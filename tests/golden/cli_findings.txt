@@ -1,8 +1,8 @@
 QA Agent report
   Run at:  <TIMESTAMP>
   Input:   <PROJECT>\has_issues.py
-  Checked: 1 file(s)
-  Tools:   ruff
+  Checked: 3 file(s)
+  Tools:   mypy, pyright, ruff
 
 Findings (3):
   <PROJECT>\has_issues.py:1  [error] F401: `json` imported but unused  (ruff)

@@ -96,7 +96,12 @@ def test_analysis_latency(suite):
             run(files[:n])
             timings[n] = time.perf_counter() - start
 
-        suite.check("a single-file analysis is fast", timings[1] < 1.0,
+        # Threshold raised from 1.0s (Phase C Part 7): a single .py file now
+        # pays three sequential cold tool starts, not two - ruff (near-
+        # instant), pyright (~0.8-1s), and mypy (~1s), since mypy also
+        # claims .py. Measured steady-state ~1.2-1.3s, occasionally ~2.0s;
+        # 3.0s keeps real, generous headroom rather than just-barely-passing.
+        suite.check("a single-file analysis is fast", timings[1] < 3.0,
                     "  [{:.0f} ms]".format(timings[1] * 1000))
         suite.check("a checkout-sized batch stays reasonable", timings[600] < 10.0,
                     "  [{:.2f}s for 600 files]".format(timings[600]))
