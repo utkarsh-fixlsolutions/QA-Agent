@@ -1,0 +1,7 @@
+QA Agent report
+  Run at:  <TIMESTAMP>
+  Input:   <PROJECT>\clean.py
+  Checked: 1 file(s)
+  Tools:   ruff
+
+Findings: no issues found.

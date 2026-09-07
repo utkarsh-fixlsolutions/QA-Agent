@@ -26,6 +26,11 @@ IGNORED_DIRS = {
 # Windows caps a command line near 32k characters, so send files in batches.
 MAX_FILES_PER_CALL = 200
 
+# A tool that never returns would otherwise block every later analysis in watch
+# mode, with no diagnosis. Measured worst case is 2.0s for 3,000 files, so this
+# leaves roughly 30x headroom over anything observed while still bounding a hang.
+ANALYSIS_TIMEOUT_SECONDS = 60.0
+
 
 @dataclass
 class RunResult:
@@ -67,9 +72,20 @@ def _chunks(items, size):
 def _invoke(adapter, files):
     command = adapter.build_command([str(f) for f in files])
     try:
-        proc = subprocess.run(command, capture_output=True, text=True)
+        proc = subprocess.run(
+            command, capture_output=True, text=True, timeout=ANALYSIS_TIMEOUT_SECONDS
+        )
     except FileNotFoundError as exc:
         raise ToolError("'{}' is not installed or not on PATH".format(adapter.name)) from exc
+    except subprocess.TimeoutExpired as exc:
+        # subprocess.run kills the child before re-raising, so nothing is left
+        # behind. Raised as a ToolError because every layer above already knows
+        # how to report one without ending a watch session.
+        raise ToolError(
+            "'{}' did not finish within {:.0f}s and was stopped ({} file(s))".format(
+                adapter.name, ANALYSIS_TIMEOUT_SECONDS, len(files)
+            )
+        ) from exc
 
     # --exit-zero means findings alone do not produce a nonzero exit, so a
     # nonzero code here is a genuine tool failure, not code issues.
