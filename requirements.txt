@@ -1,0 +1,6 @@
+# QA Agent runtime dependencies. Install: pip install -r requirements.txt
+# Filesystem event monitoring for watch mode (isolated behind qa_agent/fsmonitor.py).
+watchdog==6.0.0
+
+# The analyzer itself. Invoked as a CLI binary, not imported - see docs/02-tool-selection.md.
+ruff==0.15.14

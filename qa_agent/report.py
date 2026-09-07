@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import traceback
 from datetime import datetime
 
 
 def render(result, source):
+    """The full one-shot report: a summary block followed by the findings."""
     lines = [
         "QA Agent report",
         "  Run at:  {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
@@ -14,6 +16,22 @@ def render(result, source):
         "  Tools:   {}".format(", ".join(result.tools_used) or "none"),
         "",
     ]
+    return "\n".join(lines + _findings_lines(result))
+
+
+def render_findings(result):
+    """Just the findings, without the summary block.
+
+    Watch mode announces run time and the files involved in its own batch
+    header, so repeating them per report would duplicate information in a
+    stream meant to stay readable for hours. Both callers share these lines -
+    there is only one implementation of findings formatting.
+    """
+    return "\n".join(_findings_lines(result))
+
+
+def _findings_lines(result):
+    lines = []
 
     if result.findings:
         lines.append("Findings ({}):".format(len(result.findings)))
@@ -40,7 +58,7 @@ def render(result, source):
         for raw in result.missing:
             lines.append("  {}".format(raw))
 
-    return "\n".join(lines)
+    return lines
 
 
 def render_tool_error(error):
@@ -99,6 +117,18 @@ def render_markdown(result, source):
             lines.append("- `{}`".format(_cell(raw)))
 
     return "\n".join(lines) + "\n"
+
+
+def render_unexpected_error(source, error):
+    """An analysis failed for a reason we did not anticipate.
+
+    Long-running watch mode survives these, so the traceback is printed in full:
+    a swallowed error on an always-on process is worse than a noisy one.
+    """
+    details = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    return "QA Agent: unexpected error while analyzing {} - watch mode is still running.\n{}".format(
+        source, details.rstrip()
+    )
 
 
 def render_write_error(path, error):
