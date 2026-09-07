@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .adapters import ToolError
 from .runner import run
 
 
@@ -21,9 +20,12 @@ from .runner import run
 class AnalysisOutcome:
     """What one analysis produced: a result, or the failure that prevented it.
 
-    `expected` distinguishes a tool failure we anticipate (ruff missing, a file
-    that vanished mid-run) from something unforeseen. Classifying the failure is
-    orchestration's job because it caught it; deciding how to show it is not.
+    A failing analyzer is no longer a failure at this level (docs/15-unified-
+    reporting.md): run() records it in the result's own `tool_errors` instead
+    of raising, so `result` is populated and `ok` is true even when one of
+    several tools failed - the reporting layer renders both. `error`/
+    `expected` remain for something genuinely unforeseen escaping run()
+    itself, which is the only way to reach them now.
     """
 
     result: object = None
@@ -36,7 +38,17 @@ class AnalysisOutcome:
 
 
 class AnalysisBridge:
-    """Runs the existing pipeline over a set of changed files."""
+    """Runs the existing pipeline over a set of changed files.
+
+    config (docs/16-configuration-system.md) is resolved once at watch-session
+    startup and held here for the session's lifetime - not re-discovered per
+    batch, and not hot-reloaded if the file changes mid-session (a config
+    change needs a restart, exactly like the registered-adapter set already
+    does).
+    """
+
+    def __init__(self, config=None):
+        self._config = config
 
     def analyze_paths(self, paths):
         """Analyze exactly these paths and report what happened.
@@ -45,11 +57,10 @@ class AnalysisBridge:
         and one bad analysis must never end the session.
         """
         try:
-            return AnalysisOutcome(result=run(list(paths)))
-        except ToolError as exc:
-            return AnalysisOutcome(error=exc, expected=True)
+            return AnalysisOutcome(result=run(list(paths), config=self._config))
         except Exception as exc:  # noqa: BLE001 - deliberate last line of defence
             # Anything unforeseen is handed back with its traceback intact so the
             # reporting layer can show it in full. A silently dead watcher is the
-            # worse bug.
+            # worse bug. Analyzer failures never reach here - run() records them
+            # in the result instead of raising (docs/15).
             return AnalysisOutcome(error=exc, expected=False)

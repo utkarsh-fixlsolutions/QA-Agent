@@ -2,8 +2,8 @@
 
 - **Run at:** <TIMESTAMP>
 - **Input:** <PROJECT>\has_issues.py
-- **Checked:** 1 file(s)
-- **Tools:** ruff
+- **Checked:** 3 file(s)
+- **Tools:** mypy, pyright, ruff
 
 ## Findings (3)
 

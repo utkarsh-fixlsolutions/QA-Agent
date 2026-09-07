@@ -6,7 +6,7 @@ import traceback
 from datetime import datetime
 
 
-def render(result, source):
+def render(result, source, config_path=None):
     """The full one-shot report: a summary block followed by the findings."""
     lines = [
         "QA Agent report",
@@ -14,8 +14,10 @@ def render(result, source):
         "  Input:   {}".format(source),
         "  Checked: {} file(s)".format(len(result.checked)),
         "  Tools:   {}".format(", ".join(result.tools_used) or "none"),
-        "",
     ]
+    if config_path is not None:
+        lines.append("  Config:  {}".format(config_path))
+    lines.append("")
     return "\n".join(lines + _findings_lines(result))
 
 
@@ -46,6 +48,22 @@ def _findings_lines(result):
     else:
         lines.append("Findings: none - no files were checked.")
 
+    if result.filtered:
+        lines.append(
+            "{} finding(s) hidden by the config's severity filter (not lost - "
+            "raise min_severity or remove it to see them).".format(result.filtered)
+        )
+
+    if result.tool_errors:
+        lines.append("")
+        lines.append(
+            "Analyzer errors ({}) - findings from these tools may be incomplete:".format(
+                len(result.tool_errors)
+            )
+        )
+        for name, error in result.tool_errors:
+            lines.append("  {}: {}".format(name, error))
+
     if result.skipped:
         lines.append("")
         lines.append("Skipped ({}) - not checked:".format(len(result.skipped)))
@@ -65,12 +83,19 @@ def render_tool_error(error):
     return "QA Agent: tool error - no code issues were reported.\n  {}".format(error)
 
 
+def render_config_error(error):
+    # A distinct message from render_tool_error(): this isn't a tool that
+    # failed to run, it's the config that decides what should run at all
+    # (docs/16-configuration-system.md) - nothing has been analyzed yet.
+    return "QA Agent: configuration error - nothing was analyzed.\n  {}".format(error)
+
+
 def _cell(text):
     # A literal '|' would break the surrounding Markdown table.
     return str(text).replace("|", r"\|")
 
 
-def render_markdown(result, source):
+def render_markdown(result, source, config_path=None):
     """The same run as render(), in Markdown. Same data, different presentation."""
     lines = [
         "# QA Agent Report",
@@ -79,8 +104,10 @@ def render_markdown(result, source):
         "- **Input:** {}".format(_cell(source)),
         "- **Checked:** {} file(s)".format(len(result.checked)),
         "- **Tools:** {}".format(", ".join(result.tools_used) or "none"),
-        "",
     ]
+    if config_path is not None:
+        lines.append("- **Config:** {}".format(_cell(config_path)))
+    lines.append("")
 
     if result.findings:
         lines.append("## Findings ({})".format(len(result.findings)))
@@ -103,6 +130,20 @@ def render_markdown(result, source):
         lines.append(
             "No issues found." if result.checked else "None - no files were checked."
         )
+
+    if result.filtered:
+        lines.append("")
+        lines.append(
+            "{} finding(s) hidden by the config's severity filter (not lost).".format(
+                result.filtered
+            )
+        )
+
+    if result.tool_errors:
+        lines += ["", "## Analyzer errors ({}) - findings may be incomplete".format(
+            len(result.tool_errors)), ""]
+        for name, error in result.tool_errors:
+            lines.append("- **{}:** {}".format(name, _cell(error)))
 
     if result.skipped:
         lines += ["", "## Skipped ({}) - not checked".format(len(result.skipped)), ""]

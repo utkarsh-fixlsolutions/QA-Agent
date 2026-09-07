@@ -33,8 +33,22 @@ def test_bridge_returns_outcomes_and_prints_nothing(suite):
             failed = bridge.analyze_paths([target])
         finally:
             os.environ["PATH"] = saved
-        suite.check("a missing tool is returned, not raised", not failed.ok)
-        suite.check("...classified as an expected failure", failed.expected)
+        # A missing tool is no longer a bridge-level failure (docs/15-unified
+        # -reporting.md): run() records it in the result's own tool_errors
+        # instead of raising, so a failing tool can never hide another tool's
+        # findings. The bridge/outcome layer only ever sees something
+        # genuinely unforeseen now - see test_multi_analyzer.py and
+        # test_multi_language.py for the runner-level and CLI-level coverage
+        # of this contract.
+        #
+        # err.py is .py, claimed by ruff, pyright, and mypy (Phase C Parts 5
+        # and 7) - an empty PATH means all three fail independently, isolated
+        # from each other exactly like any other set of adapters would be.
+        suite.check("a missing tool is still a normal result, not raised", failed.ok)
+        suite.check("...recorded in the result's own tool_errors, one per failed tool",
+                    failed.result is not None and len(failed.result.tool_errors) == 3)
+        suite.check("...naming all three tools",
+                    {name for name, _ in failed.result.tool_errors} == {"mypy", "pyright", "ruff"})
 
         def boom(inputs, extra_skipped=None):
             raise ValueError("simulated")

@@ -1,0 +1,8 @@
+{
+  "name": "qa-agent-eslint-test-fixture",
+  "private": true,
+  "description": "Real ESLint install for the eslint-adapter test suites. Not a runtime dependency of qa_agent itself - see docs/14-first-multi-language-analyzer.md. Run 'npm install' here once before running tests that need a real eslint binary; they skip gracefully (clearly reported, not silently) if this hasn't been done.",
+  "devDependencies": {
+    "eslint": "^9.39.0"
+  }
+}

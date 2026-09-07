@@ -91,8 +91,8 @@ def test_hang_times_out_and_recovers(suite):
         first = outputs[0] if outputs else ""
         suite.check("timeout reported clearly", "did not finish within" in first,
                     "" if "did not finish within" in first else "  [{}]".format(first[:90]))
-        suite.check("reported as a tool error, not as code findings",
-                    "tool error" in first and "no code issues were reported" in first)
+        suite.check("reported as an analyzer error, not as code findings",
+                    "Analyzer errors" in first)
         suite.check("no finding was invented from the failure", "Findings (" not in first)
 
         # 2. the watcher is still alive and the NEXT analysis works normally

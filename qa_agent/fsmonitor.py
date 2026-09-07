@@ -51,7 +51,7 @@ class FileEvent:
 
     kind: str
     path: Path
-    old_path: Path = None  # renames only; where the file came from
+    old_path: Path | None = None  # renames only; where the file came from
 
 
 def target_path(event):
