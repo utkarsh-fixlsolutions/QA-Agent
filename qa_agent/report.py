@@ -6,8 +6,22 @@ import traceback
 from datetime import datetime
 
 
-def render(result, source, config_path=None):
-    """The full one-shot report: a summary block followed by the findings."""
+def render(result, source, config_path=None, explanations=None, summary=None,
+           suggested_fixes=None):
+    """The full one-shot report: a run summary block, then the findings.
+
+    `explanations` (Phase D Part 3): an optional {Finding: Explanation}
+    mapping, as produced by the AI package's explainer. `summary` (Phase D
+    Part 4): an optional AI-generated Summary of the whole run, as produced
+    by the AI package's summarizer. `suggested_fixes` (Phase D Part 5): an
+    optional {Finding: SuggestedFix} mapping, as produced by the AI
+    package's fixer - always advisory, never applied, and rendered beneath
+    a finding's own explanation. All three are purely additive
+    presentation - omitted or None (the default for all three), output is
+    byte-for-byte identical to every Phase C report; nothing here calls the
+    AI layer or requires it, and this module imports nothing from that
+    package.
+    """
     lines = [
         "QA Agent report",
         "  Run at:  {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
@@ -18,21 +32,66 @@ def render(result, source, config_path=None):
     if config_path is not None:
         lines.append("  Config:  {}".format(config_path))
     lines.append("")
-    return "\n".join(lines + _findings_lines(result))
+    lines += _summary_lines(summary)
+    return "\n".join(lines + _findings_lines(result, explanations, suggested_fixes))
 
 
-def render_findings(result):
-    """Just the findings, without the summary block.
+def _summary_lines(summary):
+    """The AI run summary block, rendered before the findings - clearly
+    labeled, visually distinct from the deterministic metadata above it and
+    the findings below it, and collapsed to one line the same way an AI
+    explanation is (Phase D Part 3's `_single_line()`) so a multi-line
+    reply can never blur into the section beneath it. Empty when there is
+    no summary to show - never a placeholder, never invented.
+    """
+    if summary is None:
+        return []
+    header = "AI Summary"
+    return [header, "-" * len(header), _single_line(summary.text), ""]
+
+
+def render_findings(result, explanations=None, suggested_fixes=None):
+    """Just the findings, without the run summary block.
 
     Watch mode announces run time and the files involved in its own batch
     header, so repeating them per report would duplicate information in a
     stream meant to stay readable for hours. Both callers share these lines -
-    there is only one implementation of findings formatting.
+    there is only one implementation of findings formatting. `summary`
+    (Phase D Part 4) is deliberately not accepted here: a whole-run
+    executive summary has no natural meaning for one incremental watch-mode
+    batch, unlike `explanations`/`suggested_fixes`, which stay per-finding
+    at any granularity.
     """
-    return "\n".join(_findings_lines(result))
+    return "\n".join(_findings_lines(result, explanations, suggested_fixes))
 
 
-def _findings_lines(result):
+def _single_line(text):
+    """Collapse an AI explanation to one clean line regardless of what the
+    model actually returned - deterministic formatting (docs/step-log.md,
+    Phase D Part 3), and never lets a multi-line reply blur into the next
+    finding or invent an ambiguous indent scheme.
+    """
+    return " ".join(text.split())
+
+
+def _fix_lines(fix):
+    """The [AI Suggested Fix] block, rendered beneath a finding's own
+    explanation (Phase D Part 5) - clearly labeled as advisory, requiring
+    developer review, never a claim of certainty. The explanation line is
+    collapsed to one line like every other AI-generated prose in this
+    module; the replacement is a real, possibly multi-line piece of code,
+    so its own line breaks are preserved (indented, not collapsed) rather
+    than mashed into an unreadable single line.
+    """
+    lines = ["      [AI Suggested Fix] (advisory only - review before applying)"]
+    lines.append("          {}".format(_single_line(fix.explanation)))
+    lines.append("")
+    for line in fix.replacement.splitlines() or [""]:
+        lines.append("          {}".format(line))
+    return lines
+
+
+def _findings_lines(result, explanations=None, suggested_fixes=None):
     lines = []
 
     if result.findings:
@@ -43,6 +102,18 @@ def _findings_lines(result):
                     finding.file, finding.line, finding.severity, finding.message, finding.tool
                 )
             )
+            explanation = explanations.get(finding) if explanations else None
+            if explanation is not None:
+                # Clearly labeled and visually subordinate (indented past
+                # the finding line itself), on its own line, never merged
+                # into the tool's own message and never replacing it.
+                lines.append("      [AI Explanation] {}".format(_single_line(explanation.text)))
+            fix = suggested_fixes.get(finding) if suggested_fixes else None
+            if fix is not None:
+                # Beneath the explanation, exactly as required - never
+                # rendered in its place, and never when neither exists.
+                lines.append("")
+                lines += _fix_lines(fix)
     elif result.checked:
         lines.append("Findings: no issues found.")
     else:
@@ -95,8 +166,14 @@ def _cell(text):
     return str(text).replace("|", r"\|")
 
 
-def render_markdown(result, source, config_path=None):
-    """The same run as render(), in Markdown. Same data, different presentation."""
+def render_markdown(result, source, config_path=None, explanations=None, summary=None,
+                     suggested_fixes=None):
+    """The same run as render(), in Markdown. Same data, different
+    presentation. `explanations`, `summary`, and `suggested_fixes` are the
+    same optional values `render()` accepts (Phase D Parts 3-5) - all
+    omitted or None (the default), output is byte-for-byte identical to
+    every Phase C report.
+    """
     lines = [
         "# QA Agent Report",
         "",
@@ -108,6 +185,12 @@ def render_markdown(result, source, config_path=None):
     if config_path is not None:
         lines.append("- **Config:** {}".format(_cell(config_path)))
     lines.append("")
+
+    if summary is not None:
+        # Its own section, before Findings, exactly like the terminal
+        # report - never folded into the metadata list above or the
+        # findings table below.
+        lines += ["## AI Summary", "", _single_line(summary.text), ""]
 
     if result.findings:
         lines.append("## Findings ({})".format(len(result.findings)))
@@ -130,6 +213,52 @@ def render_markdown(result, source, config_path=None):
         lines.append(
             "No issues found." if result.checked else "None - no files were checked."
         )
+
+    if explanations:
+        # A separate section, not extra table columns or cells: the
+        # findings table stays exactly what Phase C already produces, and
+        # explanations are additive, clearly labeled, and never mixed into
+        # a finding's own row (docs/step-log.md, Phase D Part 3). Same
+        # deterministic order as the findings themselves, filtered to only
+        # those actually explained.
+        explained = [f for f in result.findings if f in explanations]
+        if explained:
+            lines += ["", "## AI Explanations ({})".format(len(explained)), ""]
+            for finding in explained:
+                lines.append(
+                    "- **`{}:{}`** ({}): {}".format(
+                        _cell(finding.file),
+                        finding.line,
+                        _cell(finding.tool),
+                        _cell(_single_line(explanations[finding].text)),
+                    )
+                )
+
+    if suggested_fixes:
+        # A separate section again, not a table column: a suggested fix
+        # can be a real, multi-line piece of code, which a table cell
+        # cannot represent cleanly. Its own subheading per finding rather
+        # than a list item, since a fenced code block inside a Markdown
+        # list item is indentation-sensitive and easy to render wrong;
+        # this way is unambiguous. Same deterministic order as the
+        # findings themselves, filtered to only those actually given one.
+        fixed = [f for f in result.findings if f in suggested_fixes]
+        if fixed:
+            lines += ["", "## AI Suggested Fixes ({}) - advisory, review before applying".format(
+                len(fixed)), ""]
+            for finding in fixed:
+                fix = suggested_fixes[finding]
+                lines += [
+                    "### `{}:{}` ({})".format(_cell(finding.file), finding.line,
+                                               _cell(finding.tool)),
+                    "",
+                    _cell(_single_line(fix.explanation)),
+                    "",
+                    "```",
+                    fix.replacement,
+                    "```",
+                    "",
+                ]
 
     if result.filtered:
         lines.append("")

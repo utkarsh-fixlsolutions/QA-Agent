@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from .adapters import ADAPTERS, ToolError
+from .ai import MockProvider, OllamaProvider, explain_findings, summarize_run
+from .ai import suggest_fixes as ai_suggest_fixes
 from .gitdiff import changed_files, describe
 from .analysis_bridge import AnalysisBridge
 from .config import ConfigError, resolve as resolve_config
@@ -37,10 +40,104 @@ from .report import (
     render_unexpected_error,
     render_write_error,
 )
-from .runner import run
+from .runner import RunResult, run
 from .watch import WatchSession
 
 _ADAPTER_NAMES = [adapter.name for adapter in ADAPTERS]
+_AI_PROVIDER_CHOICES = ("ollama", "mock")
+
+
+def _add_ai_arguments(parser):
+    """The six AI flags (Phase D Part 6), shared verbatim between the
+    one-shot and watch parsers so `--ai`/`--ai-explain`/etc. mean exactly
+    the same thing in both modes.
+    """
+    parser.add_argument(
+        "--ai", action="store_true",
+        help="enable AI enrichment; with no other --ai-* flag, enables all of them",
+    )
+    parser.add_argument("--ai-explain", action="store_true", help="enable AI explanations")
+    parser.add_argument("--ai-summary", action="store_true", help="enable an AI run summary")
+    parser.add_argument(
+        "--ai-fix", action="store_true",
+        help="enable AI-suggested fixes (advisory only; never applied automatically)",
+    )
+    parser.add_argument("--ai-model", metavar="MODEL", help="override the configured AI model")
+    parser.add_argument(
+        "--ai-provider", choices=_AI_PROVIDER_CHOICES, help="override the configured AI provider",
+    )
+
+
+def _effective_ai_settings(args, ai_config):
+    """CLI > Config file > Defaults (docs/step-log.md, Phase D Part 6).
+
+    Every CLI flag here can only enable something, never force it off -
+    the same additive-only convention this CLI's other flags (--git-diff,
+    -o) already follow; there is no existing precedent for a flag that
+    un-does a config setting. A bare `--ai`, with no specific `--ai-*`
+    feature flag also given, enables all three features - the "just try
+    it" convenience a single flag should offer; naming a specific feature
+    (`--ai-explain`, alone or combined with others) is always enough on
+    its own and never silently pulls in features that were not asked for.
+    """
+    specific = args.ai_explain or args.ai_summary or args.ai_fix
+    bare_ai = args.ai and not specific
+    return replace(
+        ai_config,
+        enabled=args.ai or specific or ai_config.enabled,
+        provider=args.ai_provider or ai_config.provider,
+        model=args.ai_model or ai_config.model,
+        explain=args.ai_explain or bare_ai or ai_config.explain,
+        summary=args.ai_summary or bare_ai or ai_config.summary,
+        suggest_fixes=args.ai_fix or bare_ai or ai_config.suggest_fixes,
+    )
+
+
+def _build_ai_provider(ai_settings):
+    """Construct the configured provider, or None when AI is disabled.
+
+    `provider` is already restricted to a known name by config.py's own
+    validation and by --ai-provider's argparse `choices` - the final
+    `return None` below is an unreachable defensive fallback, not a real
+    validation path, so an unsupported name is never silently swallowed
+    here; it would already have been rejected earlier, loudly.
+    """
+    if not ai_settings.enabled:
+        return None
+    if ai_settings.provider == "mock":
+        kwargs = {} if ai_settings.model is None else {"model": ai_settings.model}
+        return MockProvider(**kwargs)
+    if ai_settings.provider == "ollama":
+        kwargs = {}
+        if ai_settings.model is not None:
+            kwargs["model"] = ai_settings.model
+        if ai_settings.endpoint is not None:
+            kwargs["endpoint"] = ai_settings.endpoint
+        if ai_settings.timeout is not None:
+            kwargs["timeout"] = ai_settings.timeout
+        return OllamaProvider(**kwargs)
+    return None  # pragma: no cover - unreachable, see docstring
+
+
+def _run_ai_pipeline(result, ai_settings, provider):
+    """Run whichever AI features are enabled, entirely best-effort.
+
+    Every function called here already returns None or an empty mapping on
+    any failure (offline, timeout, malformed response, insufficient
+    context - Parts 3-5) and never raises, so nothing here needs its own
+    try/except: the deterministic `result` this was given is always
+    returned to the caller completely unaffected either way (docs/step-log
+    .md, Phase D Part 6, graceful degradation).
+    """
+    summary, explanations, fixes = None, {}, {}
+    if provider is not None:
+        if ai_settings.summary:
+            summary = summarize_run(result, provider)
+        if ai_settings.explain:
+            explanations = explain_findings(result.findings, provider)
+        if ai_settings.suggest_fixes:
+            fixes = ai_suggest_fixes(result.findings, provider)
+    return summary, explanations, fixes
 
 
 def _effective_adapters(config):
@@ -68,6 +165,7 @@ def _watch_main(argv):
         metavar="PATH",
         help="use this config file instead of discovering .qa-agent.json",
     )
+    _add_ai_arguments(parser)
     args = parser.parse_args(argv)
 
     root = Path(args.project_path)
@@ -76,6 +174,12 @@ def _watch_main(argv):
     except ConfigError as exc:
         print(render_config_error(exc), file=sys.stderr)
         return 2
+
+    # Resolved once at startup and held for the whole session, exactly like
+    # AnalysisBridge's own config - a change needs a restart, not a
+    # mid-session reload (docs/step-log.md, Phase D Part 6).
+    ai_settings = _effective_ai_settings(args, config.ai)
+    ai_provider = _build_ai_provider(ai_settings)
 
     # The registry (filtered by config) stays the single source of truth for
     # what is enabled, so the banner cannot drift from reality - whether that
@@ -96,9 +200,29 @@ def _watch_main(argv):
     reporter = LiveReporter(root=root)
 
     def analyze_batch(batch):
-        """One quiet period: analyze what changed, then report it as one batch."""
+        """One quiet period: analyze what changed, then report it as one batch.
+
+        AI runs per batch, on that batch's own findings only - the same
+        best-effort, never-raises pipeline the one-shot CLI uses
+        (_run_ai_pipeline). A run-level AI summary is deliberately not
+        offered here: it has no natural meaning for one incremental batch
+        of changed files (Part 4's own reasoning, unchanged), so only
+        explanations and suggested fixes - both already per-finding - are
+        wired into watch mode.
+        """
         outcome = bridge.analyze_paths(batch.paths) if batch.paths else None
-        reporter.report(batch, outcome)
+        explanations, fixes = {}, {}
+        if outcome is not None and outcome.ok and ai_provider is not None:
+            # AnalysisOutcome.result is typed as plain `object`; outcome.ok
+            # (error is None) is analysis_bridge.py's own guarantee that a
+            # real RunResult is there - narrowed explicitly since pyright
+            # cannot infer that from the ok check alone.
+            assert isinstance(outcome.result, RunResult)
+            if ai_settings.explain:
+                explanations = explain_findings(outcome.result.findings, ai_provider)
+            if ai_settings.suggest_fixes:
+                fixes = ai_suggest_fixes(outcome.result.findings, ai_provider)
+        reporter.report(batch, outcome, explanations=explanations, suggested_fixes=fixes)
 
     def report_failure(error):
         """Anything unforeseen in the event path: shown in full, never swallowed."""
@@ -152,6 +276,7 @@ def main(argv=None):
         metavar="PATH",
         help="use this config file instead of discovering .qa-agent.json",
     )
+    _add_ai_arguments(parser)
     args = parser.parse_args(argv)
 
     # argparse's error() exits 2, matching this tool's input-failure code.
@@ -185,12 +310,27 @@ def main(argv=None):
         print(render_tool_error(exc), file=sys.stderr)
         return 2
 
-    print(render(result, source, config_path=config.path))
+    # Runs after the deterministic result exists, exactly per the required
+    # flow (RunResult -> summary -> explanations -> suggested fixes ->
+    # render), and never raises - see _run_ai_pipeline's own docstring.
+    # AI disabled (no flag, no config "ai" section) means ai_settings.enabled
+    # is False, _build_ai_provider returns None, and every value below stays
+    # at its untouched default - report output is then byte-for-byte
+    # identical to Phase C (docs/step-log.md, Phase D Part 6).
+    ai_settings = _effective_ai_settings(args, config.ai)
+    ai_provider = _build_ai_provider(ai_settings)
+    summary, explanations, suggested_fixes = _run_ai_pipeline(result, ai_settings, ai_provider)
+
+    print(render(result, source, config_path=config.path,
+                 explanations=explanations, summary=summary, suggested_fixes=suggested_fixes))
 
     if args.output:
         try:
             Path(args.output).write_text(
-                render_markdown(result, source, config_path=config.path), encoding="utf-8"
+                render_markdown(result, source, config_path=config.path,
+                                 explanations=explanations, summary=summary,
+                                 suggested_fixes=suggested_fixes),
+                encoding="utf-8",
             )
         except OSError as exc:
             # The run itself succeeded; only the file write failed. Report that

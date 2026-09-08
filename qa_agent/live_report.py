@@ -62,11 +62,15 @@ class LiveReporter:
         self._out = out
         self._batch_number = 0
 
-    def report(self, batch, outcome=None):
+    def report(self, batch, outcome=None, explanations=None, suggested_fixes=None):
         """Print one batch: its identity, what changed, and what was found.
 
         outcome is None when a batch contained nothing to analyze - a batch of
-        deletions still deserves to be seen.
+        deletions still deserves to be seen. `explanations`/`suggested_fixes`
+        (Phase D Part 6) are the same optional {Finding: ...} mappings
+        report.py's own render_findings() accepts - purely additive, and
+        omitted or empty by every existing caller, so output is unchanged
+        unless a caller opts in.
         """
         self._batch_number += 1
         lines = [
@@ -78,7 +82,7 @@ class LiveReporter:
         ]
         lines.extend(self._file_lines(batch.events))
         lines.append("")
-        lines.append(self._body(outcome))
+        lines.append(self._body(outcome, explanations, suggested_fixes))
         self._out("\n".join(lines))
 
     def _file_lines(self, events):
@@ -88,11 +92,11 @@ class LiveReporter:
             listed.append("  ...and {} more".format(remaining))
         return listed
 
-    def _body(self, outcome):
+    def _body(self, outcome, explanations=None, suggested_fixes=None):
         if outcome is None:
             return "Nothing to analyze."
         if outcome.ok:
-            return render_findings(outcome.result)
+            return render_findings(outcome.result, explanations, suggested_fixes)
         if outcome.expected:
             return render_tool_error(outcome.error)
         return render_unexpected_error("this batch", outcome.error)

@@ -46,6 +46,36 @@ python -m qa_agent watch <dir>             analyze files as you save them (Ctrl+
 
 Exit codes: `0` no findings / clean shutdown · `1` findings reported · `2` tool, input, or write error.
 
+### AI enrichment (optional)
+
+Findings stay 100% tool-generated always; AI, when turned on, only explains, summarizes, or suggests advisory fixes for findings that already exist - it can never invent, suppress, or change one. Off by default; output is unaffected unless you opt in.
+
+```
+--ai                 enable AI (all of --ai-explain/--ai-summary/--ai-fix, unless given individually)
+--ai-explain          explain each finding
+--ai-summary          an AI-written run summary
+--ai-fix               a suggested fix per finding - advisory only, never applied
+--ai-model <model>     override the configured model
+--ai-provider <name>   "ollama" (default, needs a local Ollama server) or "mock" (tests)
+```
+
+Or via `.qa-agent.json` (CLI flags win over this when both are given):
+
+```json
+{
+  "ai": {
+    "enabled": true,
+    "provider": "ollama",
+    "model": "qwen2.5-coder:latest",
+    "explain": true,
+    "summary": true,
+    "suggest_fixes": false
+  }
+}
+```
+
+If the provider is unreachable, times out, or replies with something unusable, the AI section is silently omitted - the deterministic report always completes.
+
 ### Watch mode output
 
 ```
@@ -64,7 +94,7 @@ One report per burst of changes: rapid saves collapse into a single analysis, an
 
 ## What it does not do
 
-No auto-fixing · no LLM · no CI integration · no dashboard · no cloud · no continuous full-repo scanning.
+No automatic code edits · no CI integration · no dashboard · no cloud · no continuous full-repo scanning. AI (above) is optional, local-only (Ollama), and advisory-only - it never edits a file or applies a fix itself.
 
 ## Testing
 
@@ -73,7 +103,7 @@ python tests/run_all.py            everything, about a minute
 python tests/run_all.py --quick    skip the stress suites
 ```
 
-Twelve suites covering the Phase A CLI against golden files, debounce semantics, every adapter's parsing and the generic runner mechanisms, the config system, the bridge contract, long-running stability, analyzer timeout and recovery, the full watch pipeline as a real process, multi-tool projects against real installs, and filesystem storms.
+Eighteen suites covering the Phase A CLI against golden files, debounce semantics, every adapter's parsing and the generic runner mechanisms, the config system (including the optional AI section), the bridge contract, long-running stability, analyzer timeout and recovery, the full watch pipeline as a real process, multi-tool projects against real installs, filesystem storms, and the AI provider/prompt/explanation/summary/fix/CLI-integration layers.
 
 **Some integration suites need real tool installs, once:** `npm install` inside `tests/fixtures/eslint`, and `powershell -File tests/fixtures/shellcheck/fetch.ps1` (both gitignored, same as this project's own `.venv` for Python and pyright). Tests that need them skip cleanly and visibly if this hasn't been done — the rest of the suite runs regardless.
 
@@ -96,4 +126,6 @@ The numbered documents are a build log: each records what was decided at that st
 
 ## Status
 
-**Phase C complete (Parts 1-7).** Five real analyzers — `ruff` + `pyright` + `mypy` (`.py`), `eslint` (`.js`), `shellcheck` (`.sh`) — run through one unified, configurable engine, merging every tool's findings into one deterministically-ordered, conservatively-deduplicated report that never hides a succeeding tool's real findings behind a failing one's error, in both one-shot and watch mode. Validated in Part 6 against six real external repositories (Python, JavaScript, and mixed), every configuration option, and workloads from a handful of files to 2,000 - which found and fixed one real, silent bug (a large batch could exceed `cmd.exe`'s command-line limit and lose findings with no error reported). Part 7 added mypy as a third independent `.py` analyzer - proving three tools can share one extension, not just two - and found and fixed a second real, silent bug the same way, before it ever reached a test (mypy's own path formatting was inconsistent within a single run, which would have broken deterministic file ordering). Verified by 12 automated suites (107 checks in the multi-analyzer suite alone). Known limitations, deferred decisions, and trade-offs are listed in [docs/12](docs/12-architecture.md), [docs/17](docs/17-hardening-and-validation.md), and [docs/step-log.md](docs/step-log.md).
+**Phase C complete (Parts 1-7):** five real analyzers — `ruff` + `pyright` + `mypy` (`.py`), `eslint` (`.js`), `shellcheck` (`.sh`) — run through one unified, configurable engine, merging every tool's findings into one deterministically-ordered, conservatively-deduplicated report that never hides a succeeding tool's real findings behind a failing one's error, in both one-shot and watch mode. Validated against real external repositories and every configuration option; two real, silent bugs found and fixed along the way (docs/step-log.md).
+
+**Phase D in progress (Parts 1-6 complete):** an optional, local-only AI layer (Ollama) built alongside the deterministic engine without changing it - a provider abstraction, prompt/context/response-validation building blocks, per-finding explanations, a run summary, advisory-only suggested fixes, and (Part 6) the CLI flags and `.qa-agent.json` section above that wire it all in. With AI disabled - the default - every report is still byte-for-byte identical to Phase C. Known limitations, deferred decisions, and trade-offs are listed in [docs/12](docs/12-architecture.md), [docs/17](docs/17-hardening-and-validation.md), and [docs/step-log.md](docs/step-log.md).
