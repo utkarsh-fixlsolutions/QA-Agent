@@ -41,6 +41,25 @@ class FixResponse:
 
 
 @dataclass(frozen=True)
+class RepairResponse:
+    """A validated repair proposal for exactly one supplied finding
+    (Phase E Part 1) - `build_repair_prompt`'s counterpart to `FixResponse`,
+    kept as a separate shape rather than added onto `FixResponse` because a
+    repair proposal needs two fields a `SuggestedFix` does not: a
+    self-reported `confidence`, and the line range the replacement covers.
+    `start_line`/`end_line` are the model's own claim, unvalidated against
+    the real file here - this module only checks shape (present and an
+    int, or absent); repair.py decides whether to trust them.
+    """
+
+    explanation: str
+    replacement: str
+    confidence: float
+    start_line: int | None = None
+    end_line: int | None = None
+
+
+@dataclass(frozen=True)
 class ValidationResult:
     """The outcome of parsing and validating one raw LLM response.
 

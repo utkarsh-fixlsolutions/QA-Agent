@@ -54,6 +54,11 @@ _SUMMARY_ROLE = (
     "report - what kinds of issues showed up, and roughly how many."
 )
 _FIX_ROLE = "Your task: suggest a concrete fix for the single finding below."
+_REPAIR_ROLE = (
+    "Your task: propose a structured repair for the single finding below - "
+    "a replacement for the affected line range in the file, together with "
+    "your own confidence in it."
+)
 
 # More than this would bury the summary prompt in tokens for little benefit -
 # the same "cap it, count the remainder" precedent live_report.py's
@@ -125,6 +130,30 @@ def build_fix_prompt(finding, context: CodeContext) -> Prompt:
         '"suggested_fix": "<a concrete fix, as text or a short code snippet>"}',
     ]
     return Prompt(system=_system_prompt(_FIX_ROLE), user="\n".join(lines))
+
+
+def build_repair_prompt(finding, context: CodeContext) -> Prompt:
+    """A prompt asking the model to propose a structured repair for one
+    specific finding - Phase E Part 1's extension of `build_fix_prompt`
+    (Phase D Part 5): same finding/context rendering and guardrails, but
+    additionally requesting a self-reported confidence and the precise
+    line range the replacement covers, since a `RepairProposal` (unlike a
+    `SuggestedFix`) is meant to be precise enough for a later phase to act
+    on. Same inputs as `build_explanation_prompt`.
+    """
+    lines = _finding_and_context_lines(finding, context)
+    lines += [
+        "",
+        "If you propose a replacement, name exactly which line numbers "
+        "(from the numbered lines above) it replaces.",
+        "",
+        'Respond with JSON only: {"explanation": "<why this change fixes the finding>", '
+        '"replacement": "<the replacement code for the affected line range>", '
+        '"confidence": <a number from 0.0 to 1.0 for how confident you are this repair '
+        'is correct>, "start_line": <first line number the replacement covers>, '
+        '"end_line": <last line number the replacement covers>}'
+    ]
+    return Prompt(system=_system_prompt(_REPAIR_ROLE), user="\n".join(lines))
 
 
 def build_summary_prompt(result) -> Prompt:

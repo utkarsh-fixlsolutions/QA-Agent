@@ -19,6 +19,7 @@ from .schemas import (
     STATUS_SUCCESS,
     ExplanationResponse,
     FixResponse,
+    RepairResponse,
     SummaryResponse,
     ValidationResult,
 )
@@ -154,5 +155,65 @@ def validate_fix_response(text: str) -> ValidationResult:
         status=STATUS_SUCCESS,
         value=FixResponse(
             explanation=data["explanation"], suggested_fix=data["suggested_fix"]
+        ),
+    )
+
+
+def _is_number_not_bool(value) -> bool:
+    """`bool` is an `int` subclass in Python - a bare `isinstance(x, (int,
+    float))` would silently accept `"confidence": true` as `1`. The same
+    check config.py already applies to `ai.timeout` (Phase D Part 6).
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _valid_optional_line(value) -> bool:
+    """`start_line`/`end_line` are optional (Phase E Part 1: "if
+    available") - absent is fine, present must be a real int.
+    """
+    return value is None or (isinstance(value, int) and not isinstance(value, bool))
+
+
+def validate_repair_response(text: str) -> ValidationResult:
+    """Validate a raw response against the repair-proposal schema:
+    `{"explanation": "<text>", "replacement": "<text>", "confidence": <0.0-1.0>,
+    "start_line": <int, optional>, "end_line": <int, optional>}`.
+
+    `confidence` is required (a repair proposal without a self-reported
+    confidence is not a usable proposal for E1), but a value outside
+    [0.0, 1.0] is clamped rather than rejected - the shape is what must be
+    right, not a model's precision picking a number. `start_line`/
+    `end_line` may be omitted entirely; repair.py falls back to the
+    finding's own line when they are.
+    """
+    data, early = _parse_and_check_common(text)
+    if early is not None:
+        return early
+    assert data is not None  # _parse_and_check_common: early is None implies data is not
+    missing = _required_string_fields(data, "explanation", "replacement")
+    if missing:
+        return ValidationResult(
+            status=STATUS_INVALID,
+            reason="missing or empty required field(s): {}".format(", ".join(missing)),
+        )
+    if "confidence" not in data or not _is_number_not_bool(data["confidence"]):
+        return ValidationResult(
+            status=STATUS_INVALID,
+            reason="missing or invalid required field: 'confidence' (must be a number)",
+        )
+    start_line, end_line = data.get("start_line"), data.get("end_line")
+    if not _valid_optional_line(start_line) or not _valid_optional_line(end_line):
+        return ValidationResult(
+            status=STATUS_INVALID,
+            reason="'start_line'/'end_line', when present, must be integers",
+        )
+    return ValidationResult(
+        status=STATUS_SUCCESS,
+        value=RepairResponse(
+            explanation=data["explanation"],
+            replacement=data["replacement"],
+            confidence=max(0.0, min(1.0, float(data["confidence"]))),
+            start_line=start_line,
+            end_line=end_line,
         ),
     )

@@ -7,7 +7,7 @@ from datetime import datetime
 
 
 def render(result, source, config_path=None, explanations=None, summary=None,
-           suggested_fixes=None):
+           suggested_fixes=None, repair_result=None):
     """The full one-shot report: a run summary block, then the findings.
 
     `explanations` (Phase D Part 3): an optional {Finding: Explanation}
@@ -16,8 +16,11 @@ def render(result, source, config_path=None, explanations=None, summary=None,
     by the AI package's summarizer. `suggested_fixes` (Phase D Part 5): an
     optional {Finding: SuggestedFix} mapping, as produced by the AI
     package's fixer - always advisory, never applied, and rendered beneath
-    a finding's own explanation. All three are purely additive
-    presentation - omitted or None (the default for all three), output is
+    a finding's own explanation. `repair_result` (Phase E Part 5): an
+    optional `RepairApplicationResult` (or a duck-typed equivalent -
+    `.success`/`.file`/`.backup_file`/`.reason`), rendered as "Verified
+    Repair Applied" or "Repair Skipped". All four are purely additive
+    presentation - omitted or None (the default for all four), output is
     byte-for-byte identical to every Phase C report; nothing here calls the
     AI layer or requires it, and this module imports nothing from that
     package.
@@ -33,6 +36,7 @@ def render(result, source, config_path=None, explanations=None, summary=None,
         lines.append("  Config:  {}".format(config_path))
     lines.append("")
     lines += _summary_lines(summary)
+    lines += _repair_application_lines(repair_result)
     return "\n".join(lines + _findings_lines(result, explanations, suggested_fixes))
 
 
@@ -48,6 +52,28 @@ def _summary_lines(summary):
         return []
     header = "AI Summary"
     return [header, "-" * len(header), _single_line(summary.text), ""]
+
+
+def _repair_application_lines(repair_result):
+    """The [Verified Repair Applied]/[Repair Skipped] block, rendered
+    right after the AI Summary block, before the findings (Phase E Part
+    5). `repair_result` is duck-typed - only `.success`/`.file`/
+    `.backup_file`/`.reason` are ever read, so a plain test double works
+    exactly like the real `RepairApplicationResult`. Empty when there is
+    nothing to show - `None` (the default) never renders anything, so
+    every existing golden report stays byte-for-byte identical.
+    """
+    if repair_result is None:
+        return []
+    if repair_result.success:
+        header = "Verified Repair Applied"
+        lines = [header, "-" * len(header), "  File:   {}".format(repair_result.file)]
+        if repair_result.backup_file is not None:
+            lines.append("  Backup: {}".format(repair_result.backup_file))
+        lines.append("")
+        return lines
+    header = "Repair Skipped"
+    return [header, "-" * len(header), "  Reason: {}".format(repair_result.reason), ""]
 
 
 def render_findings(result, explanations=None, suggested_fixes=None):
@@ -167,12 +193,12 @@ def _cell(text):
 
 
 def render_markdown(result, source, config_path=None, explanations=None, summary=None,
-                     suggested_fixes=None):
+                     suggested_fixes=None, repair_result=None):
     """The same run as render(), in Markdown. Same data, different
-    presentation. `explanations`, `summary`, and `suggested_fixes` are the
-    same optional values `render()` accepts (Phase D Parts 3-5) - all
-    omitted or None (the default), output is byte-for-byte identical to
-    every Phase C report.
+    presentation. `explanations`, `summary`, `suggested_fixes`, and
+    `repair_result` are the same optional values `render()` accepts (Phase
+    D Parts 3-5, Phase E Part 5) - all omitted or None (the default),
+    output is byte-for-byte identical to every Phase C report.
     """
     lines = [
         "# QA Agent Report",
@@ -191,6 +217,19 @@ def render_markdown(result, source, config_path=None, explanations=None, summary
         # report - never folded into the metadata list above or the
         # findings table below.
         lines += ["## AI Summary", "", _single_line(summary.text), ""]
+
+    if repair_result is not None:
+        # Its own section too, in the same place the terminal report puts
+        # it (Phase E Part 5) - duck-typed, same as render()'s own block.
+        if repair_result.success:
+            lines += ["## Verified Repair Applied", "",
+                      "- **File:** `{}`".format(_cell(repair_result.file))]
+            if repair_result.backup_file is not None:
+                lines.append("- **Backup:** `{}`".format(_cell(repair_result.backup_file)))
+            lines.append("")
+        else:
+            lines += ["## Repair Skipped", "",
+                      "- **Reason:** {}".format(_cell(repair_result.reason)), ""]
 
     if result.findings:
         lines.append("## Findings ({})".format(len(result.findings)))
