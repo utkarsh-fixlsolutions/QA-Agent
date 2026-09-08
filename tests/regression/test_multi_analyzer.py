@@ -309,8 +309,10 @@ def test_mypy_one_bad_line_does_not_silently_drop_the_rest(suite):
 def test_adapter_contracts(suite):
     ruff, eslint = RuffAdapter(), ESLintAdapter()
     suite.check("ruff claims .py only", ruff.extensions == frozenset({".py"}))
-    suite.check("eslint claims .js only (TypeScript deliberately deferred)",
-                eslint.extensions == frozenset({".js"}))
+    suite.check("eslint claims .js/.jsx/.ts/.tsx (docs/18 - routing only, "
+                "real TypeScript checking still depends on the analyzed "
+                "project's own eslint config)",
+                eslint.extensions == frozenset({".js", ".jsx", ".ts", ".tsx"}))
     suite.check("ruff's --exit-zero means only 0 is ever a normal exit",
                 ruff.ok_exit_codes == frozenset({0}))
     suite.check("eslint allows exit 1 too (findings present, not a failure)",

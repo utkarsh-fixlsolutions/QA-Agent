@@ -1,5 +1,7 @@
 # Step 14 — First Multi-Language Analyzer: ESLint
 
+**Addendum (2026-09-08):** the `.js`-only scope below (§5) was widened to also claim `.jsx`/`.ts`/`.tsx` — routing only, no engine change, no bundled TypeScript/JSX parser. See [docs/18](18-eslint-jsx-tsx-extension.md). Everything below is left exactly as it was decided and verified at the time; §5's own "natural, likely next steps, deliberately deferred" line was the plan this addendum carried out.
+
 **Status:** IMPLEMENTED (2026-09-07). Design approved with the two amendments below adopted; implementation, tests, and dogfooding complete.
 **Phase:** C, Part 2 of "Multi-Language Intelligence."
 **Scope:** register exactly one new adapter, ESLint, for `.js` only. The point of this part is not "support JavaScript" — it is to prove, with a real second tool, that Part 1's architecture ([docs/13](./13-multi-analyzer-foundation.md)) scales the way it was designed to. Pyright, Mypy, and ShellCheck are discussed only in §12 (future scalability), never implemented here.
