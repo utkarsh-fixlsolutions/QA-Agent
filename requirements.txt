@@ -1,0 +1,19 @@
+# QA Agent runtime dependencies. Install: pip install -r requirements.txt
+# Filesystem event monitoring for watch mode (isolated behind qa_agent/fsmonitor.py).
+watchdog==6.0.0
+
+# The analyzers. Both invoked as CLI binaries, never imported.
+ruff==0.15.14
+
+# A second .py analyzer (type checking, alongside ruff's linting). Runs from
+# qa_agent's own venv, not the analyzed project's - fine for that project's
+# own source, but produces real "missing import" noise for a target
+# project's third-party dependencies this venv doesn't have (confirmed by
+# dogfooding a genuinely external project, docs/step-log.md Phase C Part 6;
+# docs/12's Known Limitations has the full trade-off).
+pyright==1.1.411
+
+# A third .py analyzer (a second, independent type checker, alongside
+# pyright's) - proves three adapters can share one extension, not just two
+# (Phase C Part 7). `-O json` output only; never imported as a library.
+mypy==2.3.1

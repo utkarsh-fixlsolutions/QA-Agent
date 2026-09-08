@@ -1,0 +1,13 @@
+QA Agent report
+  Run at:  <TIMESTAMP>
+  Input:   <PROJECT>
+  Checked: 6 file(s)
+  Tools:   mypy, pyright, ruff
+
+Findings (3):
+  <PROJECT>\has_issues.py:1  [error] F401: `json` imported but unused  (ruff)
+  <PROJECT>\has_issues.py:5  [error] E711: Comparison to `None` should be `cond is None`  (ruff)
+  <PROJECT>\has_issues.py:7  [error] F841: Local variable `y` is assigned to but never used  (ruff)
+
+Skipped (1) - not checked:
+  <PROJECT>\notes.txt  (no tool configured for '.txt')
