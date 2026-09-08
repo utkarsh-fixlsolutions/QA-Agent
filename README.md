@@ -1,6 +1,6 @@
 # QA Agent
 
-A minimal, on-premise QA agent. Point it at a repository and it runs local tools (`ruff` + `pyright` + `mypy` for `.py`, `eslint` for `.js`, `shellcheck` for `.sh`) and reports **real, tool-verified issues** — file, line, severity, message, source tool. It never invents a finding: if no tool reports something, nothing is reported.
+A minimal, on-premise QA agent. Point it at a repository and it runs local tools (`ruff` + `pyright` + `mypy` for `.py`, `eslint` for `.js`/`.jsx`/`.ts`/`.tsx`, `shellcheck` for `.sh`) and reports **real, tool-verified issues** — file, line, severity, message, source tool. It never invents a finding: if no tool reports something, nothing is reported.
 
 Runs entirely on your own machine. No paid APIs, no cloud services, no network access at any point.
 
@@ -18,7 +18,7 @@ pip install -r requirements.txt
 
 Requires Python 3.8+. Pulls in `watchdog` (filesystem events), `ruff`, `pyright`, and `mypy` (the three Python analyzers).
 
-**For `.js` files:** requires Node.js/npm and a project-local ESLint install with a flat `eslint.config.(js|mjs|cjs)` — this is a prerequisite of the *project being analyzed*, not of qa_agent itself, so ESLint is never pinned in `requirements.txt`. Without it, `.js` files report a clear `ToolError` rather than being silently skipped or falsely marked clean; `.py` files are unaffected either way. See [docs/14](docs/14-first-multi-language-analyzer.md) for the full set of trade-offs (local-vs-global ESLint, ESLint 8 vs. 9 config compatibility).
+**For `.js`/`.jsx`/`.ts`/`.tsx` files:** requires Node.js/npm and a project-local ESLint install with a flat `eslint.config.(js|mjs|cjs)` — this is a prerequisite of the *project being analyzed*, not of qa_agent itself, so ESLint is never pinned in `requirements.txt`. Without it, these files report a clear `ToolError` rather than being silently skipped or falsely marked clean; `.py` files are unaffected either way. qa_agent only routes `.jsx`/`.ts`/`.tsx` files to ESLint the same way it already does `.js` — it does not bundle or configure a TypeScript/JSX parser itself, so meaningful `.ts`/`.tsx`/`.jsx` checking depends on the analyzed project's own eslint config having the parser/plugin it needs (e.g. `@typescript-eslint`); without one, ESLint reports its own honest parse error rather than qa_agent inventing or suppressing anything. See [docs/14](docs/14-first-multi-language-analyzer.md) for the original `.js` trade-offs (local-vs-global ESLint, ESLint 8 vs. 9 config compatibility) and [docs/18](docs/18-eslint-jsx-tsx-extension.md) for the extension to `.jsx`/`.ts`/`.tsx`.
 
 **For `.sh` files:** requires [ShellCheck](https://www.shellcheck.net/) on `PATH` — no pip/npm distribution, install it yourself (or use `tests/fixtures/shellcheck/fetch.ps1` for the test suite only). Without it, `.sh` files report a clear `ToolError`, exactly like a missing ruff or eslint.
 
@@ -122,11 +122,12 @@ The numbered documents are a build log: each records what was decided at that st
 | [11](docs/11-long-running-stability.md) stability · [12](docs/12-architecture.md) architecture | Phase B: hardening and overview |
 | [13](docs/13-multi-analyzer-foundation.md) multi-analyzer foundation · [14](docs/14-first-multi-language-analyzer.md) ESLint · [15](docs/15-unified-reporting.md) unified reporting · [16](docs/16-configuration-system.md) configuration | Phase C: the multi-language engine, its tools, merging their output into one report, and configuring all of it per project |
 | [17](docs/17-hardening-and-validation.md) hardening & validation | Phase C: production validation, a real bug found and fixed, current capabilities and limitations |
+| [18](docs/18-eslint-jsx-tsx-extension.md) ESLint .jsx/.ts/.tsx extension | Phase C Part 2 addendum: widening ESLint's claimed extensions beyond `.js` |
 | [step-log](docs/step-log.md) | Every step: goal, decisions, evidence, status |
 
 ## Status
 
-**Phase C complete (Parts 1-7):** five real analyzers — `ruff` + `pyright` + `mypy` (`.py`), `eslint` (`.js`), `shellcheck` (`.sh`) — run through one unified, configurable engine, merging every tool's findings into one deterministically-ordered, conservatively-deduplicated report that never hides a succeeding tool's real findings behind a failing one's error, in both one-shot and watch mode. Validated against real external repositories and every configuration option; two real, silent bugs found and fixed along the way (docs/step-log.md).
+**Phase C complete (Parts 1-7):** five real analyzers — `ruff` + `pyright` + `mypy` (`.py`), `eslint` (`.js`/`.jsx`/`.ts`/`.tsx` — extended from `.js`-only, see [docs/18](docs/18-eslint-jsx-tsx-extension.md)), `shellcheck` (`.sh`) — run through one unified, configurable engine, merging every tool's findings into one deterministically-ordered, conservatively-deduplicated report that never hides a succeeding tool's real findings behind a failing one's error, in both one-shot and watch mode. Validated against real external repositories and every configuration option; two real, silent bugs found and fixed along the way (docs/step-log.md).
 
 **Phase D complete (Parts 1-6):** an optional, local-only AI layer (Ollama) built alongside the deterministic engine without changing it - a provider abstraction, prompt/context/response-validation building blocks, per-finding explanations, a run summary, advisory-only suggested fixes, and the CLI flags and `.qa-agent.json` section above that wire it all in. With AI disabled - the default - every report is still byte-for-byte identical to Phase C. Known limitations, deferred decisions, and trade-offs are listed in [docs/12](docs/12-architecture.md), [docs/17](docs/17-hardening-and-validation.md), and [docs/step-log.md](docs/step-log.md).
 

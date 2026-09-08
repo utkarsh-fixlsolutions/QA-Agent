@@ -200,7 +200,8 @@ def test_watch_mode_banner_lists_both_analyzers(suite):
         output, alive = _watch(root, [], env=env_with_eslint(), settle=0)
     suite.check(
         "banner lists all five analyzers",
-        "Analyzers: eslint (.js), mypy (.py), pyright (.py), ruff (.py), shellcheck (.sh)"
+        "Analyzers: eslint (.js, .jsx, .ts, .tsx), mypy (.py), pyright (.py), "
+        "ruff (.py), shellcheck (.sh)"
         in output,
     )
     suite.check("watcher was alive", alive)

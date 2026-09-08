@@ -952,3 +952,23 @@ Confirms Part 5's own measurement: pyright dominates multi-tool wall time, tools
 **Deferred beyond Phase E because implementing it now would expand this step:** parallel repair, distributed execution, multi-agent systems, ranking multiple repair candidates, git integration, undo history, automatic commits, REST API, GUI, VS Code extension, watch mode repair, cloud execution, configuration redesign.
 
 **Status: Phase E Part 6 CLOSED.**
+
+---
+
+## Phase C, Part 2 Addendum — ESLint Extension: `.jsx`/`.ts`/`.tsx` Routing (2026-09-08)
+
+**Goal:** widen `ESLintAdapter` beyond the `.js`-only scope [docs/14](14-first-multi-language-analyzer.md) §5 deliberately deferred, without becoming the "build out JS/TS tooling" scope creep that document explicitly drew a line against. On branch `feature/eslint-jsx-tsx-support`, off `dev`/`main` synced at commit `4e0ed03` (all of Phases A-E present).
+
+**Design:** `ESLintAdapter.extensions` widened from `frozenset({".js"})` to `frozenset({".js", ".jsx", ".ts", ".tsx"})` - the entire code change. `build_command()` and `parse()` are already extension-agnostic (they operate on whatever `filePath`/`messages` ESLint's own JSON reports) and needed no edit; the routing-only nature of this change is exactly why. Real linting/parsing correctness for `.jsx`/`.ts`/`.tsx` remains entirely the analyzed project's own responsibility (its `eslint.config`'s `files` patterns and, for real TypeScript/JSX syntax, its own parser/plugin choice) - identical in kind to how `.js` linting already depended on that project having ESLint installed at all.
+
+**Measured (real ESLint 9.39.5, `tests/fixtures/eslint`'s real install, not assumed):** a target project whose `eslint.config` has no `files` pattern naming `.jsx`/`.ts` reports a `severity: 1` `"File ignored because no matching configuration was supplied."` advisory for those files - honest, not silent, not a crash. Once a project opts in (`files: ["**/*.js", "**/*.jsx", "**/*.ts", "**/*.tsx"]`), JS-compatible code under any of the four extensions lints identically; genuine JSX/TypeScript syntax without an aware parser produces a `fatal: true` parse error (`"Unexpected token <"`, `"The keyword 'interface' is reserved"`) - both already handled, unmodified, by the same fatal-parse-error path docs/14 §5 already proved for a plain `.js` syntax error. Full details and every measured case: [docs/18](18-eslint-jsx-tsx-extension.md).
+
+**Files changed:** `qa_agent/adapters.py` (`ESLintAdapter.extensions` + docstrings), `tests/regression/test_multi_analyzer.py` (adapter-contract assertion), `tests/integration/test_multi_language.py` (live banner assertion, `eslint (.js)` -> `eslint (.js, .jsx, .ts, .tsx)`), `README.md` (summary line, prerequisite paragraph, docs table, status line), `docs/14-first-multi-language-analyzer.md` (addendum pointer, historical content otherwise untouched), `docs/18-eslint-jsx-tsx-extension.md` (new). **Untouched:** `runner.py`, `report.py`, `__main__.py`, `watch.py`, every other adapter - the watch-mode banner and `watched_extensions` are already built generically from `adapter.extensions` (docs/14 §6), so this needed zero changes outside `adapters.py` itself, the same "register/widen and the rest follows" property Part 2 first proved.
+
+**Verified:** `python tests/run_all.py` - **23/24 suites** (the one failure is `test_watch_pipeline.py`'s pre-existing, unrelated timing flake, documented in every part since Phase D Part 4).
+
+**Dogfooding, real CLI, real files, no fakes:** `python -m qa_agent <dir>` run against a real scratch project (`eslint.config.js` opted in to all four extensions, `plain.jsx`/`plain.ts` with JS-compatible content, `real.jsx`/`real.ts` with genuine JSX/TypeScript syntax) - all 5 files routed to `eslint` and checked (previously, the `.jsx`/`.ts` files would have been silently skipped, matched by no adapter at all); real findings reported for all four extensions, including both the `no-unused-vars` case and the fatal-parse-error case, exit code 1.
+
+**Deferred:** bundling `@typescript-eslint` or any JSX/TypeScript-aware parser as a qa_agent-side default, auto-scaffolding a target project's `eslint.config` for these extensions, `.mjs`/`.cjs` (a separate, already-named gap from docs/14's own "Discoveries made during implementation").
+
+**Status: Phase C Part 2 addendum CLOSED.**

@@ -13,11 +13,13 @@ which tool, or which exit codes are normal for it.
 `ADAPTERS` is a tuple of adapters rather than an extension-keyed dict, so more
 than one adapter can claim the same extension without changing anything
 outside this file. Registers five adapters: ruff, pyright, and mypy on .py,
-eslint on .js, shellcheck on .sh (docs/step-log.md, Phase C Parts 5 and 7) -
-ruff+pyright was the first real (not fake-adapter-only) exercise of two tools
-sharing an extension, mypy is the first exercise of three, and shellcheck is
-the first adapter for a language none of the others touch at all. None of
-them needed any change to this module's contract.
+eslint on .js/.jsx/.ts/.tsx, shellcheck on .sh (docs/step-log.md, Phase C
+Parts 5 and 7; eslint's own extension set widened in a later addendum, see
+docs/18-eslint-jsx-tsx-extension.md) - ruff+pyright was the first real (not
+fake-adapter-only) exercise of two tools sharing an extension, mypy is the
+first exercise of three, and shellcheck is the first adapter for a language
+none of the others touch at all. None of them needed any change to this
+module's contract - widening eslint's own `extensions` didn't either.
 """
 
 from __future__ import annotations
@@ -98,10 +100,22 @@ _ESLINT_SEVERITY_NAMES = {1: "warning", 2: "error"}
 
 
 class ESLintAdapter:
-    """Adapter for ESLint (docs/14-first-multi-language-analyzer.md).
+    """Adapter for ESLint (docs/14-first-multi-language-analyzer.md,
+    docs/18-eslint-jsx-tsx-extension.md).
 
-    .js only for now - TypeScript needs its own parser/plugin and its own
-    due diligence, deliberately deferred rather than bundled in here.
+    Claims .js, .jsx, .ts, and .tsx. This adapter only routes files to the
+    analyzed project's own `eslint` and its own eslint.config - it parses
+    ESLint's output, never any source file itself - so widening the claimed
+    extensions is the entire change; build_command()/parse() below are
+    already extension-agnostic and needed no edit. Real TypeScript checking
+    still depends entirely on that project's own config having
+    @typescript-eslint's parser/plugin set up, exactly as real JS linting
+    already depended on that project having eslint installed at all
+    (README's ".js files" prerequisite, now ".js/.jsx/.ts/.tsx"). A project
+    without TypeScript parsing configured gets ESLint's own honest parse
+    error or fatal config error back, through the same ToolError/parse()
+    handling every other unparseable-batch case already uses below -
+    nothing TypeScript-specific is added or assumed on qa_agent's side.
 
     Unlike ruff, a nonzero exit does not mean the tool failed: exit 1 is
     ESLint's normal way of saying "there are errors in the code" (it has no
@@ -117,7 +131,7 @@ class ESLintAdapter:
     """
 
     name = "eslint"
-    extensions = frozenset({".js"})
+    extensions = frozenset({".js", ".jsx", ".ts", ".tsx"})
     ok_exit_codes = frozenset({0, 1})
     use_shell = True
 
