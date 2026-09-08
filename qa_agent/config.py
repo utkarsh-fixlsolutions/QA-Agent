@@ -30,11 +30,49 @@ CONFIG_FILENAME = ".qa-agent.json"
 # keep in sync by hand than to justify a cross-module import for.
 SEVERITY_LEVELS = {"style": 1, "note": 1, "info": 2, "information": 2, "warning": 3, "error": 4}
 
-_ALLOWED_KEYS = {"analyzers", "ignore", "include", "min_severity"}
+_ALLOWED_KEYS = {"analyzers", "ignore", "include", "min_severity", "ai"}
+
+# Phase D Part 6: the only providers the AI package actually implements
+# (docs/step-log.md) - Ollama for real use, Mock for tests. A name outside
+# this set is rejected the same way an unknown analyzer name already is:
+# a typo must never silently mean "AI quietly does nothing".
+_KNOWN_AI_PROVIDERS = {"ollama", "mock"}
+
+_ALLOWED_AI_KEYS = {
+    "enabled", "provider", "model", "endpoint", "timeout", "explain", "summary", "suggest_fixes",
+}
 
 
 class ConfigError(Exception):
     """The config file itself is unusable. Reported clearly, never guessed past."""
+
+
+@dataclass(frozen=True)
+class AIConfig:
+    """Optional AI enrichment settings (Phase D Part 6).
+
+    `enabled` is a master switch: `explain`/`summary`/`suggest_fixes` only
+    ever run when it is also true - the same shape the example config in
+    docs/step-log.md's Part 6 entry uses (all three could be `true` while
+    `enabled` is `false`, and nothing would run). `model`/`endpoint`/
+    `timeout` of `None` mean "use the provider's own default" - not
+    duplicated here; the AI package's own provider classes already own
+    those defaults, this module only ever overrides them when a project
+    asks to. This module never imports that package at all - it only ever
+    produces this plain data value, which `__main__.py` later reads.
+    """
+
+    enabled: bool = False
+    provider: str = "ollama"
+    model: object = None  # str | None
+    endpoint: object = None  # str | None
+    timeout: object = None  # float | None
+    explain: bool = False
+    summary: bool = False
+    suggest_fixes: bool = False
+
+
+DEFAULT_AI_CONFIG = AIConfig()
 
 
 @dataclass(frozen=True)
@@ -49,6 +87,7 @@ class Config:
     include: frozenset = field(default_factory=frozenset)
     min_severity: object = None  # "warning" | "error" | None
     path: object = None  # Path this was loaded from, or None for the defaults
+    ai: AIConfig = field(default_factory=AIConfig)  # Phase D Part 6, defaults to all-disabled
 
 
 DEFAULT_CONFIG = Config()
@@ -128,6 +167,7 @@ def load(path, known_analyzers):
         include=include,
         min_severity=min_severity,
         path=path,
+        ai=_load_ai_config(raw, path),
     )
 
 
@@ -137,6 +177,74 @@ def _string_list(raw, key, path):
     value = raw[key]
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ConfigError("'{}' setting '{}' must be a list of strings".format(path, key))
+    return value
+
+
+def _load_ai_config(raw, path):
+    """Validate and parse the optional "ai" section (Phase D Part 6) - the
+    same strict style as every other setting: an unrecognized key or a
+    wrong-typed value is a ConfigError, never silently ignored or guessed
+    past. Absent entirely, every field keeps AIConfig's own default (AI
+    off) - zero-config behavior is unaffected either way.
+    """
+    if "ai" not in raw:
+        return DEFAULT_AI_CONFIG
+
+    ai_raw = raw["ai"]
+    if not isinstance(ai_raw, dict):
+        raise ConfigError("'{}' setting 'ai' must be a JSON object".format(path))
+
+    unknown = set(ai_raw) - _ALLOWED_AI_KEYS
+    if unknown:
+        raise ConfigError(
+            "'{}' has unrecognized 'ai' setting(s): {}".format(path, ", ".join(sorted(unknown)))
+        )
+
+    provider = ai_raw.get("provider", DEFAULT_AI_CONFIG.provider)
+    if not isinstance(provider, str) or provider not in _KNOWN_AI_PROVIDERS:
+        raise ConfigError(
+            "'{}' has an invalid 'ai.provider' {!r} (must be one of: {})".format(
+                path, provider, ", ".join(sorted(_KNOWN_AI_PROVIDERS))
+            )
+        )
+
+    timeout = ai_raw.get("timeout")
+    if timeout is not None and (
+        isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0
+    ):
+        raise ConfigError(
+            "'{}' has an invalid 'ai.timeout' {!r} (must be a positive number)".format(
+                path, timeout
+            )
+        )
+
+    return AIConfig(
+        enabled=_ai_bool(ai_raw, "enabled", path),
+        provider=provider,
+        model=_ai_string(ai_raw, "model", path),
+        endpoint=_ai_string(ai_raw, "endpoint", path),
+        timeout=timeout,
+        explain=_ai_bool(ai_raw, "explain", path),
+        summary=_ai_bool(ai_raw, "summary", path),
+        suggest_fixes=_ai_bool(ai_raw, "suggest_fixes", path),
+    )
+
+
+def _ai_bool(raw, key, path):
+    if key not in raw:
+        return False
+    value = raw[key]
+    if not isinstance(value, bool):
+        raise ConfigError("'{}' setting 'ai.{}' must be true or false".format(path, key))
+    return value
+
+
+def _ai_string(raw, key, path):
+    if key not in raw:
+        return None
+    value = raw[key]
+    if not isinstance(value, str):
+        raise ConfigError("'{}' setting 'ai.{}' must be a string".format(path, key))
     return value
 
 
