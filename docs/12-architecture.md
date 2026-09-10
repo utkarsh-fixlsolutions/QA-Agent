@@ -67,9 +67,11 @@ Each link knows only the next one's interface. The monitor has never heard of ru
 | `analysis_bridge.py` | Orchestration: paths → `AnalysisOutcome` | `adapters`, `runner` |
 | `live_report.py` | Watch-stream presentation | `fsmonitor`, `report` |
 | `watch.py` | Process lifecycle only | stdlib only |
+| `ai/` | Optional AI layer: provider, prompts, explain/summarize/suggest-fix, the full repair-proposal-through-verified-application pipeline (docs/step-log.md, Phases D-E). Not on the diagram above - purely additive, wired in only by `__main__.py`. | provider (Ollama/mock) only |
+| `project/` | Deterministic Project Discovery Engine (docs/19, Phase F Part 1): `discover_project(root)` builds an evidence-backed `ProjectKnowledge` - languages, frameworks, package managers, repository/application type - from one filesystem walk. Extended in Phase F Part 2 (docs/20) with `build_repository_context(project)`, a pure transformation of `ProjectKnowledge` into a richer, still-deterministic `RepositoryContext` (architecture/layout summaries, constraints, known limitations) - not wired into `qa_agent/ai/`. No AI, no subprocess, no network; not on the diagram above either - it runs standalone via `discover`/`discover --context`. | `runner.IGNORED_DIRS` only (one constant, read-only) |
 | `__main__.py` | CLI parsing and composition root | everything |
 
-`watch.py` imports nothing from the package — the clearest sign the lifecycle stayed separate from the work.
+`watch.py` imports nothing from the package — the clearest sign the lifecycle stayed separate from the work. `ai/` and `project/` are each one-directional leaves of their own: neither imports the other, neither is imported by any pipeline module above, and each is wired in only at `__main__.py`, the one composition root.
 
 ## Event flow, step by step
 
