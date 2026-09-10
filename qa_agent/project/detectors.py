@@ -363,7 +363,15 @@ _CONFIGURATION_PREFIXES = (
     ".babelrc",
 )
 
-_RUNTIME_BASENAMES = {"main.py", "app.py", "server.js", "server.ts", "index.ts", "index.js", "manage.py"}
+_RUNTIME_BASENAMES = {
+    "main.py", "app.py", "server.js", "server.ts", "index.ts", "index.js", "manage.py",
+    # Added in Phase G Part 1 (docs/21-runtime-qa-planning-engine.md): Next.js's
+    # real middleware convention is a root-level middleware.ts/.js file, not a
+    # directory - missing here meant the planner's Middleware check could
+    # never fire for a real Next.js app (found dogfooding against lms-ai,
+    # which has exactly this file and no middleware/ directory at all).
+    "middleware.ts", "middleware.js",
+}
 
 
 def _categorize_one(rel):

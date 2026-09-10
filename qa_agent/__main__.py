@@ -42,6 +42,8 @@ from .project import (
 from .project import build_repository_context, discover_project
 from .project import render as render_discovery
 from .project import render_context
+from .runtime import plan_runtime_qa
+from .runtime import render as render_runtime_plan
 from .report import (
     render,
     render_config_error,
@@ -276,12 +278,24 @@ def _discover_main(argv):
         "--context", action="store_true",
         help="also build and print the RepositoryContext (Phase F Part 2) - still read-only, no AI",
     )
+    parser.add_argument(
+        "--runtime-plan", action="store_true",
+        help=(
+            "also build and print a RuntimeQAPlan (Phase G Part 1) - what should be "
+            "tested and why, in what order; nothing is ever executed. Implies --context, "
+            "so the evidence behind each planned check is always shown alongside it."
+        ),
+    )
     args = parser.parse_args(argv)
 
     result = discover_project(args.project_path)
     print(render_discovery(result))
-    if args.context and result.project is not None:
-        print(render_context(build_repository_context(result.project)))
+    context = None
+    if (args.context or args.runtime_plan) and result.project is not None:
+        context = build_repository_context(result.project)
+        print(render_context(context))
+    if args.runtime_plan and context is not None:
+        print(render_runtime_plan(plan_runtime_qa(context)))
     if result.status in (
         _DISCOVERY_STATUS_INVALID_ROOT,
         _DISCOVERY_STATUS_PERMISSION_DENIED,

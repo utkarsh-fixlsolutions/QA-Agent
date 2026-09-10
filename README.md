@@ -44,6 +44,7 @@ python -m qa_agent <input> --output r.md   also save the report as Markdown
 python -m qa_agent watch <dir>             analyze files as you save them (Ctrl+C to stop)
 python -m qa_agent discover <dir>          print a deterministic project profile (no AI, no analyzers)
 python -m qa_agent discover <dir> --context  ...plus a derived repository-context summary (Phase F Part 2)
+python -m qa_agent discover <dir> --runtime-plan  ...plus what should be runtime-tested and why (Phase G Part 1, never executed)
 ```
 
 Exit codes: `0` no findings / clean shutdown · `1` findings reported · `2` tool, input, or write error.
@@ -123,6 +124,8 @@ A read-only, deterministic pass over the repository's own files — languages, f
 
 Add `--context` for a derived, still fully deterministic repository summary built on top - an ordered architecture summary, a repository-layout description, factual constraints ("TypeScript project", "Requires Node", "Dockerized"), and a curated list of known gaps ("No CI configuration detected"). Not wired into the AI layer - produced and printable only, for now. See [docs/20](docs/20-repository-context-engine.md).
 
+Add `--runtime-plan` for a deterministic, evidence-based list of *what should be tested and why* - server startup, API endpoints, middleware, Docker, CI, and more, each with a reason, its supporting evidence, a priority, a dependency order, and an expected result. Nothing is ever executed - this plans, it does not run anything. Only about half the categories a full runtime-QA vision would eventually cover are implemented yet (no database/auth/session/queue/cache detection exists in the deterministic layer today) - named honestly rather than faked. See [docs/21](docs/21-runtime-qa-planning-engine.md).
+
 ## What it does not do
 
 No automatic code edits · no CI integration · no dashboard · no cloud · no continuous full-repo scanning. AI (above) is optional, local-only (Ollama), and advisory-only - it never edits a file or applies a fix itself.
@@ -134,7 +137,7 @@ python tests/run_all.py            everything, about a minute
 python tests/run_all.py --quick    skip the stress suites
 ```
 
-Twenty-six suites covering the Phase A CLI against golden files, debounce semantics, every adapter's parsing and the generic runner mechanisms, the config system (including the optional AI section), the bridge contract, long-running stability, analyzer timeout and recovery, the full watch pipeline as a real process, multi-tool projects against real installs, filesystem storms, the AI provider/prompt/explanation/summary/fix/repair/CLI-integration layers, the deterministic Project Discovery Engine (languages, frameworks, package managers, repository/application type, ignore policy, symlinks, permissions, determinism), and the Repository Context Engine built on top of it (architecture/layout summaries, constraints, known limitations, serialization).
+Twenty-seven suites covering the Phase A CLI against golden files, debounce semantics, every adapter's parsing and the generic runner mechanisms, the config system (including the optional AI section), the bridge contract, long-running stability, analyzer timeout and recovery, the full watch pipeline as a real process, multi-tool projects against real installs, filesystem storms, the AI provider/prompt/explanation/summary/fix/repair/CLI-integration layers, the deterministic Project Discovery Engine (languages, frameworks, package managers, repository/application type, ignore policy, symlinks, permissions, determinism), the Repository Context Engine built on top of it (architecture/layout summaries, constraints, known limitations, serialization), and the Runtime QA Planning Engine built on top of that (evidence-gated checks, dependency ordering, serialization, never executes anything).
 
 **Some integration suites need real tool installs, once:** `npm install` inside `tests/fixtures/eslint`, and `powershell -File tests/fixtures/shellcheck/fetch.ps1` (both gitignored, same as this project's own `.venv` for Python and pyright). Tests that need them skip cleanly and visibly if this hasn't been done — the rest of the suite runs regardless.
 
@@ -156,6 +159,7 @@ The numbered documents are a build log: each records what was decided at that st
 | [18](docs/18-eslint-jsx-tsx-extension.md) ESLint .jsx/.ts/.tsx extension | Phase C Part 2 addendum: widening ESLint's claimed extensions beyond `.js` |
 | [19](docs/19-project-discovery-engine.md) project discovery | Phase F Part 1: a deterministic project-structure model - languages, frameworks, package managers - for future runtime-QA phases to consume |
 | [20](docs/20-repository-context-engine.md) repository context | Phase F Part 2: a derived, still-deterministic repository summary (architecture, layout, constraints, known limitations) built on top of Part 1 - produced, not yet consumed by the AI layer |
+| [21](docs/21-runtime-qa-planning-engine.md) runtime QA planning | Phase G Part 1: a deterministic plan of what should be runtime-tested and why, built on top of Part 2 - never executes anything; honestly scoped to only the evidence Parts 1-2 can actually detect today |
 | [step-log](docs/step-log.md) | Every step: goal, decisions, evidence, status |
 
 ## Status
@@ -169,3 +173,5 @@ The numbered documents are a build log: each records what was decided at that st
 **Phase F Part 1 complete:** a deterministic Project Discovery Engine (`qa_agent/project/`, `discover_project(root)`) that builds a structured, evidence-backed profile of a repository - languages, frameworks, package managers, build systems, repository/application type, and every important file/directory - each fact traceable to a real file on disk, nothing invented or inferred. No AI, no subprocess, no network; a single filesystem walk, reusing and extending the existing ignore policy. Read-only via `python -m qa_agent discover <path>`. Not consumed by anything yet - this is the foundation later runtime-QA phases will build on, not runtime testing itself. See [docs/19](docs/19-project-discovery-engine.md).
 
 **Phase F Part 2 complete:** a Repository Context Engine (`qa_agent/project/context.py`/`context_builder.py`, `build_repository_context(project)`) that turns Part 1's `ProjectKnowledge` into a richer, still entirely deterministic `RepositoryContext` - an ordered architecture summary, a repository-layout description, factual constraints, and a curated, finite list of known limitations, plus lossless dict/JSON serialization. References `ProjectKnowledge` rather than duplicating it. Deliberately **not** wired into any AI prompt builder - `qa_agent/ai/` is entirely untouched by this part, confirmed by a direct source-grep test; that integration is an explicit, separate decision for a later phase. Read-only via `python -m qa_agent discover <path> --context`. See [docs/20](docs/20-repository-context-engine.md).
+
+**Phase G Part 1 complete:** a Runtime QA Planning Engine (`qa_agent/runtime/`, `plan_runtime_qa(context)`) that converts a `RepositoryContext` into a deterministic, dependency-ordered `RuntimeQAPlan` - what should be tested, why, in what order, with what dependencies - never executing anything. 19 check types across server startup, API endpoints, middleware, frontend routes, Docker, CI, build verification, and framework-specific clusters for Next.js App Router and FastAPI, each backed by real evidence. Honestly scoped: roughly half the categories a full runtime-QA vision would eventually need (database/ORM, authentication, WebSockets, caching, queues, and more) have no evidence detector yet and are explicitly not faked - named as deferred work, not silently dropped. Read-only via `python -m qa_agent discover <path> --runtime-plan`. See [docs/21](docs/21-runtime-qa-planning-engine.md).
