@@ -368,15 +368,22 @@ def test_render_markdown_produces_a_real_table(suite):
 # --- pure-function guarantees -------------------------------------------
 
 def test_planner_modules_never_import_subprocess_http_or_browser(suite):
+    """Scoped to Part 1's own four files, not the whole `qa_agent/runtime/`
+    directory - Part 2 (docs/22) legitimately added `executor.py`, which
+    imports `subprocess` by design (that is its entire job). This test's
+    job is only ever "the *planning* logic stays pure" - checked precisely
+    by naming Part 1's own files, not swept up wholesale as the directory
+    grows with later, deliberately different parts.
+    """
     package_dir = Path(__file__).resolve().parent.parent.parent / "qa_agent" / "runtime"
     offending = []
     banned = ("import subprocess", "import requests", "urllib.request", "playwright", "selenium", "socket.")
-    for path in package_dir.glob("*.py"):
-        text = path.read_text(encoding="utf-8")
+    for name in ("models.py", "rules.py", "planner.py", "render.py"):
+        text = (package_dir / name).read_text(encoding="utf-8")
         if any(b in text for b in banned):
-            offending.append(path.name)
+            offending.append(name)
     suite.check(
-        "no file in qa_agent/runtime/ imports subprocess/requests/a browser driver",
+        "no Phase G Part 1 planning file imports subprocess/requests/a browser driver",
         offending == [],
         " ({})".format(offending),
     )

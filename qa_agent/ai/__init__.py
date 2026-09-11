@@ -68,6 +68,26 @@ is intentionally not re-exported here - `validator.py`'s already-exported
 constant of the same name carries the identical value, and re-exporting a
 second module's constant under that name would shadow it. Also not wired
 into `__main__.py`, any pipeline module, watch mode, or any CLI flag.
+
+`diagnosis.py`/`diagnosis_models.py`/`diagnosis_prompts.py`/
+`diagnosis_parser.py` (Phase G Part 3) are this package's second exception
+to "nothing in this package imports the deterministic engine" -
+`diagnose_runtime_failure`/`diagnose_runtime_failures` read a real
+`qa_agent.runtime.RuntimeCheckResult`/`RuntimeExecutionResult` and a real
+`qa_agent.project.RepositoryContext` as plain input data, the same
+direction `validator.py` already established for `runner.run`'s output.
+The reverse is never true: `qa_agent/runtime/` still imports nothing from
+this package, enforced by its own isolation tests. The AI never determines
+whether a runtime check passed or failed - Phase G Part 2's own
+`RuntimeCheckResult.status` remains the sole authority; this module only
+interprets evidence for checks already determined to have failed
+(`fail`/`timeout`/`error`), returning `NOT_APPLICABLE` with zero provider
+calls for anything else. Every claim in a returned `RuntimeDiagnosis` is
+checked against the real supplied evidence before being accepted
+(`response_is_grounded`) - an unsupported claim becomes `INVALID_RESPONSE`,
+never a silently-accepted fabrication. Wired into the CLI only via
+`discover --diagnose` (implies `--execute-runtime-plan`); AI is off by
+default, exactly like every other AI feature in this project.
 """
 
 from .apply import (
@@ -77,6 +97,28 @@ from .apply import (
     reject_repair,
 )
 from .context import CodeContext, extract_context
+from .diagnosis import (
+    diagnose_runtime_failure,
+    diagnose_runtime_failures,
+    diagnosis_to_dict,
+    diagnoses_to_json,
+    render_diagnosis,
+)
+from .diagnosis_models import (
+    DIAGNOSIS_AI_ERROR,
+    DIAGNOSIS_DIAGNOSED,
+    DIAGNOSIS_INSUFFICIENT_CONTEXT,
+    DIAGNOSIS_INVALID_RESPONSE,
+    DIAGNOSIS_NOT_APPLICABLE,
+    DIAGNOSIS_STATUSES,
+    SEVERITIES,
+    SEVERITY_ERROR,
+    SEVERITY_INFO,
+    SEVERITY_WARNING,
+    RuntimeDiagnosis,
+)
+from .diagnosis_parser import DiagnosisResponse, response_is_grounded, validate_diagnosis_response
+from .diagnosis_prompts import build_diagnosis_prompt
 from .decision import (
     ACTION_ACCEPT_CANDIDATE,
     ACTION_HOLD,
@@ -121,6 +163,39 @@ from .response_parser import (
     validate_repair_response,
     validate_summary_response,
 )
+from .runtime_repair import (
+    check_repair_eligibility,
+    propose_runtime_repair,
+    render_runtime_repair_result,
+    repair_runtime_failure,
+    repair_runtime_failures,
+    resolve_repair_target,
+    runtime_repair_result_to_dict,
+    runtime_repair_results_to_json,
+)
+from .runtime_repair_models import (
+    APPLY_NOT_ATTEMPTED,
+    ELIGIBILITY_ELIGIBLE,
+    ELIGIBILITY_NOT_ELIGIBLE,
+    OUTCOME_ACCEPTED,
+    OUTCOME_APPLIED,
+    OUTCOME_APPLIED_BUT_STILL_FAILING,
+    OUTCOME_ERROR,
+    OUTCOME_HELD,
+    OUTCOME_NOT_ELIGIBLE,
+    OUTCOME_PROPOSAL_FAILED,
+    OUTCOME_REJECTED,
+    OUTCOME_VALIDATION_FAILED,
+    OUTCOME_VERIFIED,
+    OUTCOMES as RUNTIME_REPAIR_OUTCOMES,
+    VERIFICATION_NOT_APPLICABLE,
+    VERIFICATION_STILL_FAILING,
+    VERIFICATION_UNKNOWN,
+    VERIFICATION_VERIFIED,
+    EligibilityResult,
+    RuntimeRepairResult,
+    TargetResolution,
+)
 from .schemas import (
     STATUS_INSUFFICIENT_CONTEXT,
     STATUS_INVALID,
@@ -156,10 +231,21 @@ __all__ = [
     "ACTION_REJECT",
     "ACTION_VALIDATION_FAILED",
     "AIProvider",
+    "APPLY_NOT_ATTEMPTED",
     "AppliedRepair",
     "CodeContext",
     "ConnectionResult",
     "DEFAULT_MAX_ITERATIONS",
+    "DIAGNOSIS_AI_ERROR",
+    "DIAGNOSIS_DIAGNOSED",
+    "DIAGNOSIS_INSUFFICIENT_CONTEXT",
+    "DIAGNOSIS_INVALID_RESPONSE",
+    "DIAGNOSIS_NOT_APPLICABLE",
+    "DIAGNOSIS_STATUSES",
+    "DiagnosisResponse",
+    "ELIGIBILITY_ELIGIBLE",
+    "ELIGIBILITY_NOT_ELIGIBLE",
+    "EligibilityResult",
     "Explanation",
     "ExplanationResponse",
     "FixResponse",
@@ -167,6 +253,16 @@ __all__ = [
     "LLMResponse",
     "MockProvider",
     "OllamaProvider",
+    "OUTCOME_ACCEPTED",
+    "OUTCOME_APPLIED",
+    "OUTCOME_APPLIED_BUT_STILL_FAILING",
+    "OUTCOME_ERROR",
+    "OUTCOME_HELD",
+    "OUTCOME_NOT_ELIGIBLE",
+    "OUTCOME_PROPOSAL_FAILED",
+    "OUTCOME_REJECTED",
+    "OUTCOME_VALIDATION_FAILED",
+    "OUTCOME_VERIFIED",
     "Prompt",
     "RepairApplicationResult",
     "RepairAttemptOutcome",
@@ -176,6 +272,13 @@ __all__ = [
     "RepairProposal",
     "RepairResponse",
     "RepairValidationResult",
+    "RuntimeDiagnosis",
+    "RuntimeRepairResult",
+    "RUNTIME_REPAIR_OUTCOMES",
+    "SEVERITIES",
+    "SEVERITY_ERROR",
+    "SEVERITY_INFO",
+    "SEVERITY_WARNING",
     "STATUS_APPLIED",
     "STATUS_APPLY_FAILED",
     "STATUS_ERROR",
@@ -193,7 +296,12 @@ __all__ = [
     "SuggestedFix",
     "Summary",
     "SummaryResponse",
+    "TargetResolution",
     "TemporaryWorkspace",
+    "VERIFICATION_NOT_APPLICABLE",
+    "VERIFICATION_STILL_FAILING",
+    "VERIFICATION_UNKNOWN",
+    "VERIFICATION_VERIFIED",
     "ValidationComparison",
     "ValidationResult",
     "apply_repair",
@@ -203,22 +311,38 @@ __all__ = [
     "build_fix_prompt",
     "build_repair_prompt",
     "build_summary_prompt",
+    "build_diagnosis_prompt",
+    "check_repair_eligibility",
     "cleanup_workspace",
     "compare_results",
     "create_workspace",
     "decide_repair",
+    "diagnose_runtime_failure",
+    "diagnose_runtime_failures",
+    "diagnoses_to_json",
+    "diagnosis_to_dict",
     "explain_finding",
     "explain_findings",
     "extract_context",
     "parse_json_response",
     "propose_repair",
     "propose_repairs",
+    "propose_runtime_repair",
     "reject_repair",
+    "render_diagnosis",
+    "render_runtime_repair_result",
+    "repair_runtime_failure",
+    "repair_runtime_failures",
+    "resolve_repair_target",
+    "response_is_grounded",
     "run_repair_loop",
+    "runtime_repair_result_to_dict",
+    "runtime_repair_results_to_json",
     "strip_markdown_fence",
     "suggest_fix",
     "suggest_fixes",
     "summarize_run",
+    "validate_diagnosis_response",
     "validate_explanation_response",
     "validate_fix_response",
     "validate_repair",

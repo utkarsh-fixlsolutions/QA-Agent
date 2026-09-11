@@ -27,6 +27,8 @@ from pathlib import Path
 
 from .adapters import ADAPTERS, ToolError
 from .ai import MockProvider, OllamaProvider, explain_findings, summarize_run
+from .ai import diagnose_runtime_failures, render_diagnosis
+from .ai import repair_runtime_failures, render_runtime_repair_result
 from .ai import suggest_fixes as ai_suggest_fixes
 from .gitdiff import changed_files, describe
 from .analysis_bridge import AnalysisBridge
@@ -42,8 +44,9 @@ from .project import (
 from .project import build_repository_context, discover_project
 from .project import render as render_discovery
 from .project import render_context
-from .runtime import plan_runtime_qa
+from .runtime import plan_runtime_qa, run_runtime_plan
 from .runtime import render as render_runtime_plan
+from .runtime import render_execution
 from .report import (
     render,
     render_config_error,
@@ -257,20 +260,24 @@ def _watch_main(argv):
 
 
 def _discover_main(argv):
-    """`python -m qa_agent discover <path>` (Phase F Part 1, docs/19). A
-    read-only command, deliberately kept as small as `_watch_main` is
-    large: it calls `discover_project()`, prints `render()`'s output, and
-    exits - no AI, no analyzers, no repair, nothing else. Exists for
-    dogfooding and debugging the discovery engine directly, matching the
-    CLI-visibility docs/19 itself required.
+    """`python -m qa_agent discover <path>` (Phase F Part 1, docs/19). No
+    analyzers, ever. Read-only unless `--execute-runtime-plan` (Phase G
+    Part 2, launches real subprocesses) or `--repair-runtime` (Phase G Part
+    4, the only flag that can write to the real repository - see its own
+    help text) is given; AI (`--diagnose`, Phase G Part 3; `--repair-runtime`)
+    is off unless explicitly requested, exactly like every other AI feature
+    in this project. Exists for dogfooding and debugging the discovery/
+    planning/execution/diagnosis/repair engines directly.
     """
     parser = argparse.ArgumentParser(
         prog="qa_agent discover",
         description=(
             "Print a deterministic, evidence-based profile of a project's "
             "structure - languages, frameworks, package managers, and "
-            "important files/directories. No AI, no analyzers, no repair, "
-            "no network, no subprocess."
+            "important files/directories. No AI, no analyzers, no network. "
+            "Read-only unless --execute-runtime-plan (launches real "
+            "subprocesses) or --repair-runtime (the only flag that can "
+            "write to the real repository) is given - see their own help text."
         ),
     )
     parser.add_argument("project_path", help="directory to inspect")
@@ -286,16 +293,75 @@ def _discover_main(argv):
             "so the evidence behind each planned check is always shown alongside it."
         ),
     )
+    parser.add_argument(
+        "--execute-runtime-plan", action="store_true",
+        help=(
+            "also actually run the planned checks it knows how to (Phase G Part 2) - "
+            "launches real subprocesses (build/test commands, a real dev-server process "
+            "it always terminates afterward). Every other planned check reports "
+            "not_implemented. Implies --runtime-plan."
+        ),
+    )
+    parser.add_argument(
+        "--diagnose", action="store_true",
+        help=(
+            "also ask AI to interpret why each failed check failed (Phase G Part 3) - "
+            "the deterministic result stays authoritative; AI only explains it, and only "
+            "for checks that actually failed/timed out/errored. Off by default: without "
+            "this flag, zero AI calls are made. Implies --execute-runtime-plan."
+        ),
+    )
+    parser.add_argument(
+        "--repair-runtime", action="store_true",
+        help=(
+            "also attempt a verified repair for each DIAGNOSED runtime failure (Phase G Part 4) - "
+            "reuses the existing Phase E repair pipeline end to end: a candidate patch is proposed, "
+            "applied only inside a temporary workspace, validated, and written to this real repository "
+            "only if a deterministic decision accepts it and the original runtime check is confirmed "
+            "passing afterward. At most one repair attempt per failure. --diagnose alone never modifies "
+            "any file; this flag is required for any real write. Implies --diagnose."
+        ),
+    )
+    parser.add_argument(
+        "--ai-provider", choices=_AI_PROVIDER_CHOICES, default="ollama",
+        help="AI provider for --diagnose/--repair-runtime: 'ollama' (default, needs a local Ollama "
+             "server) or 'mock' (tests)",
+    )
+    parser.add_argument("--ai-model", metavar="MODEL",
+                         help="override the default model for --diagnose/--repair-runtime")
     args = parser.parse_args(argv)
+
+    want_diagnose = args.diagnose or args.repair_runtime
 
     result = discover_project(args.project_path)
     print(render_discovery(result))
     context = None
-    if (args.context or args.runtime_plan) and result.project is not None:
+    want_plan = args.context or args.runtime_plan or args.execute_runtime_plan or want_diagnose
+    if want_plan and result.project is not None:
         context = build_repository_context(result.project)
         print(render_context(context))
-    if args.runtime_plan and context is not None:
-        print(render_runtime_plan(plan_runtime_qa(context)))
+    plan = None
+    if (args.runtime_plan or args.execute_runtime_plan or want_diagnose) and context is not None:
+        plan = plan_runtime_qa(context)
+        print(render_runtime_plan(plan))
+    execution = None
+    if (args.execute_runtime_plan or want_diagnose) and plan is not None:
+        execution = run_runtime_plan(plan, args.project_path)
+        print(render_execution(execution))
+    diagnoses = None
+    if want_diagnose and execution is not None and context is not None:
+        kwargs = {} if not args.ai_model else {"model": args.ai_model}
+        provider = MockProvider(**kwargs) if args.ai_provider == "mock" else OllamaProvider(**kwargs)
+        diagnoses = diagnose_runtime_failures(execution, context, provider)
+        rendered = [render_diagnosis(d) for d in diagnoses]
+        rendered = [text for text in rendered if text]
+        if rendered:
+            print("\n\n".join(rendered))
+        if args.repair_runtime:
+            repairs = repair_runtime_failures(execution, diagnoses, context, provider, args.project_path)
+            rendered_repairs = [render_runtime_repair_result(r) for r in repairs]
+            if rendered_repairs:
+                print("\n\n".join(rendered_repairs))
     if result.status in (
         _DISCOVERY_STATUS_INVALID_ROOT,
         _DISCOVERY_STATUS_PERMISSION_DENIED,
