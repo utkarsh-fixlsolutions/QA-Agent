@@ -4,9 +4,11 @@
   python -m qa_agent --git-diff [REF]      check only what git reports as changed
   ... --output report.md                   also write the report to a file
   python -m qa_agent watch <dir>           run as a long-running process
+  python -m qa_agent discover <dir>        print a deterministic project profile (Phase F Part 1)
 
-A directory literally named "watch" must be given as an explicit path (for
-example "./watch" or an absolute path), since a bare "watch" selects watch mode.
+A directory literally named "watch" or "discover" must be given as an
+explicit path (for example "./watch" or an absolute path), since a bare
+"watch"/"discover" selects that subcommand instead.
 
 Exit codes:
   0  ran cleanly, no findings
@@ -32,6 +34,14 @@ from .config import ConfigError, resolve as resolve_config
 from .debouncer import Debouncer
 from .fsmonitor import FileSystemMonitor
 from .live_report import LiveReporter
+from .project import (
+    STATUS_DISCOVERY_FAILED as _DISCOVERY_STATUS_FAILED,
+    STATUS_INVALID_ROOT as _DISCOVERY_STATUS_INVALID_ROOT,
+    STATUS_PERMISSION_DENIED as _DISCOVERY_STATUS_PERMISSION_DENIED,
+)
+from .project import build_repository_context, discover_project
+from .project import render as render_discovery
+from .project import render_context
 from .report import (
     render,
     render_config_error,
@@ -244,10 +254,49 @@ def _watch_main(argv):
     return WatchSession(args.project_path, analyzers, components=[monitor, debouncer]).run()
 
 
+def _discover_main(argv):
+    """`python -m qa_agent discover <path>` (Phase F Part 1, docs/19). A
+    read-only command, deliberately kept as small as `_watch_main` is
+    large: it calls `discover_project()`, prints `render()`'s output, and
+    exits - no AI, no analyzers, no repair, nothing else. Exists for
+    dogfooding and debugging the discovery engine directly, matching the
+    CLI-visibility docs/19 itself required.
+    """
+    parser = argparse.ArgumentParser(
+        prog="qa_agent discover",
+        description=(
+            "Print a deterministic, evidence-based profile of a project's "
+            "structure - languages, frameworks, package managers, and "
+            "important files/directories. No AI, no analyzers, no repair, "
+            "no network, no subprocess."
+        ),
+    )
+    parser.add_argument("project_path", help="directory to inspect")
+    parser.add_argument(
+        "--context", action="store_true",
+        help="also build and print the RepositoryContext (Phase F Part 2) - still read-only, no AI",
+    )
+    args = parser.parse_args(argv)
+
+    result = discover_project(args.project_path)
+    print(render_discovery(result))
+    if args.context and result.project is not None:
+        print(render_context(build_repository_context(result.project)))
+    if result.status in (
+        _DISCOVERY_STATUS_INVALID_ROOT,
+        _DISCOVERY_STATUS_PERMISSION_DENIED,
+        _DISCOVERY_STATUS_FAILED,
+    ):
+        return 2
+    return 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "watch":
         return _watch_main(argv[1:])
+    if argv and argv[0] == "discover":
+        return _discover_main(argv[1:])
 
     parser = argparse.ArgumentParser(
         prog="qa_agent",
