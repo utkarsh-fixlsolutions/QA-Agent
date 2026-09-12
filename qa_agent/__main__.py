@@ -5,10 +5,11 @@
   ... --output report.md                   also write the report to a file
   python -m qa_agent watch <dir>           run as a long-running process
   python -m qa_agent discover <dir>        print a deterministic project profile (Phase F Part 1)
+  python -m qa_agent agent <dir>           run the bounded, autonomous QA execution loop (Phase G5.2)
 
-A directory literally named "watch" or "discover" must be given as an
-explicit path (for example "./watch" or an absolute path), since a bare
-"watch"/"discover" selects that subcommand instead.
+A directory literally named "watch", "discover", or "agent" must be given
+as an explicit path (for example "./watch" or an absolute path), since a
+bare "watch"/"discover"/"agent" selects that subcommand instead.
 
 Exit codes:
   0  ran cleanly, no findings
@@ -26,7 +27,12 @@ from dataclasses import replace
 from pathlib import Path
 
 from .adapters import ADAPTERS, ToolError
-from .ai import MockProvider, OllamaProvider, explain_findings, summarize_run
+from .api_qa import render as render_api_qa
+from .api_qa import run_api_qa
+from .agent import DEFAULT_MAX_ITERATIONS as _AGENT_DEFAULT_MAX_ITERATIONS
+from .agent import DEFAULT_OBJECTIVE as _AGENT_DEFAULT_OBJECTIVE
+from .agent import HISTORY_EXECUTED, QAState, TERMINATION_CONTROLLER_ERROR, run_agent_loop
+from .ai import MockProvider, OllamaProvider, OpenRouterProvider, explain_findings, summarize_run
 from .ai import diagnose_runtime_failures, render_diagnosis
 from .ai import repair_runtime_failures, render_runtime_repair_result
 from .ai import suggest_fixes as ai_suggest_fixes
@@ -59,7 +65,7 @@ from .runner import RunResult, run
 from .watch import WatchSession
 
 _ADAPTER_NAMES = [adapter.name for adapter in ADAPTERS]
-_AI_PROVIDER_CHOICES = ("ollama", "mock")
+_AI_PROVIDER_CHOICES = ("ollama", "mock", "cloud")
 
 
 def _add_ai_arguments(parser):
@@ -108,30 +114,48 @@ def _effective_ai_settings(args, ai_config):
     )
 
 
-def _build_ai_provider(ai_settings):
-    """Construct the configured provider, or None when AI is disabled.
+def _construct_ai_provider(provider_name, model=None, endpoint=None, timeout=None):
+    """The one place every `--ai-provider`/`ai.provider` name becomes a real
+    provider instance - shared by `_build_ai_provider` (the one-shot/watch
+    CLI, Phase D Part 6) and `_discover_main` (Phase G3/G4), so adding a new
+    provider (OpenRouter, docs/27) only ever meant adding one branch here,
+    not duplicating the same dispatch in two places.
 
-    `provider` is already restricted to a known name by config.py's own
-    validation and by --ai-provider's argparse `choices` - the final
+    `provider_name` is already restricted to a known name by config.py's
+    own validation and by `--ai-provider`'s argparse `choices` - the final
     `return None` below is an unreachable defensive fallback, not a real
     validation path, so an unsupported name is never silently swallowed
-    here; it would already have been rejected earlier, loudly.
+    here; it would already have been rejected earlier, loudly. Never reads
+    an API key or any secret itself - a provider that needs one
+    (`OpenRouterProvider`) reads it from its own environment variable,
+    exactly as `OllamaProvider` needs no secret at all.
     """
+    kwargs = {} if model is None else {"model": model}
+    if provider_name == "mock":
+        return MockProvider(**kwargs)
+    if provider_name == "ollama":
+        if endpoint is not None:
+            kwargs["endpoint"] = endpoint
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        return OllamaProvider(**kwargs)
+    if provider_name == "cloud":
+        if endpoint is not None:
+            kwargs["endpoint"] = endpoint
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        return OpenRouterProvider(**kwargs)
+    return None  # pragma: no cover - unreachable, see docstring
+
+
+def _build_ai_provider(ai_settings):
+    """Construct the configured provider, or None when AI is disabled."""
     if not ai_settings.enabled:
         return None
-    if ai_settings.provider == "mock":
-        kwargs = {} if ai_settings.model is None else {"model": ai_settings.model}
-        return MockProvider(**kwargs)
-    if ai_settings.provider == "ollama":
-        kwargs = {}
-        if ai_settings.model is not None:
-            kwargs["model"] = ai_settings.model
-        if ai_settings.endpoint is not None:
-            kwargs["endpoint"] = ai_settings.endpoint
-        if ai_settings.timeout is not None:
-            kwargs["timeout"] = ai_settings.timeout
-        return OllamaProvider(**kwargs)
-    return None  # pragma: no cover - unreachable, see docstring
+    return _construct_ai_provider(
+        ai_settings.provider, model=ai_settings.model,
+        endpoint=ai_settings.endpoint, timeout=ai_settings.timeout,
+    )
 
 
 def _run_ai_pipeline(result, ai_settings, provider):
@@ -325,10 +349,21 @@ def _discover_main(argv):
     parser.add_argument(
         "--ai-provider", choices=_AI_PROVIDER_CHOICES, default="ollama",
         help="AI provider for --diagnose/--repair-runtime: 'ollama' (default, needs a local Ollama "
-             "server) or 'mock' (tests)",
+             "server), 'mock' (tests), or 'cloud' (OpenRouter - needs OPENROUTER_API_KEY set in "
+             "the environment; see docs/27-openrouter-cloud-provider.md)",
     )
     parser.add_argument("--ai-model", metavar="MODEL",
-                         help="override the default model for --diagnose/--repair-runtime")
+                         help="override the default model for --diagnose/--repair-runtime "
+                              "(default with --ai-provider cloud: poolside/laguna-s-2.1:free)")
+    parser.add_argument(
+        "--api-test", action="store_true",
+        help=(
+            "discover Next.js App Router API route handlers (app/**/route.ts) and make real HTTP "
+            "calls against them (docs/30-api-qa-v1.md) - starts a real dev server (npm run dev/start) "
+            "it always stops afterward. No AI. Implies --context. Express/Node and Pages Router "
+            "routes are not discovered in v1."
+        ),
+    )
     args = parser.parse_args(argv)
 
     want_diagnose = args.diagnose or args.repair_runtime
@@ -336,10 +371,13 @@ def _discover_main(argv):
     result = discover_project(args.project_path)
     print(render_discovery(result))
     context = None
-    want_plan = args.context or args.runtime_plan or args.execute_runtime_plan or want_diagnose
+    want_plan = args.context or args.runtime_plan or args.execute_runtime_plan or want_diagnose or args.api_test
     if want_plan and result.project is not None:
         context = build_repository_context(result.project)
         print(render_context(context))
+    if args.api_test and context is not None:
+        api_result = run_api_qa(context, args.project_path)
+        print(render_api_qa(api_result))
     plan = None
     if (args.runtime_plan or args.execute_runtime_plan or want_diagnose) and context is not None:
         plan = plan_runtime_qa(context)
@@ -350,8 +388,7 @@ def _discover_main(argv):
         print(render_execution(execution))
     diagnoses = None
     if want_diagnose and execution is not None and context is not None:
-        kwargs = {} if not args.ai_model else {"model": args.ai_model}
-        provider = MockProvider(**kwargs) if args.ai_provider == "mock" else OllamaProvider(**kwargs)
+        provider = _construct_ai_provider(args.ai_provider, model=args.ai_model)
         diagnoses = diagnose_runtime_failures(execution, context, provider)
         rendered = [render_diagnosis(d) for d in diagnoses]
         rendered = [text for text in rendered if text]
@@ -371,12 +408,83 @@ def _discover_main(argv):
     return 0
 
 
+def _agent_main(argv):
+    """`python -m qa_agent agent <path>` (Phase G5.2, docs/29). Runs the
+    bounded, autonomous QA execution loop: AI (G5.1) selects the next QA
+    action from a deterministic allowlist, the deterministic controller
+    validates it, the deterministic executor (G5.2) actually runs it via
+    the existing G1-G4 engines, and the cycle repeats - until the AI stops,
+    the iteration budget is reached, no eligible action remains, or a
+    genuine provider/controller failure occurs. Always opt-in AI, exactly
+    like every other AI feature in this project; always launches real
+    subprocesses (build/test commands, a real dev-server process it always
+    terminates) the same way `discover --execute-runtime-plan` already
+    does. Never applies a repair - G5.3, not implemented yet.
+    """
+    parser = argparse.ArgumentParser(
+        prog="qa_agent agent",
+        description=(
+            "Run the bounded, autonomous QA execution loop (G5.2): AI selects the next QA action from "
+            "a deterministic allowlist; the deterministic system independently validates and executes "
+            "it via the existing project discovery/runtime planning/execution/diagnosis engines "
+            "(G1-G4), unmodified. Repeats until the AI stops, the iteration budget is reached, no "
+            "eligible action remains, or a real provider/controller failure occurs. Never applies a "
+            "repair - that integration is a later stage (G5.3), not implemented yet."
+        ),
+    )
+    parser.add_argument("project_path", help="directory to run the agent against")
+    parser.add_argument("--objective", default="", metavar="TEXT",
+                         help="a short QA objective shown to the AI (default: {!r})".format(_AGENT_DEFAULT_OBJECTIVE))
+    parser.add_argument(
+        "--ai-provider", choices=_AI_PROVIDER_CHOICES, default="ollama",
+        help="AI provider: 'ollama' (default, needs a local Ollama server), 'mock' (tests), or 'cloud' "
+             "(OpenRouter - needs OPENROUTER_API_KEY set in the environment)",
+    )
+    parser.add_argument("--ai-model", metavar="MODEL", help="override the default model for the chosen provider")
+    parser.add_argument(
+        "--max-iterations", type=int, default=_AGENT_DEFAULT_MAX_ITERATIONS, metavar="N",
+        help="maximum number of actions the agent may take in one session (default: {})".format(
+            _AGENT_DEFAULT_MAX_ITERATIONS),
+    )
+    args = parser.parse_args(argv)
+
+    if args.max_iterations < 1:
+        parser.error("--max-iterations must be at least 1")
+
+    provider = _construct_ai_provider(args.ai_provider, model=args.ai_model)
+    state = QAState(objective=args.objective, max_iterations=args.max_iterations)
+    result = run_agent_loop(state, provider, args.project_path)
+
+    print("QA Agent Session (G5.2)")
+    print()
+    print("  Objective: {}".format(args.objective or _AGENT_DEFAULT_OBJECTIVE))
+    print("  Provider:  {}{}".format(args.ai_provider, " ({})".format(args.ai_model) if args.ai_model else ""))
+    print()
+    if not result.history:
+        print("  No action was executed.")
+    for record in result.history:
+        label = "EXECUTED" if record.outcome == HISTORY_EXECUTED else "REJECTED"
+        target_part = " target={}".format(record.target) if record.target else ""
+        print("  [{}] iter {}: {}{} [{}] - {}".format(
+            label, record.iteration, record.action_id or "(none)", target_part, record.status, record.summary))
+    print()
+    print("  Termination: {} - {}".format(result.termination_reason, result.termination_detail))
+    print("  AI-selected stop: {}".format("yes" if result.ai_stopped else "no"))
+    print()
+    print("  Note: this reports what the agent did, not whether the QA objective was \"satisfied\" -")
+    print("        that judgment is explicitly deferred to a later stage (G5.4), not made here.")
+
+    return 2 if result.termination_reason == TERMINATION_CONTROLLER_ERROR else 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "watch":
         return _watch_main(argv[1:])
     if argv and argv[0] == "discover":
         return _discover_main(argv[1:])
+    if argv and argv[0] == "agent":
+        return _agent_main(argv[1:])
 
     parser = argparse.ArgumentParser(
         prog="qa_agent",

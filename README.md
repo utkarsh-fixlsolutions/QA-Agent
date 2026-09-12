@@ -2,7 +2,7 @@
 
 A minimal, on-premise QA agent. Point it at a repository and it runs local tools (`ruff` + `pyright` + `mypy` for `.py`, `eslint` for `.js`/`.jsx`/`.ts`/`.tsx`, `shellcheck` for `.sh`) and reports **real, tool-verified issues** — file, line, severity, message, source tool. It never invents a finding: if no tool reports something, nothing is reported.
 
-Runs entirely on your own machine. No paid APIs, no cloud services, no network access at any point.
+Core deterministic QA analysis runs entirely on your own machine - no paid APIs, no cloud services, no network access at any point. AI enrichment is optional and local by default (Ollama); an optional cloud provider (OpenRouter, see [docs/27](docs/27-openrouter-cloud-provider.md)) can be explicitly configured for AI features only - never required for core QA functionality.
 
 **Two ways to use it:**
 - **One-shot** — check paths, or just what git says you changed.
@@ -48,6 +48,8 @@ python -m qa_agent discover <dir> --runtime-plan  ...plus what should be runtime
 python -m qa_agent discover <dir> --execute-runtime-plan  ...actually runs the checks it knows how to (Phase G Part 2 - real subprocesses)
 python -m qa_agent discover <dir> --diagnose  ...plus AI interprets why each failed check failed (Phase G Part 3 - opt-in AI)
 python -m qa_agent discover <dir> --repair-runtime  ...attempts a verified repair for each diagnosed failure (Phase G Part 4 - the only flag that writes)
+python -m qa_agent discover <dir> --diagnose --ai-provider cloud  ...same, via the optional OpenRouter cloud provider instead of local Ollama
+python -m qa_agent discover <dir> --api-test  ...discovers Next.js App Router API routes, starts the real dev server, and calls them for real (API QA v1, no AI)
 ```
 
 Exit codes: `0` no findings / clean shutdown · `1` findings reported · `2` tool, input, or write error.
@@ -137,7 +139,7 @@ Add `--repair-runtime` to let a `DIAGNOSED` runtime failure enter the existing P
 
 ## What it does not do
 
-No automatic code edits · no CI integration · no dashboard · no cloud · no continuous full-repo scanning. AI (above) is optional, local-only (Ollama), and advisory-only - it never edits a file or applies a fix itself.
+No automatic code edits · no CI integration · no dashboard · no continuous full-repo scanning. AI (above) is optional - local by default (Ollama), with an optional cloud provider (OpenRouter, [docs/27](docs/27-openrouter-cloud-provider.md)) available when explicitly configured - and advisory-only - it never edits a file or applies a fix itself.
 
 ## Testing
 
@@ -172,6 +174,8 @@ The numbered documents are a build log: each records what was decided at that st
 | [22](docs/22-runtime-execution-engine.md) runtime execution | Phase G Part 2: actually runs the checks it can (server startup, build/test, environment/static-asset verification) - real subprocesses, always cleaned up; everything else reports honestly as not-yet-implemented |
 | [23](docs/23-runtime-failure-diagnosis-engine.md) runtime failure diagnosis | Phase G Part 3: the first real AI reasoning layer for runtime QA - interprets why a check failed, grounded in the real evidence, never the pass/fail authority; lives in `qa_agent/ai/`, not `qa_agent/runtime/` |
 | [24](docs/24-runtime-repair-integration.md) runtime repair integration | Phase G Part 4: lets a diagnosed runtime failure enter the existing, unmodified Phase D/E verified-repair pipeline - a deterministic eligibility gate and file/line localizer, a real candidate runtime check re-run before any write, only ever `VERIFIED` after a real re-run of the real check passes |
+| [27](docs/27-openrouter-cloud-provider.md) OpenRouter cloud provider | An optional third `AIProvider` (alongside Ollama/Mock) for OpenRouter's hosted models - opt-in via `--ai-provider cloud`, needs `OPENROUTER_API_KEY`; changes nothing about G1-G4's own logic |
+| [30](docs/30-api-qa-v1.md) API QA v1 | Next.js App Router endpoint testing (`qa_agent/api_qa/`) - discovers real `app/**/route.ts` handlers, starts the real dev server, makes real HTTP calls, reports structured pass/fail evidence; opt-in via `--api-test`, no AI |
 | [step-log](docs/step-log.md) | Every step: goal, decisions, evidence, status |
 
 ## Status
@@ -193,3 +197,5 @@ The numbered documents are a build log: each records what was decided at that st
 **Phase G Part 3 complete:** an AI Runtime Failure Diagnosis Engine (`qa_agent/ai/diagnosis.py`, `diagnose_runtime_failure(s)`) - the first real AI reasoning layer for runtime QA. Interprets *why* a check that already, genuinely failed/timed out/errored did so - never whether it did; Phase G Part 2's own `RuntimeCheckResult.status` remains the sole authority, verified by a call-counting test that a PASS/SKIPPED/NOT_IMPLEMENTED check triggers zero AI calls. Every claim about a specific file or component is checked against the real evidence it was actually given before being accepted - an unsupported claim is rejected outright, not silently kept. Lives in `qa_agent/ai/`, not `qa_agent/runtime/` (which stays exactly as deterministic as it's always been) - reading `RuntimeExecutionResult`/`RepositoryContext` as input data, the same one-directional exception `validator.py` already established in Phase E. Opt-in via `python -m qa_agent discover <path> --diagnose`; zero AI calls without it. See [docs/23](docs/23-runtime-failure-diagnosis-engine.md).
 
 **Phase G Part 4 complete:** Runtime Failure -> Verified Repair Integration (`qa_agent/ai/runtime_repair.py`, `repair_runtime_failure(s)`) - a thin layer that lets a `DIAGNOSED` runtime failure enter the existing, completely unmodified Phase D/E verified-repair pipeline; no second repair engine, workspace, validator, decision policy, or apply mechanism exists anywhere in this phase. A `DIAGNOSED` diagnosis is treated as a hypothesis, never proof, demonstrated concretely during dogfooding: a real, well-grounded, high-confidence diagnosis was still correctly refused by the deterministic eligibility gate for naming the same real file two different ways. `decide_repair()`'s own static-analysis verdict is used only as a regression guard; the real signal for a runtime repair is a genuine re-run of the actual runtime check (`npm run build`, not a linter) against a candidate copy materialized inside the same temporary workspace via cheap directory-entry links, never a slow full-tree copy. `ACCEPTED` and `VERIFIED` are never conflated - only a real, final re-run of the real, original check against the real repository can ever produce `VERIFIED`. At most one repair attempt per failure; opt-in via `python -m qa_agent discover <path> --repair-runtime` (implies `--diagnose`) - `--diagnose` alone never writes a file. See [docs/24](docs/24-runtime-repair-integration.md).
+
+**API QA v1 complete:** Next.js App Router endpoint testing (`qa_agent/api_qa/`, `run_api_qa(context, root)`) - discovers real `app/**/route.ts`/`route.js` handlers by their real exported HTTP method functions, starts the real dev server (`npm run dev`/`start`), makes real HTTP calls against every non-dynamic discovered endpoint, and reports structured pass/fail evidence (status code, response time, JSON-content-type validity), always stopping the server afterward. No AI, no dependency on `qa_agent/runtime/` (a small amount of process-lifecycle logic is deliberately duplicated rather than reusing an engine whose own liveness-check function always kills the process it starts). Dogfooded live against a real Next.js project - both a real pass and a real, correctly-caught intentional failure. Express/Node and Pages Router route discovery are named, deferred v2 work, not silently unsupported. Opt-in via `python -m qa_agent discover <path> --api-test`. See [docs/30](docs/30-api-qa-v1.md).
