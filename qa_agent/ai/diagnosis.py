@@ -20,6 +20,11 @@ offline or timed-out provider, a malformed or ungrounded response, or the
 model's own "insufficient_context" decline) is not an error from this
 module's point of view - it simply means a structured, explicit diagnosis
 outcome, never a raised exception and never a fabricated one.
+
+See docs/25-ai-behavior-contract.md for the full AI behavior contract this
+module operates under (role, evidence rules, deterministic authority);
+`diagnosis_prompts.DIAGNOSIS_GUARDRAILS` carries that contract's own
+additive clauses (`qa_agent/ai/contract.py`), unchanged here.
 """
 
 from __future__ import annotations

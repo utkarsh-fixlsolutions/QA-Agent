@@ -1,7 +1,11 @@
-"""Server lifecycle for API QA v1 (docs/30-api-qa-v1.md): discover a real
-start command, launch it, wait until it looks ready (or a timeout elapses)
-**without** killing it, so real HTTP calls can be made against it - then,
-always, stop it.
+"""Server lifecycle for API QA v1 (docs/30-api-qa-v1.md; docs/32-fastapi
+-discovery-and-startup.md): discover a real start command, launch it, wait
+until it looks ready (or a timeout elapses) **without** killing it, so real
+HTTP calls can be made against it - then, always, stop it.
+
+`discover_server_start_command` tries two independent, additive strategies
+- Node/npm (Step 30, unchanged) first, then Python/FastAPI (new) - never
+one replacing the other; see that function's own docstring.
 
 This deliberately duplicates a small amount of process-management logic
 that already exists in `qa_agent/runtime/executor.py`
@@ -80,18 +84,207 @@ def _npm_script_command(root, package_manager, script_name):
 
 
 def discover_server_start_command(root, project):
-    """Real, evidence-based only - an npm `dev`/`start` script the
-    developer wrote themselves. Returns `(command, evidence)` or
-    `(None, reason)`. No fallback to a guessed command.
+    """Real, evidence-based only. Tries the Node/npm strategy first (Step
+    30's own original behavior, completely unchanged - an npm `dev`/`start`
+    script the developer wrote themselves); if no JS package manager is
+    even detected, tries the Python/FastAPI strategy (new, gated behind a
+    real, already-detected FastAPI framework fact). Returns `(command,
+    evidence)` or `(None, reason)`. No fallback to a guessed command.
     """
     manager = _js_package_manager(project)
-    if manager is None:
-        return None, "no JS package manager detected for this project"
-    for script in ("dev", "start"):
-        command = _npm_script_command(root, manager, script)
-        if command is not None:
-            return command, "package.json scripts.{} (via {})".format(script, manager)
-    return None, "no npm dev/start script found in package.json"
+    if manager is not None:
+        for script in ("dev", "start"):
+            command = _npm_script_command(root, manager, script)
+            if command is not None:
+                return command, "package.json scripts.{} (via {})".format(script, manager)
+        return None, "no npm dev/start script found in package.json"
+
+    if _is_fastapi_project(project):
+        return _discover_python_start_command(root, project)
+
+    return None, "no JS package manager detected for this project"
+
+
+# --- Python / FastAPI strategy (new) ----------------------------------------
+
+def _is_fastapi_project(project):
+    return any(item.name == "FastAPI" for item in project.frameworks)
+
+
+# On Windows, a project-local venv's interpreter lives under Scripts\; on
+# every other platform, under bin/ - both real, standard layouts `python -m
+# venv` itself creates, checked for directly (never activated via a shell
+# script - "invoke the interpreter executable directly" is this step's own
+# explicit requirement).
+_VENV_DIR_NAMES = (".venv", "venv")
+
+
+def _venv_python(root):
+    """The real, on-disk interpreter inside the target project's own
+    virtual environment, when one exists - `None` otherwise, never guessed.
+    Checked in `_VENV_DIR_NAMES` order; the first real match wins.
+    """
+    root = Path(root)
+    subpath = ("Scripts", "python.exe") if _IS_WINDOWS else ("bin", "python")
+    for venv_name in _VENV_DIR_NAMES:
+        candidate = root.joinpath(venv_name, *subpath)
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _select_interpreter(root):
+    """The target project's own venv interpreter when one exists on disk;
+    otherwise whatever `python` resolves to on this process's own PATH -
+    the same graceful-degradation convention every other evidence-based
+    lookup in this package already follows (never a hard failure just
+    because the preferred, more-precise option is not available).
+    """
+    return _venv_python(root) or "python"
+
+
+# A real file that really calls `uvicorn.run(...)` when executed directly -
+# never guessed from a filename alone (the exact bug found auditing this
+# project: `qa_agent/runtime/executor.py`'s own generic entry-point
+# heuristic picks a file by name only, and would have picked `app/main.py`
+# here, which never calls `uvicorn.run(...)` at all). Checked by real
+# content, not by name - the names below are only where evidence is looked
+# for, never assumed to already be true.
+_UVICORN_RUN_RE = re.compile(r"uvicorn\s*\.\s*run\s*\(")
+_FASTAPI_APP_VAR_RE = re.compile(r"(\w+)\s*=\s*FastAPI\s*\(")
+
+_PY_ENTRY_CANDIDATE_NAMES = ("run.py", "main.py", "app.py", "asgi.py", "wsgi.py")
+
+_MAX_PY_PROBE_BYTES = 500_000
+
+
+def _read_py_text_safe(path):
+    try:
+        if path.stat().st_size > _MAX_PY_PROBE_BYTES:
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _find_uvicorn_run_entrypoint(root, project):
+    """The real, relative path of a file that really contains a
+    `uvicorn.run(...)` call - checked against common runner-script names
+    plus every real entry point Project Discovery already found
+    (`project.entry_points`, e.g. `app/main.py`) - or `None` if no real
+    file actually contains one.
+    """
+    root = Path(root)
+    candidates = list(_PY_ENTRY_CANDIDATE_NAMES) + list(project.entry_points)
+    checked = set()
+    for rel in candidates:
+        if rel in checked or not rel.endswith(".py"):
+            continue
+        checked.add(rel)
+        text = _read_py_text_safe(root / rel)
+        if text is not None and _UVICORN_RUN_RE.search(text):
+            return rel
+    return None
+
+
+def _find_fastapi_app_module(root, project):
+    """A real, already-known `.py` file (`project.entry_points`/
+    `project.important_files` - never an unbounded whole-repository scan)
+    that really assigns `<name> = FastAPI(...)` - returns `(module, app_
+    var)` (e.g. `("app.main", "app")`) or `None`. Never guesses a module
+    path that does not correspond to a real file actually found this way.
+    """
+    root = Path(root)
+    candidates = list(project.entry_points) + list(project.important_files)
+    checked = set()
+    for rel in candidates:
+        if rel in checked or not rel.endswith(".py"):
+            continue
+        checked.add(rel)
+        text = _read_py_text_safe(root / rel)
+        if text is None:
+            continue
+        match = _FASTAPI_APP_VAR_RE.search(text)
+        if match:
+            module = rel[:-3].replace("\\", "/").replace("/", ".")
+            return module, match.group(1)
+    return None
+
+
+# The real packages a FastAPI app needs to even import - checked, never
+# assumed, before any real startup attempt (docs/32's own explicit
+# "understand why startup cannot proceed" requirement). A fixed, literal
+# probe script this project itself controls - never code read from or
+# supplied by the target project - so this is not arbitrary execution.
+_DEPENDENCY_PROBE_MODULES = ("fastapi", "uvicorn")
+_DEPENDENCY_PROBE_TIMEOUT = 15.0
+
+
+def check_python_dependencies(interpreter, modules=_DEPENDENCY_PROBE_MODULES):
+    """Runs `<interpreter> -c "import <modules>"` - direct interpreter
+    invocation, `shell=False`, no activation script of any kind. Returns
+    `(ok, reason)`; never raises - a missing/broken interpreter is reported
+    as `ok=False` with a clear reason, exactly like every other real
+    failure mode in this module.
+    """
+    probe = "import " + ", ".join(modules)
+    try:
+        completed = subprocess.run(
+            [interpreter, "-c", probe],
+            capture_output=True, text=True, timeout=_DEPENDENCY_PROBE_TIMEOUT, shell=False,
+        )
+    except FileNotFoundError:
+        return False, "interpreter '{}' does not exist or is not runnable".format(interpreter)
+    except subprocess.TimeoutExpired:
+        return False, "checking dependencies via '{}' did not finish within {:.0f}s".format(
+            interpreter, _DEPENDENCY_PROBE_TIMEOUT)
+    except OSError as exc:
+        return False, "could not run '{}' to check dependencies: {}".format(interpreter, exc)
+
+    if completed.returncode == 0:
+        return True, "{} import successfully via '{}'".format(", ".join(modules), interpreter)
+    detail_lines = (completed.stderr or completed.stdout or "").strip().splitlines()
+    last_line = detail_lines[-1] if detail_lines else "import failed with exit code {}".format(completed.returncode)
+    return False, "{} not importable via '{}': {}".format(", ".join(modules), interpreter, last_line)
+
+
+def _discover_python_start_command(root, project):
+    """Real, evidence-based only, for a project with a real, already-
+    detected FastAPI dependency. Prefers a real file that genuinely calls
+    `uvicorn.run(...)`; falls back to a real `<module>:<app>` uvicorn
+    target only when a real `FastAPI()` instantiation can be found in an
+    already-known file. The interpreter is the project's own venv when one
+    exists on disk, else whatever `python` resolves to - see `_select_
+    interpreter`. Dependency availability is checked before this function
+    ever returns a command, so a missing-package failure is reported here,
+    deterministically, rather than surfacing later as an opaque process
+    crash.
+    """
+    root = Path(root)
+    interpreter = _select_interpreter(root)
+
+    entrypoint = _find_uvicorn_run_entrypoint(root, project)
+    if entrypoint is not None:
+        command = [interpreter, entrypoint]
+        evidence = "{} calls uvicorn.run(...) directly (interpreter: {})".format(entrypoint, interpreter)
+    else:
+        module_target = _find_fastapi_app_module(root, project)
+        if module_target is None:
+            return None, (
+                "FastAPI detected, but no runnable entrypoint could be found - neither a real file "
+                "calling uvicorn.run(...) nor a real 'FastAPI()' instantiation in any already-known file"
+            )
+        module, app_var = module_target
+        command = [interpreter, "-m", "uvicorn", "{}:{}".format(module, app_var),
+                   "--host", "127.0.0.1", "--port", "8000"]
+        evidence = "uvicorn {}:{} (real FastAPI() instantiation found; interpreter: {})".format(
+            module, app_var, interpreter)
+
+    deps_ok, deps_reason = check_python_dependencies(interpreter)
+    if not deps_ok:
+        return None, "found a Python/FastAPI startup command ({}), but {}".format(evidence, deps_reason)
+
+    return command, evidence
 
 
 def _command_available(command):

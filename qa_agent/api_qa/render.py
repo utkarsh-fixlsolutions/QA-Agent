@@ -52,12 +52,16 @@ def render(result):
             _endpoint_column(call), _status_label(call), timing, symbol,
             ew=endpoint_width, sw=status_width,
         ))
+        if call.resolved_path:
+            lines.append("        Concrete request: {} {}".format(call.endpoint.method, call.resolved_path))
         if call.status != "pass":
             evidence = call.error or call.reason
             if evidence:
                 lines.append("        {}".format(evidence))
             if call.response_sample:
                 lines.append("        body: {}".format(call.response_sample[:200]))
+        if call.resolution_evidence:
+            lines.append("        evidence: {}".format(call.resolution_evidence))
         counts[call.status] = counts.get(call.status, 0) + 1
 
     lines.append("")
@@ -80,6 +84,8 @@ def _call_to_dict(call):
         "content_type": call.content_type,
         "valid_response": call.valid_response,
         "response_sample": call.response_sample,
+        "resolved_path": call.resolved_path,
+        "resolution_evidence": call.resolution_evidence,
         "error": call.error,
         "reason": call.reason,
     }

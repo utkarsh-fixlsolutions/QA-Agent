@@ -29,6 +29,11 @@ from __future__ import annotations
 import re
 
 from .context import CodeContext
+from .contract import (
+    CANDIDATE_ONLY_CLAUSE,
+    CONTRADICTORY_EVIDENCE_CLAUSE,
+    DETERMINISTIC_AUTHORITY_CLAUSE,
+)
 from .prompts import Prompt
 
 _ROLE = (
@@ -49,6 +54,8 @@ REPAIR_GUARDRAILS = (
     "already visible in the evidence or the code below. If you are not "
     "confident a safe, minimal fix can be made from what is shown, respond "
     "with the insufficient-context decline below rather than guessing. "
+    + CONTRADICTORY_EVIDENCE_CLAUSE + " " + DETERMINISTIC_AUTHORITY_CLAUSE + " "
+    + CANDIDATE_ONLY_CLAUSE + " "
     'Respond with JSON only, matching exactly the shape requested below - '
     "no extra commentary outside the JSON, and no markdown other than the "
     "JSON itself. If the supplied context is not sufficient to propose a "

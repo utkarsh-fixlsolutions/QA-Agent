@@ -3,7 +3,11 @@
 an `app/` directory named `route.ts`/`route.js` that export one or more
 HTTP method functions (`GET`, `POST`, ...). Express/Node and Pages Router
 support are explicitly out of scope for v1 (see docs/30's own scope
-section) - not silently half-supported, just not attempted.
+section) - not silently half-supported, just not attempted. Extended in
+docs/32-fastapi-discovery-and-startup.md with a second, independent Python/
+FastAPI discovery strategy (`@app.get(...)`/`@router.get(...)`-style
+decorators) - these shapes are shared by both strategies unchanged; only
+`discovery.py`/`server.py` gained new, additive strategy functions.
 
 Every `ApiEndpoint` traces back to a real file and a real exported handler
 name - the same "no fact without evidence" discipline `DetectedItem`
@@ -56,16 +60,24 @@ CALL_STATUSES = (CALL_PASS, CALL_FAIL, CALL_SKIPPED)
 
 @dataclass(frozen=True)
 class ApiEndpoint:
-    """One discovered endpoint. `path` is the real URL path Next.js would
-    route to (route-group segments like `(marketing)` already stripped,
-    since they never appear in the real URL - a documented Next.js
-    convention, not a guess). `dynamic` is true when `path` still contains
-    an unresolved `[segment]`/`[...segment]` placeholder - such an endpoint
-    is discovered and reported, but never called automatically (see
-    docs/30's "no invented path parameters" rule).
+    """One discovered endpoint. `path` is the real URL path the framework
+    would route to. For Next.js, route-group segments like `(marketing)`
+    are already stripped (they never appear in the real URL - a documented
+    convention, not a guess) and `dynamic` reflects an unresolved
+    `[segment]`/`[...segment]` placeholder. For FastAPI, `path` is the
+    real string literal passed to the route decorator, unmodified, and
+    `dynamic` reflects an unresolved `{segment}` placeholder. Either way, a
+    dynamic endpoint is discovered and reported, but never called
+    automatically (see docs/30's "no invented path parameters" rule).
 
-    `source_file` is the real, repository-relative `route.ts`/`route.js`
-    file this endpoint was found in - the one piece of evidence every
+    `line`: the real 1-based source line the route was declared on, when
+    the discovering strategy tracks it (currently only the FastAPI
+    strategy does - the Next.js strategy finds a whole exported function,
+    not one decorator line, so `line` stays `None` there, honestly, never
+    a guessed value).
+
+    `source_file` is the real, repository-relative `route.ts`/`route.js`/
+    `.py` file this endpoint was found in - the one piece of evidence every
     `ApiEndpoint` must carry.
     """
 
@@ -73,6 +85,7 @@ class ApiEndpoint:
     path: str
     source_file: str
     dynamic: bool = False
+    line: Optional[int] = None
 
     def __post_init__(self):
         if self.method not in METHODS:
@@ -83,6 +96,11 @@ class ApiEndpoint:
             raise ValueError(
                 "ApiEndpoint({!r} {!r}) constructed with no source_file - every discovered "
                 "endpoint must be backed by a real file".format(self.method, self.path)
+            )
+        if self.line is not None and self.line < 1:
+            raise ValueError(
+                "ApiEndpoint({!r} {!r}) has a non-positive line number {!r}"
+                .format(self.method, self.path, self.line)
             )
 
 
@@ -99,6 +117,26 @@ class ApiCallResult:
     `valid_response` is `None` when JSON validity does not apply (the
     response's content-type was not JSON, or no response was received);
     `True`/`False` only when a real JSON-parse attempt was actually made.
+
+    `response_json` (docs/33-api-qa-deterministic-verification.md): the
+    real, already-parsed JSON value, populated only when `valid_response
+    is True` - the same already-validated parse `call_endpoint` performs
+    internally to decide pass/fail, exposed here rather than re-parsed a
+    second time. This is what makes evidence-based path-parameter
+    resolution possible without a second HTTP call or a second, competing
+    HTTP layer: a later endpoint's resolver reads a real, already-received
+    response's own real data, never the truncated display `response_sample`.
+
+    `resolved_path`/`resolution_evidence` (docs/33): only set when this
+    call's concrete request differed from `endpoint.path`'s own literal
+    template (a dynamic path parameter substituted with a real,
+    evidence-derived value, or a request body constructed from a real
+    OpenAPI schema default) - `resolved_path` is the real, concrete path
+    actually requested (e.g. `/api/users/1`) and `resolution_evidence` is
+    a short, human-readable trace of exactly which prior fact made that
+    substitution possible. Both stay empty for a plain, non-dynamic call -
+    `endpoint.path` alone is already the concrete path there, and nothing
+    needs explaining.
     """
 
     endpoint: ApiEndpoint
@@ -108,6 +146,9 @@ class ApiCallResult:
     content_type: str = ""
     valid_response: Optional[bool] = None
     response_sample: str = ""
+    response_json: Optional[object] = None
+    resolved_path: str = ""
+    resolution_evidence: str = ""
     error: str = ""
     reason: str = ""
 

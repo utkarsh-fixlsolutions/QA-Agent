@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 
+from .contract import CONTRADICTORY_EVIDENCE_CLAUSE, DETERMINISTIC_AUTHORITY_CLAUSE
 from .prompts import Prompt
 
 _ROLE = (
@@ -42,6 +43,20 @@ DIAGNOSIS_GUARDRAILS = (
     "output is ambiguous, or when the repository context is thin - a high "
     "confidence requires the evidence to actually support one specific "
     "cause, not just a plausible-sounding one. "
+    "When the evidence below includes the actual source code of the file "
+    "involved, prefer a precise, specific explanation grounded directly in "
+    "that code over a vague, component-only description: if the code shows "
+    "an unconditional throw/error, a handler that always fails regardless "
+    "of input, or a route that is explicitly named or commented as an "
+    "example, demo, or test route, say exactly that, citing the specific "
+    "construct (e.g. the class or function name) - do not describe it only "
+    "as 'a server error occurred' when the code makes the real cause "
+    "clear. Only name a file in affected_files when that exact file path "
+    "string appears somewhere in the evidence below - never a file you "
+    "infer must exist. Do not fall back to a vague, file-less explanation "
+    "when a concrete source file is present in the evidence and clearly "
+    "explains the failure. "
+    + CONTRADICTORY_EVIDENCE_CLAUSE + " " + DETERMINISTIC_AUTHORITY_CLAUSE + " "
     'Respond with JSON only, matching exactly the shape requested below - '
     "no extra commentary outside the JSON, and no markdown other than the "
     "JSON itself. If the supplied evidence is not sufficient to determine a "

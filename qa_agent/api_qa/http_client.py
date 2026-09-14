@@ -48,36 +48,58 @@ def _decode_capped(raw_bytes):
 
 
 def _validate_json_if_applicable(content_type, text, truncated):
-    """Returns `valid_response` (`None`/`True`/`False`). A truncated body
-    is never claimed valid or invalid - there is not enough of it to
-    honestly judge either way.
+    """Returns `(valid_response, parsed_json)` - `valid_response` is
+    `None`/`True`/`False`, `parsed_json` is the real, already-parsed value
+    when (and only when) `valid_response is True`, `None` otherwise
+    (docs/33-api-qa-deterministic-verification.md - exposed on
+    `ApiCallResult.response_json` so a later evidence-based resolution
+    step never needs a second HTTP call or a second JSON parse of the same
+    body). A truncated body is never claimed valid or invalid - there is
+    not enough of it to honestly judge either way, and never parsed.
     """
     if not _is_json_content_type(content_type):
-        return None
+        return None, None
     if truncated:
-        return None
+        return None, None
     try:
-        json.loads(text)
-        return True
+        return True, json.loads(text)
     except json.JSONDecodeError:
-        return False
+        return False, None
 
 
 def _result(endpoint, status, **kwargs):
     return ApiCallResult(endpoint=endpoint, status=status, **kwargs)
 
 
-def call_endpoint(base_url, endpoint, timeout=DEFAULT_TIMEOUT_SECONDS):
+def call_endpoint(base_url, endpoint, timeout=DEFAULT_TIMEOUT_SECONDS, path_override=None, body=None,
+                   resolution_evidence=""):
     """One real HTTP call. Pass/fail rule (deliberately simple and
     deterministic, per docs/30): a 2xx status code, and - only when the
     response declares a JSON content-type - a body that actually parses as
     JSON. Any other outcome (non-2xx, invalid declared-JSON body,
     connection failure, timeout) is a fail, with the real evidence
     (status code, sample, or error) always attached.
+
+    `path_override`/`body`/`resolution_evidence` (docs/33-api-qa
+    -deterministic-verification.md, all optional, all additive - every
+    existing caller is unaffected): when a caller has already resolved a
+    real, concrete path (a dynamic `{param}` substituted with a real,
+    evidence-derived value) or constructed a real request body (from a
+    real OpenAPI schema default), it passes them here rather than this
+    function ever inventing either itself - this remains the one place
+    that actually makes an HTTP call; the *decision* of what path/body to
+    use is made entirely by the caller (`resolution.py`).
     """
-    url = base_url.rstrip("/") + endpoint.path
-    request = urllib.request.Request(url, method=endpoint.method)
+    concrete_path = path_override if path_override is not None else endpoint.path
+    url = base_url.rstrip("/") + concrete_path
+    data = None
+    headers = {}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=endpoint.method)
     start = time.perf_counter()
+    resolved_path = concrete_path if path_override is not None else ""
 
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -92,18 +114,20 @@ def call_endpoint(base_url, endpoint, timeout=DEFAULT_TIMEOUT_SECONDS):
         content_type = exc.headers.get("Content-Type", "") if exc.headers else ""
         elapsed_ms = (time.perf_counter() - start) * 1000
         text, truncated = _decode_capped(raw)
-        valid = _validate_json_if_applicable(content_type, text, truncated)
+        valid, parsed = _validate_json_if_applicable(content_type, text, truncated)
         return _result(
             endpoint, CALL_FAIL, status_code=status_code, response_time_ms=elapsed_ms,
-            content_type=content_type, valid_response=valid,
+            content_type=content_type, valid_response=valid, response_json=parsed,
             response_sample=text[:MAX_RESPONSE_SAMPLE_CHARS],
             reason="HTTP {} response".format(status_code),
+            resolved_path=resolved_path, resolution_evidence=resolution_evidence,
         )
     except _TIMEOUT_EXCEPTIONS:
         elapsed_ms = (time.perf_counter() - start) * 1000
         return _result(
             endpoint, CALL_FAIL, response_time_ms=elapsed_ms,
             error="'{}' did not respond within {:.0f}s".format(url, timeout),
+            resolved_path=resolved_path, resolution_evidence=resolution_evidence,
         )
     except urllib.error.URLError as exc:
         elapsed_ms = (time.perf_counter() - start) * 1000
@@ -112,17 +136,21 @@ def call_endpoint(base_url, endpoint, timeout=DEFAULT_TIMEOUT_SECONDS):
             error = "'{}' did not respond within {:.0f}s".format(url, timeout)
         else:
             error = "could not reach '{}': {}".format(url, reason)
-        return _result(endpoint, CALL_FAIL, response_time_ms=elapsed_ms, error=error)
+        return _result(
+            endpoint, CALL_FAIL, response_time_ms=elapsed_ms, error=error,
+            resolved_path=resolved_path, resolution_evidence=resolution_evidence,
+        )
     except Exception as exc:  # noqa: BLE001 - a bad call must never crash the session
         elapsed_ms = (time.perf_counter() - start) * 1000
         return _result(
             endpoint, CALL_FAIL, response_time_ms=elapsed_ms,
             error="unexpected error calling '{}': {}".format(url, exc),
+            resolved_path=resolved_path, resolution_evidence=resolution_evidence,
         )
 
     elapsed_ms = (time.perf_counter() - start) * 1000
     text, truncated = _decode_capped(raw)
-    valid = _validate_json_if_applicable(content_type, text, truncated)
+    valid, parsed = _validate_json_if_applicable(content_type, text, truncated)
     is_2xx = 200 <= status_code < 300
     success = is_2xx and valid is not False
 
@@ -136,6 +164,7 @@ def call_endpoint(base_url, endpoint, timeout=DEFAULT_TIMEOUT_SECONDS):
     return _result(
         endpoint, CALL_PASS if success else CALL_FAIL,
         status_code=status_code, response_time_ms=elapsed_ms,
-        content_type=content_type, valid_response=valid,
+        content_type=content_type, valid_response=valid, response_json=parsed,
         response_sample=text[:MAX_RESPONSE_SAMPLE_CHARS], reason=reason,
+        resolved_path=resolved_path, resolution_evidence=resolution_evidence,
     )

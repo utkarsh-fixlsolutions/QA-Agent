@@ -1,20 +1,29 @@
-"""Next.js App Router route-handler discovery (Phase G5-adjacent, docs/30
--api-qa-v1.md): `discover_api_endpoints(context, root)`.
+"""API endpoint discovery (Phase G5-adjacent, docs/30-api-qa-v1.md; docs/32
+-fastapi-discovery-and-startup.md): `discover_api_endpoints(context, root)`.
 
-Scoped, evidence-based, and deliberately narrow, exactly like `qa_agent.
-project.detectors`'s own manifest reads: a real `route.ts`/`route.js` file
-is read (capped, same `_MAX_READ_BYTES` philosophy as detectors.py's own
-`_MAX_MANIFEST_BYTES`) only to find its real exported HTTP method
-functions via a regex over source text - never a full TypeScript/JS parse,
-and never a guess at a method that is not actually exported. A route file
-with no recognized export is reported as a warning, not silently dropped
-and not fabricated into an endpoint that was never really there.
+Two independent, additive strategies, combined by the one public function
+at the bottom of this file - neither replaces the other:
 
-Only Next.js **App Router** route handlers are discovered here (v1's
-explicit, documented scope - see docs/30). Pages Router (`pages/api/**`)
-and Express (`app.get(...)`, `router.post(...)`) are real, common patterns
-this module does not attempt to detect at all in v1, deliberately, rather
-than half-supporting either unreliably.
+- `_discover_nextjs_endpoints` (Step 30, unchanged): real `route.ts`/
+  `route.js` files under an `app/`-named directory, read (capped, same
+  `_MAX_READ_BYTES` philosophy as `project.detectors`'s own
+  `_MAX_MANIFEST_BYTES`) only to find real exported HTTP method functions
+  via a regex over source text - never a full TypeScript/JS parse.
+- `_discover_fastapi_endpoints` (new): real `@app.<method>(...)`/
+  `@router.<method>(...)` decorators in `.py` files, found the same
+  "regex over text, never a full parse" way - gated behind a real,
+  already-detected FastAPI framework fact (`project.frameworks`), so an
+  unrelated Python project's own incidental `@something.get(...)`-shaped
+  text is never mistaken for a real route.
+
+A route with no recognized handler is reported as a warning, not silently
+dropped and not fabricated into an endpoint that was never really there.
+
+Pages Router (`pages/api/**`), Express (`app.get(...)` in a `.js`/`.ts`
+file), and a FastAPI `APIRouter`'s own `prefix=` composition are real,
+common patterns this module does not attempt to resolve, deliberately,
+rather than half-supporting any of them unreliably - named here, not
+silently gapped.
 """
 
 from __future__ import annotations
@@ -92,11 +101,13 @@ def _extract_methods(text):
     return tuple(m for m in METHODS if m in found)
 
 
-def discover_api_endpoints(context, root):
+def _discover_nextjs_endpoints(context, root):
     """Returns `(endpoints, warnings)`. Never raises - any per-file read
     failure is skipped with a warning, exactly like `run_runtime_plan`'s
     own "one check's failure never stops the rest" discipline, applied
     here to "one route file's failure never stops discovery of the rest".
+    Unchanged from Step 30 - only its name changed, to make room for a
+    second strategy below.
     """
     root = Path(root)
     project = context.project
@@ -140,3 +151,121 @@ def discover_api_endpoints(context, root):
 
     endpoints.sort(key=lambda e: (e.path, e.method))
     return tuple(endpoints), tuple(warnings)
+
+
+# --- Python / FastAPI strategy (new) ----------------------------------------
+
+# Python-specific noise directories a route scan should never descend into -
+# on top of the Next.js strategy's own `_IGNORED_DIR_NAMES`, which already
+# covers the VCS/build-output cases shared by both ecosystems.
+_PY_IGNORED_DIR_NAMES = frozenset({
+    ".venv", "venv", "env", "__pycache__", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", ".tox", "site-packages",
+})
+
+# `@app.get("/x")` / `@router.post('/y')` - a route decorator naming a real
+# HTTP method and a real, literal path string. Deliberately does not match
+# a keyword-only path (`@app.get(path="/x")`) or a decorator whose path
+# argument is a variable/expression rather than a literal string - both
+# real, documented scope boundaries (this module's own module docstring),
+# not silently mishandled.
+_PYTHON_ROUTE_DECORATOR_RE = re.compile(
+    r"@(?:app|router)\.(get|post|put|patch|delete|options|head)\s*\(\s*[\"']([^\"']*)[\"']",
+    re.IGNORECASE,
+)
+_FASTAPI_DYNAMIC_SEGMENT_RE = re.compile(r"\{[^}]+\}")
+
+
+def _find_python_files(root_abs):
+    """Every `.py` file under `root_abs`, walked once, pruning both the
+    shared and the Python-specific ignored directories before descending -
+    the same "prune, don't filter afterward" technique the Next.js
+    strategy's own `_find_route_files` already uses.
+    """
+    ignored = _IGNORED_DIR_NAMES | _PY_IGNORED_DIR_NAMES
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root_abs, topdown=True):
+        dirnames[:] = [d for d in dirnames if d not in ignored]
+        for name in filenames:
+            if name.endswith(".py"):
+                found.append(Path(dirpath) / name)
+    return found
+
+
+def _is_fastapi_project(project):
+    return any(item.name == "FastAPI" for item in project.frameworks)
+
+
+def _discover_fastapi_endpoints(context, root):
+    """Returns `(endpoints, warnings)`. Never attempted at all unless
+    `project.frameworks` already, really contains "FastAPI" (Phase F's own
+    detection, reused rather than re-implemented here) - the same
+    evidence-gated scoping the Next.js strategy applies via its own
+    `app`-named-directory rule. A real `.py` file's own content is read
+    (capped) only to find real `@app.<method>(...)`/`@router.<method>(...)`
+    decorators via a regex over source text - never a full AST parse, never
+    a guessed route. `APIRouter(prefix=...)` composition is not resolved -
+    a real, documented scope boundary (this module's own module docstring).
+    """
+    project = context.project
+    if not _is_fastapi_project(project):
+        return (), ()
+
+    root = Path(root)
+    endpoints = []
+    warnings = []
+
+    for py_file in _find_python_files(root):
+        text = _read_text_capped(py_file)
+        source_file = py_file.relative_to(root).as_posix()
+        if text is None:
+            warnings.append("could not read Python file: {}".format(source_file))
+            continue
+        for match in _PYTHON_ROUTE_DECORATOR_RE.finditer(text):
+            path = match.group(2)
+            if not path:
+                # A decorator matched with an empty string literal path -
+                # not a real, callable route; never fabricated into one.
+                continue
+            method = match.group(1).upper()
+            line = text.count("\n", 0, match.start()) + 1
+            dynamic = bool(_FASTAPI_DYNAMIC_SEGMENT_RE.search(path))
+            endpoints.append(ApiEndpoint(
+                method=method, path=path, source_file=source_file, dynamic=dynamic, line=line,
+            ))
+
+    endpoints.sort(key=lambda e: (e.path, e.method, e.source_file))
+    return tuple(endpoints), tuple(warnings)
+
+
+# --- combined entry point ----------------------------------------------
+
+def discover_api_endpoints(context, root):
+    """The one public entry point: runs every strategy above and merges
+    the results - never one replacing the other. A strategy that finds
+    nothing (its own gating evidence absent) contributes an empty result,
+    so a pure Next.js project's own output is unaffected by the Python
+    strategy existing at all, and vice versa - proven directly by the
+    existing Next.js regression suite continuing to pass unmodified.
+
+    Deduplicated by `(method, path)` across *both* strategies combined (in
+    the unlikely event the same method+path were somehow found by each -
+    never expected in practice, since they gate on mutually exclusive
+    framework evidence, but guarded anyway rather than assumed impossible).
+    """
+    root = Path(root)
+    nextjs_endpoints, nextjs_warnings = _discover_nextjs_endpoints(context, root)
+    fastapi_endpoints, fastapi_warnings = _discover_fastapi_endpoints(context, root)
+
+    endpoints = []
+    seen = set()
+    for endpoint in list(nextjs_endpoints) + list(fastapi_endpoints):
+        key = (endpoint.method, endpoint.path)
+        if key in seen:
+            continue
+        seen.add(key)
+        endpoints.append(endpoint)
+
+    endpoints.sort(key=lambda e: (e.path, e.method))
+    warnings = tuple(nextjs_warnings) + tuple(fastapi_warnings)
+    return tuple(endpoints), warnings

@@ -97,6 +97,11 @@ from .apply import (
     reject_repair,
 )
 from .context import CodeContext, extract_context
+from .contract import (
+    CANDIDATE_ONLY_CLAUSE,
+    CONTRADICTORY_EVIDENCE_CLAUSE,
+    DETERMINISTIC_AUTHORITY_CLAUSE,
+)
 from .diagnosis import (
     diagnose_runtime_failure,
     diagnose_runtime_failures,
@@ -119,6 +124,7 @@ from .diagnosis_models import (
 )
 from .diagnosis_parser import DiagnosisResponse, response_is_grounded, validate_diagnosis_response
 from .diagnosis_prompts import build_diagnosis_prompt
+from .runtime_repair_prompts import build_runtime_repair_prompt
 from .decision import (
     ACTION_ACCEPT_CANDIDATE,
     ACTION_HOLD,
@@ -131,6 +137,7 @@ from .explainer import Explanation, explain_finding, explain_findings
 from .fixer import SuggestedFix, suggest_fix, suggest_fixes
 from .mock import MockProvider
 from .ollama import OllamaProvider
+from .openrouter import OpenRouterProvider
 from .prompts import (
     GUARDRAILS,
     Prompt,
@@ -233,8 +240,11 @@ __all__ = [
     "AIProvider",
     "APPLY_NOT_ATTEMPTED",
     "AppliedRepair",
+    "CANDIDATE_ONLY_CLAUSE",
     "CodeContext",
+    "CONTRADICTORY_EVIDENCE_CLAUSE",
     "ConnectionResult",
+    "DETERMINISTIC_AUTHORITY_CLAUSE",
     "DEFAULT_MAX_ITERATIONS",
     "DIAGNOSIS_AI_ERROR",
     "DIAGNOSIS_DIAGNOSED",
@@ -253,6 +263,7 @@ __all__ = [
     "LLMResponse",
     "MockProvider",
     "OllamaProvider",
+    "OpenRouterProvider",
     "OUTCOME_ACCEPTED",
     "OUTCOME_APPLIED",
     "OUTCOME_APPLIED_BUT_STILL_FAILING",
@@ -312,6 +323,7 @@ __all__ = [
     "build_repair_prompt",
     "build_summary_prompt",
     "build_diagnosis_prompt",
+    "build_runtime_repair_prompt",
     "check_repair_eligibility",
     "cleanup_workspace",
     "compare_results",

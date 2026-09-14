@@ -28,7 +28,7 @@ from pathlib import Path
 
 from .adapters import ADAPTERS, ToolError
 from .api_qa import render as render_api_qa
-from .api_qa import run_api_qa
+from .api_qa import diagnose_and_repair_api_failures, render_api_diagnosis_repair_entry, run_api_qa
 from .agent import DEFAULT_MAX_ITERATIONS as _AGENT_DEFAULT_MAX_ITERATIONS
 from .agent import DEFAULT_OBJECTIVE as _AGENT_DEFAULT_OBJECTIVE
 from .agent import HISTORY_EXECUTED, QAState, TERMINATION_CONTROLLER_ERROR, run_agent_loop
@@ -364,20 +364,50 @@ def _discover_main(argv):
             "routes are not discovered in v1."
         ),
     )
+    parser.add_argument(
+        "--api-diagnose", action="store_true",
+        help=(
+            "also ask AI to interpret each failing API call (docs/31-api-qa-ai-bridge.md) - reuses "
+            "G3 diagnosis unmodified, fed real evidence from the HTTP call (status code, response "
+            "sample, timing, error). Off by default: without this flag, zero AI calls are made for "
+            "API failures. Implies --api-test."
+        ),
+    )
+    parser.add_argument(
+        "--api-repair", action="store_true",
+        help=(
+            "also attempt a verified repair for each DIAGNOSED API failure (docs/31) - reuses G4's "
+            "existing repair pipeline unmodified (temporary workspace, static regression gate, atomic "
+            "apply), then restarts the real dev server and re-calls the same real endpoint to report "
+            "whether it is actually fixed. Never repairs without a completed diagnosis. Implies "
+            "--api-diagnose."
+        ),
+    )
     args = parser.parse_args(argv)
 
     want_diagnose = args.diagnose or args.repair_runtime
+    want_api_test = args.api_test or args.api_diagnose or args.api_repair
+    want_api_diagnose = args.api_diagnose or args.api_repair
 
     result = discover_project(args.project_path)
     print(render_discovery(result))
     context = None
-    want_plan = args.context or args.runtime_plan or args.execute_runtime_plan or want_diagnose or args.api_test
+    want_plan = args.context or args.runtime_plan or args.execute_runtime_plan or want_diagnose or want_api_test
     if want_plan and result.project is not None:
         context = build_repository_context(result.project)
         print(render_context(context))
-    if args.api_test and context is not None:
+    if want_api_test and context is not None:
         api_result = run_api_qa(context, args.project_path)
         print(render_api_qa(api_result))
+        if want_api_diagnose:
+            api_provider = _construct_ai_provider(args.ai_provider, model=args.ai_model)
+            entries = diagnose_and_repair_api_failures(
+                api_result, context, api_provider, args.project_path,
+                do_diagnose=True, do_repair=args.api_repair,
+            )
+            if entries:
+                print()
+                print("\n\n".join(render_api_diagnosis_repair_entry(e) for e in entries))
     plan = None
     if (args.runtime_plan or args.execute_runtime_plan or want_diagnose) and context is not None:
         plan = plan_runtime_qa(context)

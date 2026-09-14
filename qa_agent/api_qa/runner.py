@@ -1,9 +1,12 @@
-"""API QA v1's one public entry point (docs/30-api-qa-v1.md):
-`run_api_qa(context, root, config=None)`.
+"""API QA v1's one public entry point (docs/30-api-qa-v1.md;
+docs/33-api-qa-deterministic-verification.md): `run_api_qa(context, root,
+config=None)`.
 
-Composition, nothing more: `discovery.py` finds real endpoints,
-`server.py` starts (and always stops) a real dev server, `http_client.py`
-makes real HTTP calls against it. This module owns none of that logic
+Composition, nothing more: `discovery.py` finds real endpoints, `server.py`
+starts (and always stops) a real dev server, `resolution.py` decides which
+endpoints are safely testable (resolving a dynamic path parameter or
+request body from real prior evidence where it genuinely can) and executes
+them via `http_client.call_endpoint`. This module owns none of that logic
 itself - only the order to run it in and how to turn what happened into
 one honest `ApiTestResult`, the same "one public entry point orchestrates
 already-independent pieces" shape `run_runtime_plan` and `discover_project`
@@ -25,7 +28,7 @@ from typing import Optional
 from . import server as _server
 from .discovery import discover_api_endpoints
 from .http_client import DEFAULT_TIMEOUT_SECONDS as _DEFAULT_REQUEST_TIMEOUT
-from .http_client import call_endpoint
+from .resolution import resolve_and_execute
 from .models import (
     CALL_SKIPPED,
     SERVER_CRASHED,
@@ -77,20 +80,6 @@ def _resolve_base_url(handle, warnings):
     return _DEFAULT_NEXTJS_URL
 
 
-def _call_all(endpoints, base_url, timeout):
-    calls = []
-    for endpoint in endpoints:
-        if endpoint.dynamic:
-            calls.append(ApiCallResult(
-                endpoint=endpoint, status=CALL_SKIPPED,
-                reason="dynamic route segment - a real path parameter value cannot be "
-                       "safely invented (see docs/30's own scope rule)",
-            ))
-            continue
-        calls.append(call_endpoint(base_url, endpoint, timeout=timeout))
-    return tuple(calls)
-
-
 def run_api_qa(context, root, config=None):
     config = config or DEFAULT_CONFIG
     root = Path(root)
@@ -140,7 +129,7 @@ def run_api_qa(context, root, config=None):
             )
 
         base_url = _resolve_base_url(handle, warnings)
-        calls = _call_all(endpoints, base_url, config.request_timeout)
+        calls = resolve_and_execute(endpoints, base_url, config.request_timeout)
         return _finish(
             endpoints=endpoints, calls=calls, server_status=SERVER_STARTED,
             server_detail=handle.reason, base_url=base_url,

@@ -32,11 +32,13 @@ SEVERITY_LEVELS = {"style": 1, "note": 1, "info": 2, "information": 2, "warning"
 
 _ALLOWED_KEYS = {"analyzers", "ignore", "include", "min_severity", "ai"}
 
-# Phase D Part 6: the only providers the AI package actually implements
-# (docs/step-log.md) - Ollama for real use, Mock for tests. A name outside
-# this set is rejected the same way an unknown analyzer name already is:
-# a typo must never silently mean "AI quietly does nothing".
-_KNOWN_AI_PROVIDERS = {"ollama", "mock"}
+# Phase D Part 6, extended for the optional OpenRouter cloud provider
+# (docs/27-openrouter-cloud-provider.md): the only providers the AI package
+# actually implements - Ollama for local use, Mock for tests, "cloud" for
+# OpenRouter (opt-in, needs OPENROUTER_API_KEY set in the environment). A
+# name outside this set is rejected the same way an unknown analyzer name
+# already is: a typo must never silently mean "AI quietly does nothing".
+_KNOWN_AI_PROVIDERS = {"ollama", "mock", "cloud"}
 
 _ALLOWED_AI_KEYS = {
     "enabled", "provider", "model", "endpoint", "timeout", "explain", "summary", "suggest_fixes",

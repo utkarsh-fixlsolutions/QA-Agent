@@ -51,6 +51,14 @@ is still used, unmodified, as a **static-regression guard only** (a
 when a candidate materializes and its own runtime check actually runs, that
 real runtime outcome - not decide_repair()'s own "improved" branch - is
 what drives ACCEPT vs REJECT. See `_combine_decision()` below.
+
+See docs/25-ai-behavior-contract.md for the full AI behavior contract this
+module operates under; `runtime_repair_prompts.REPAIR_GUARDRAILS` carries
+that contract's own additive clauses (`qa_agent/ai/contract.py`), including
+the explicit reminder that a proposal here is a candidate only - this
+module's own eligibility/decision logic already never reads `explanation`
+or `confidence` to decide anything, which is that same rule enforced in
+code, not just in the prompt.
 """
 
 from __future__ import annotations
