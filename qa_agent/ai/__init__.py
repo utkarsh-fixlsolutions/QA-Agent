@@ -135,6 +135,7 @@ from .decision import (
 )
 from .explainer import Explanation, explain_finding, explain_findings
 from .fixer import SuggestedFix, suggest_fix, suggest_fixes
+from .groq import GroqProvider
 from .mock import MockProvider
 from .ollama import OllamaProvider
 from .openrouter import OpenRouterProvider
@@ -260,6 +261,7 @@ __all__ = [
     "ExplanationResponse",
     "FixResponse",
     "GUARDRAILS",
+    "GroqProvider",
     "LLMResponse",
     "MockProvider",
     "OllamaProvider",

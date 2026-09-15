@@ -1,16 +1,19 @@
 """G5 — Autonomous QA Agent (Phase G Part 5). G5.1 (docs/28) decides what
 QA action should happen next; G5.2 (docs/29) executes that decision,
 collects evidence, updates state, and repeats - a bounded, real autonomous
-loop over G1-G4's own existing capabilities. G5.3 (diagnosis + verified
-repair integration) and G5.4 (intelligent completion semantics) are not
-implemented yet - see docs/29's own roadmap.
+loop over G1-G4's own existing capabilities. G5.3 (docs/34) wires
+`runtime_repair` to the real, existing G4 verified-repair pipeline, so the
+loop can now propose, apply, and re-verify a fix for a diagnosed failure,
+not just observe and diagnose it. G5.4 (docs/34) adds `compute_qa_outcome`
+- a deterministic, evidence-only verdict (`passed`/`failed`/`inconclusive`)
+on one finished session's real QA result, independent of why it stopped.
 
 `select_next_action(state, provider)` (G5.1) is the one decision-making
 entry point: given a `QAState` and any `AIProvider`-shaped object, it
 returns a structured `ControllerDecision` - `continue` with exactly one
-deterministically-eligible next action (and, for `runtime_diagnosis`, a
-real, currently-valid target), `stop`, or `error`. It never executes
-anything itself.
+deterministically-eligible next action (and, for `runtime_diagnosis`/
+`runtime_repair`, a real, currently-valid target), `stop`, or `error`. It
+never executes anything itself.
 
 `run_agent_loop(state, provider, root, config=None)` (G5.2) is the one
 execution entry point: it calls `select_next_action` repeatedly, validates
@@ -35,10 +38,17 @@ real call into those engines - confirmed by direct source-grep isolation
 tests for both properties. `qa_agent/runtime/`, `qa_agent/project/`, and
 the deterministic analyzer pipeline never import this package either.
 
-Not wired into `__main__.py` or any CLI flag yet - see docs/29 for why.
+Wired into `__main__.py` as `python -m qa_agent agent <path>` (G5.2, docs/29).
 """
 
 from .actions import ACTION_REGISTRY, RUNTIME_CHECK_ACTION_IDS, eligible_actions, get_action, valid_targets
+from .completion import (
+    QA_OUTCOME_FAILED,
+    QA_OUTCOME_INCONCLUSIVE,
+    QA_OUTCOME_PASSED,
+    QA_OUTCOMES,
+    compute_qa_outcome,
+)
 from .controller import select_next_action
 from .executor import (
     EXECUTION_STATUSES,
@@ -103,6 +113,10 @@ __all__ = [
     "HISTORY_EXECUTED",
     "HISTORY_REJECTED",
     "QAState",
+    "QA_OUTCOME_FAILED",
+    "QA_OUTCOME_INCONCLUSIVE",
+    "QA_OUTCOME_PASSED",
+    "QA_OUTCOMES",
     "RUNTIME_CHECK_ACTION_IDS",
     "SAFETY_ASSISTED",
     "SAFETY_AUTONOMOUS",
@@ -115,6 +129,7 @@ __all__ = [
     "TERMINATION_NO_ACTIONS",
     "TERMINATIONS",
     "build_action_selection_prompt",
+    "compute_qa_outcome",
     "eligible_actions",
     "execute_action",
     "get_action",

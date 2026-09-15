@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Tuple
 
@@ -86,6 +86,14 @@ class _Diagnosis:
     error: object = None
 
 
+@dataclass(frozen=True)
+class _Repair:
+    check_id: str
+    outcome: str = "rejected"
+    verification_status: str = "not_applicable"
+    explanation: str = "a repair result"
+
+
 def _context():
     return _RepositoryContext(project=_Project())
 
@@ -119,12 +127,12 @@ def _stop_json(reason="nothing left to do"):
 
 # --- action registry: deterministic data, never AI-determined --------------
 
-def test_registry_has_ten_actions_nine_implemented(suite):
+def test_registry_has_ten_actions_all_implemented(suite):
     suite.check("ten actions were investigated", len(ACTION_REGISTRY) == 10)
     implemented = [a for a in ACTION_REGISTRY if a.implemented]
-    suite.check("nine are implemented", len(implemented) == 9)
-    suite.check("runtime_repair exists but is deliberately not implemented in G5.1",
-                get_action("runtime_repair") is not None and not get_action("runtime_repair").implemented)
+    suite.check("all ten are implemented as of G5.3", len(implemented) == 10)
+    suite.check("runtime_repair exists and requires a target (G5.3)",
+                get_action("runtime_repair") is not None and get_action("runtime_repair").requires_target)
 
 
 def test_get_action_returns_none_for_an_unknown_id(suite):
@@ -190,17 +198,36 @@ def test_runtime_diagnosis_eligible_only_when_a_real_undiagnosed_failure_exists(
                 "runtime_diagnosis" not in {a.id for a in eligible_actions(state_already_diagnosed)})
 
 
-def test_runtime_repair_is_never_eligible_in_g51(suite):
-    """The one action this whole stage deliberately never offers, no
-    matter how favorable the state - proven directly, not just asserted by
-    `implemented=False` in isolation.
+def test_runtime_repair_eligible_only_with_a_real_diagnosed_unrepaired_failure(suite):
+    """G5.3: the mirror image of the old G5.1 "never eligible" guarantee -
+    now eligible exactly when a real, DIAGNOSED, not-yet-repaired failure
+    exists, and no longer eligible the moment that check id gets any
+    repair result at all (see `test_agent_loop.py` for the one-shot proof
+    inside the real loop).
     """
-    state = _planned_state(
+    state_no_diagnosis = _planned_state(
+        "build-verification", execution_results=(_CheckResult(id="build-verification", status="fail"),),
+    )
+    suite.check("no diagnosis at all -> runtime_repair not eligible",
+                "runtime_repair" not in {a.id for a in eligible_actions(state_no_diagnosis)})
+
+    state_insufficient_context = _planned_state(
+        "build-verification", execution_results=(_CheckResult(id="build-verification", status="fail"),),
+        diagnoses=(_Diagnosis(check_id="build-verification", diagnosis_status="insufficient_context"),),
+    )
+    suite.check("a non-DIAGNOSED diagnosis status -> runtime_repair still not eligible",
+                "runtime_repair" not in {a.id for a in eligible_actions(state_insufficient_context)})
+
+    state_diagnosed = _planned_state(
         "build-verification", execution_results=(_CheckResult(id="build-verification", status="fail"),),
         diagnoses=(_Diagnosis(check_id="build-verification", diagnosis_status="diagnosed"),),
     )
-    suite.check("runtime_repair is never in the eligible set, even with a real diagnosed failure",
-                "runtime_repair" not in {a.id for a in eligible_actions(state)})
+    suite.check("a real, DIAGNOSED, unrepaired failure -> runtime_repair is eligible",
+                "runtime_repair" in {a.id for a in eligible_actions(state_diagnosed)})
+
+    state_already_repaired = replace(state_diagnosed, repairs=(_Repair(check_id="build-verification", outcome="rejected"),))
+    suite.check("that same failure, already given a repair attempt (even a rejected one) -> no longer eligible",
+                "runtime_repair" not in {a.id for a in eligible_actions(state_already_repaired)})
 
 
 # --- the parser: structural validation only ---------------------------------
@@ -432,15 +459,30 @@ def test_a_real_but_currently_unavailable_registry_action_is_rejected(suite):
     suite.check("a real-but-currently-unavailable action is rejected", decision.decision == DECISION_ERROR)
 
 
-def test_runtime_repair_can_never_be_selected_even_if_the_model_names_it(suite):
+def test_runtime_repair_requires_a_valid_target_even_in_a_favorable_state(suite):
+    """G5.3: `runtime_repair` is a real, selectable action now - but only
+    with a real, currently-valid target, the same two-tier rule
+    `runtime_diagnosis` already established in G5.2.
+    """
     state = _planned_state(
         "build-verification", execution_results=(_CheckResult(id="build-verification", status="fail"),),
         diagnoses=(_Diagnosis(check_id="build-verification"),),
     )
-    provider = MockProvider(response_text=_continue_json("runtime_repair"))
-    decision = select_next_action(state, provider)
-    suite.check("runtime_repair is rejected even with a favorable, fully-diagnosed state",
-                decision.decision == DECISION_ERROR)
+    no_target = select_next_action(state, MockProvider(response_text=_continue_json("runtime_repair")))
+    suite.check("no target supplied -> rejected", no_target.decision == DECISION_ERROR)
+
+    wrong_target = select_next_action(state, MockProvider(response_text=json.dumps({
+        "decision": "continue", "next_action": "runtime_repair", "target": "not-a-real-check-id",
+        "reason": "x", "evidence_needed": [],
+    })))
+    suite.check("a fabricated target -> rejected", wrong_target.decision == DECISION_ERROR)
+
+    valid_target = select_next_action(state, MockProvider(response_text=json.dumps({
+        "decision": "continue", "next_action": "runtime_repair", "target": "build-verification",
+        "reason": "x", "evidence_needed": [],
+    })))
+    suite.check("the real, currently-valid target -> accepted", valid_target.decision == DECISION_CONTINUE)
+    suite.check("the accepted decision carries the real target", valid_target.target == "build-verification")
 
 
 # --- deterministic authority: AI output cannot change controller state -----
@@ -463,15 +505,25 @@ def test_ai_output_cannot_change_previous_execution_results(suite):
                 state.execution_results[0].status == "fail" and state.execution_results[0] is result)
 
 
-def test_ai_output_cannot_mark_an_action_as_implemented(suite):
-    provider = MockProvider(response_text=_continue_json("runtime_repair"))
+def test_ai_output_cannot_mutate_registry_metadata(suite):
+    """The general guarantee `test_ai_output_cannot_change_action_availability`
+    already proves for eligibility, one level deeper: no AI call, however
+    it responds, ever mutates a real `ActionDefinition`'s own fixed fields.
+    """
+    before = replace(get_action("runtime_repair"))
     state = _planned_state(
         "build-verification", execution_results=(_CheckResult(id="build-verification", status="fail"),),
         diagnoses=(_Diagnosis(check_id="build-verification"),),
     )
+    provider = MockProvider(response_text=json.dumps({
+        "decision": "continue", "next_action": "runtime_repair", "target": "build-verification",
+        "reason": "x", "evidence_needed": [],
+    }))
     select_next_action(state, provider)
-    suite.check("runtime_repair's own registry metadata is untouched by any AI call",
-                get_action("runtime_repair").implemented is False)
+    after = get_action("runtime_repair")
+    suite.check("runtime_repair's own registry metadata is untouched by a real AI call",
+                after.implemented == before.implemented and after.requires_target == before.requires_target
+                and after.requires == before.requires and after.safety_level == before.safety_level)
 
 
 # --- provider compatibility (no live network call in any of these) ---------
@@ -668,7 +720,7 @@ def test_agent_package_makes_no_subprocess_or_file_write_calls(suite):
 if __name__ == "__main__":
     suite = Suite("G5.1: Autonomous QA Action Selection Controller")
     sys.exit(suite.run([
-        test_registry_has_ten_actions_nine_implemented,
+        test_registry_has_ten_actions_all_implemented,
         test_get_action_returns_none_for_an_unknown_id,
         test_registry_ids_are_unique,
         test_empty_state_offers_only_project_discovery,
@@ -676,7 +728,7 @@ if __name__ == "__main__":
         test_runtime_check_actions_require_being_in_the_actual_plan,
         test_runtime_check_already_executed_is_not_offered_again,
         test_runtime_diagnosis_eligible_only_when_a_real_undiagnosed_failure_exists,
-        test_runtime_repair_is_never_eligible_in_g51,
+        test_runtime_repair_eligible_only_with_a_real_diagnosed_unrepaired_failure,
         test_parser_accepts_a_valid_continue_response,
         test_parser_accepts_a_valid_stop_response,
         test_parser_rejects_an_unknown_decision,
@@ -704,10 +756,10 @@ if __name__ == "__main__":
         test_arbitrary_file_modification_request_is_rejected,
         test_run_arbitrary_command_action_name_is_rejected,
         test_a_real_but_currently_unavailable_registry_action_is_rejected,
-        test_runtime_repair_can_never_be_selected_even_if_the_model_names_it,
+        test_runtime_repair_requires_a_valid_target_even_in_a_favorable_state,
         test_ai_output_cannot_change_action_availability,
         test_ai_output_cannot_change_previous_execution_results,
-        test_ai_output_cannot_mark_an_action_as_implemented,
+        test_ai_output_cannot_mutate_registry_metadata,
         test_mockprovider_integration,
         test_ollamaprovider_shape_compatible_without_a_live_call,
         test_openrouterprovider_shape_compatible_without_a_live_call,

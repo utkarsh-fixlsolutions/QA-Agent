@@ -272,7 +272,7 @@ def repair_api_failure(
                                    .format(repair_result.outcome),
         )
 
-    command, evidence = _server.discover_server_start_command(root, repository_context.project)
+    command, evidence, server_cwd = _server.discover_server_start_command(root, repository_context.project)
     if command is None:
         return ApiRepairAttempt(
             repair_result=repair_result,
@@ -280,7 +280,7 @@ def repair_api_failure(
                                    "re-test: {}".format(evidence),
         )
 
-    handle = _server.start_and_wait_ready(command, root, config.server_startup_timeout, env=config.env)
+    handle = _server.start_and_wait_ready(command, server_cwd, config.server_startup_timeout, env=config.env)
     try:
         if handle.status in (_server.STATUS_NOT_FOUND, _server.STATUS_CRASHED):
             return ApiRepairAttempt(

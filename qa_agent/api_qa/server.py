@@ -30,9 +30,11 @@ import queue
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -47,13 +49,37 @@ STATUS_NOT_FOUND = "not_found"
 
 DEFAULT_READY_PATTERNS = (
     "ready", "listening", "running on", "compiled successfully",
-    "started server", "application startup complete", "watching for file changes",
+    "watching for file changes",
 )
+# Two patterns deliberately removed (docs/41), both real, previously
+# latent false-positives never actually exercised until `fastapi`/
+# `uvicorn` were installed in this environment for the first time today
+# (previously silently skipped, not silently passing - found immediately
+# once real end-to-end tests could finally run):
+#   - "started server" matched uvicorn's own very first startup line,
+#     "Started server process [PID]" - printed well before anything else.
+#   - "application startup complete" matched uvicorn's own next line,
+#     "Application startup complete." - which is *still* one line too
+#     early: uvicorn's real URL-bearing line, "Uvicorn running on
+#     http://...", is always printed last, one line after this. Removing
+#     it is safe because "running on" (already a real pattern here) is
+#     what actually matches that final, authoritative line for uvicorn -
+#     the same signal, minus the premature break, and it directly yields
+#     a real base URL from the very same line via `_LOCAL_URL_RE`.
 
 # Matches the real "- Local:        http://localhost:3000" line `next dev`/
 # `next start` print on startup - used to discover the real bound port
-# rather than assuming Next.js's default 3000 whenever it can be observed.
+# rather than assuming a default port whenever it can be observed.
 _LOCAL_URL_RE = re.compile(r"https?://(?:localhost|127\.0\.0\.1):\d+")
+
+# A second, weaker-but-still-real evidence source (docs/40-monorepo-server
+# -discovery.md): plenty of real, common Express/FastAPI-style servers log
+# a bare "Server running on port 5000" rather than a full URL - no
+# `_LOCAL_URL_RE` match, but the port number itself is still a real fact
+# the process actually printed, never a guess. Tried only when
+# `_LOCAL_URL_RE` found nothing at all - a real, literal URL is always
+# preferred evidence when both are somehow present.
+_PORT_ONLY_RE = re.compile(r"\bport[:\s]+(\d{2,5})\b", re.IGNORECASE)
 
 _JS_PACKAGE_MANAGER_PRIORITY = ("pnpm", "yarn", "bun", "npm")
 
@@ -73,8 +99,8 @@ def _js_package_manager(project):
     return None
 
 
-def _npm_script_command(root, package_manager, script_name):
-    data = _read_json_safe(root / "package.json")
+def _npm_script_command(pkg_dir, package_manager, script_name):
+    data = _read_json_safe(Path(pkg_dir) / "package.json")
     if not isinstance(data, dict):
         return None
     scripts = data.get("scripts")
@@ -83,26 +109,112 @@ def _npm_script_command(root, package_manager, script_name):
     return [package_manager, "run", script_name]
 
 
+# A monorepo/workspace package's own framework - real evidence already
+# gathered by Phase F discovery (`project.frameworks`, each with the real
+# file(s) that prove it) - is "frontend-only" when every framework whose
+# evidence lives under that package is one of these. Duplicated, not
+# imported, from `project.detectors`'s own private `_FRONTEND_FRAMEWORKS`
+# list - the same "duplicate a small list narrowly rather than import
+# another module's private constant into an unrelated package" precedent
+# `discovery.py`'s own `_IGNORED_DIR_NAMES` docstring already established.
+_FRONTEND_FRAMEWORK_NAMES = frozenset({"React", "Vue", "Angular", "Svelte", "Next.js", "Nuxt"})
+
+
+def _package_looks_frontend_only(project, pkg_rel_dir):
+    prefix = pkg_rel_dir.rstrip("/") + "/"
+    evidenced = [
+        item for item in project.frameworks
+        if any(ev.startswith(prefix) for ev in item.evidence)
+    ]
+    return bool(evidenced) and all(item.name in _FRONTEND_FRAMEWORK_NAMES for item in evidenced)
+
+
+def _monorepo_start_command(root, project, manager):
+    """Real, evidence-based only, for a workspace/monorepo with no runnable
+    script at its own root (docs/40-monorepo-server-discovery.md): tries
+    each real, already-detected `project.monorepo_packages` directory's own
+    `package.json` for a real `dev`/`start` script - the same two-script
+    preference the root-level strategy already has, just checked one level
+    into each real package directory instead of assuming the root is the
+    only place a server could live.
+
+    A monorepo commonly has more than one runnable package (a frontend dev
+    server *and* a backend API server, e.g. `client`/`server`) - starting
+    the wrong one would silently test nothing real, so this never guesses
+    among genuine candidates. A candidate package whose own framework
+    evidence (`project.frameworks`) is entirely frontend-only
+    (`_FRONTEND_FRAMEWORK_NAMES`) is deprioritized in favor of any
+    candidate that is not; if that still leaves more than one real
+    candidate, or leaves none at all, the whole thing is honestly reported
+    as ambiguous/absent - never an arbitrary pick. Returns `(command,
+    evidence, cwd)` or `(None, reason, None)`.
+    """
+    candidates = []  # (pkg, command, script)
+    for pkg in sorted(project.monorepo_packages):
+        pkg_dir = Path(root) / pkg
+        for script in ("dev", "start"):
+            command = _npm_script_command(pkg_dir, manager, script)
+            if command is not None:
+                candidates.append((pkg, command, script))
+                break
+
+    if not candidates:
+        return None, "no npm dev/start script found in the root package.json, nor in any monorepo package ({})".format(
+            ", ".join(sorted(project.monorepo_packages)) or "none"
+        ), None
+
+    non_frontend = [c for c in candidates if not _package_looks_frontend_only(project, c[0])]
+    chosen = None
+    if len(non_frontend) == 1:
+        chosen = non_frontend[0]
+    elif len(candidates) == 1:
+        chosen = candidates[0]
+
+    if chosen is None:
+        return None, (
+            "root package.json has no dev/start script, and which monorepo package is the real "
+            "server could not be determined without guessing - candidates with a dev/start script: {}"
+            .format(", ".join(pkg for pkg, _cmd, _script in candidates))
+        ), None
+
+    pkg, command, script = chosen
+    evidence = "monorepo package '{}/package.json' scripts.{} (via {})".format(pkg, script, manager)
+    return command, evidence, Path(root) / pkg
+
+
 def discover_server_start_command(root, project):
     """Real, evidence-based only. Tries the Node/npm strategy first (Step
-    30's own original behavior, completely unchanged - an npm `dev`/`start`
-    script the developer wrote themselves); if no JS package manager is
-    even detected, tries the Python/FastAPI strategy (new, gated behind a
-    real, already-detected FastAPI framework fact). Returns `(command,
-    evidence)` or `(None, reason)`. No fallback to a guessed command.
+    30's own original behavior, unchanged for a single-package project - an
+    npm `dev`/`start` script the developer wrote themselves at the real
+    project root); when the root has none *and* this is a real, already-
+    detected workspace/monorepo (`project.monorepo_packages`, docs/40),
+    tries each real package directory next rather than giving up
+    immediately - a workspace/monorepo's own runnable server commonly
+    lives one level down (`server/package.json`), never at the workspace
+    root itself. If no JS package manager is even detected, tries the
+    Python/FastAPI strategy (new, gated behind a real, already-detected
+    FastAPI framework fact). Returns `(command, evidence, cwd)` or `(None,
+    reason, None)` - `cwd` is the real directory the command must actually
+    be launched from (the workspace root and a monorepo package's own
+    directory are not the same thing; running a package's own `npm run
+    dev` from the wrong cwd would fail to find that package's own
+    `package.json` at all). No fallback to a guessed command.
     """
     manager = _js_package_manager(project)
     if manager is not None:
         for script in ("dev", "start"):
             command = _npm_script_command(root, manager, script)
             if command is not None:
-                return command, "package.json scripts.{} (via {})".format(script, manager)
-        return None, "no npm dev/start script found in package.json"
+                return command, "package.json scripts.{} (via {})".format(script, manager), Path(root)
+        if project.monorepo_packages:
+            return _monorepo_start_command(root, project, manager)
+        return None, "no npm dev/start script found in package.json", None
 
     if _is_fastapi_project(project):
-        return _discover_python_start_command(root, project)
+        command, evidence = _discover_python_start_command(root, project)
+        return command, evidence, (Path(root) if command is not None else None)
 
-    return None, "no JS package manager detected for this project"
+    return None, "no JS package manager detected for this project", None
 
 
 # --- Python / FastAPI strategy (new) ----------------------------------------
@@ -351,6 +463,14 @@ class ServerHandle:
     waiting for it to become ready. `proc` is `None` only when the server
     was never started at all (`STATUS_NOT_FOUND`) - `stop()` is always
     safe to call regardless.
+
+    `log_queue` (docs/37-api-qa-server-log-capture.md): the same live
+    `queue.Queue` `_reader_thread` keeps appending real stdout/stderr lines
+    to for as long as the process stays alive - kept on the handle (rather
+    than discarded once `start_and_wait_ready` returns) so a caller can
+    drain whatever the server prints *after* it became ready, e.g. while
+    real HTTP calls are being made against it. `None` only when `proc` is
+    also `None` (nothing was ever started, so nothing was ever queued).
     """
 
     proc: Optional[subprocess.Popen]
@@ -359,10 +479,38 @@ class ServerHandle:
     logs: Tuple[str, ...]
     elapsed: float
     base_url: str = ""
+    log_queue: Optional["queue.Queue"] = None
 
     def stop(self):
         if self.proc is not None:
             _kill_process_tree(self.proc)
+
+
+# A log tail is only ever useful as recent, human-scannable context - never
+# an unbounded dump. The same "cap the displayed evidence, never silently
+# drop it all" convention `http_client.py`'s own `MAX_RESPONSE_SAMPLE_CHARS`
+# already established.
+MAX_LOG_TAIL_CHARS = 4_000
+
+
+def drain_log_tail(handle: ServerHandle, max_chars: int = MAX_LOG_TAIL_CHARS) -> str:
+    """Every real line the server has printed since the last time this (or
+    `start_and_wait_ready`) drained its queue, joined and trimmed to the
+    last `max_chars` characters - never the full, unbounded history.
+    Returns `""` when the server was never started, or printed nothing new.
+    Non-blocking: only ever reads what is already queued, never waits for
+    more output to arrive.
+    """
+    if handle.log_queue is None:
+        return ""
+    lines = []
+    try:
+        while True:
+            lines.append(handle.log_queue.get_nowait())
+    except queue.Empty:
+        pass
+    text = "".join(lines)
+    return text[-max_chars:] if len(text) > max_chars else text
 
 
 def start_and_wait_ready(command, cwd, timeout, env=None, ready_patterns=DEFAULT_READY_PATTERNS):
@@ -421,22 +569,65 @@ def start_and_wait_ready(command, cwd, timeout, env=None, ready_patterns=DEFAULT
         return ServerHandle(
             proc=proc, status=STATUS_CRASHED,
             reason="process exited on its own after {:.1f}s (exit code {})".format(elapsed, proc.returncode),
-            logs=tuple(lines), elapsed=elapsed,
+            logs=tuple(lines), elapsed=elapsed, log_queue=q,
         )
     if matched_line is not None:
         return ServerHandle(
             proc=proc, status=STATUS_READY,
             reason="matched ready signal: {!r}".format(matched_line),
-            logs=tuple(lines), elapsed=elapsed, base_url=base_url,
+            logs=tuple(lines), elapsed=elapsed, base_url=base_url, log_queue=q,
         )
     return ServerHandle(
         proc=proc, status=STATUS_ALIVE_NO_READY_SIGNAL,
         reason="process stayed running for {:.1f}s without crashing; no recognized "
                "'ready' log line matched".format(elapsed),
-        logs=tuple(lines), elapsed=elapsed, base_url=base_url,
+        logs=tuple(lines), elapsed=elapsed, base_url=base_url, log_queue=q,
     )
 
 
 def _observed_base_url(logs_text):
     match = _LOCAL_URL_RE.search(logs_text)
-    return match.group(0) if match else ""
+    if match:
+        return match.group(0)
+    port_match = _PORT_ONLY_RE.search(logs_text)
+    if port_match:
+        return "http://localhost:{}".format(port_match.group(1))
+    return ""
+
+
+# A dev tool's own printed "ready"/"listening"-shaped log line only proves
+# it printed something ready-shaped - never that a listener socket is
+# actually bound and accepting connections yet. A real race found
+# dogfooding twice, with two different frameworks: a cold-compiling Next.js
+# dev server, and a nodemon-wrapped Express server whose wrapper process
+# prints its own status text before the real child process it spawns has
+# finished binding - both matched a real "ready" log line, and the very
+# first real HTTP call still got a real, honest connection-refused.
+DEFAULT_CONNECT_PROBE_TIMEOUT = 10.0
+_CONNECT_PROBE_POLL_INTERVAL = 0.1
+
+
+def wait_until_connectable(base_url, timeout=DEFAULT_CONNECT_PROBE_TIMEOUT,
+                            poll_interval=_CONNECT_PROBE_POLL_INTERVAL):
+    """Real confirmation that *something* is actually accepting TCP
+    connections at `base_url`, polled every `poll_interval` seconds up to
+    `timeout` - a real, live check, never inferred from log text. Returns
+    `True` the moment a real connect succeeds, `False` once `timeout`
+    elapses without one - never raises, never blocks past `timeout`.
+    Deliberately only a TCP connect, not a real HTTP request - checking
+    reachability should never itself count as one of the real calls
+    `resolve_and_execute` goes on to make and report.
+    """
+    parsed = urllib.parse.urlsplit(base_url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    deadline = time.perf_counter() + timeout
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=poll_interval):
+                return True
+        except OSError:
+            pass
+        if time.perf_counter() >= deadline:
+            return False
+        time.sleep(poll_interval)

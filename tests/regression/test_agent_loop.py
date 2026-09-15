@@ -289,21 +289,42 @@ def _plan(*check_ids):
 
 
 def _result(check_id, status, reason=""):
+    # Mirrors the real RuntimeCheckResult's full field set
+    # (qa_agent/runtime/execution_models.py) - diagnosis_prompts.py/
+    # runtime_repair.py both read several of these directly (duration,
+    # details, start_time, end_time), so a duck-typed fixture missing any
+    # of them fails deep inside G3/G4 with an AttributeError instead of
+    # exercising the real diagnosis/repair path this file's own G5.3 tests
+    # need to actually reach.
     @dataclass(frozen=True)
     class _R:
         id: str
         status: str
         reason: str = ""
         name: str = ""
+        start_time: str = "2026-01-01T00:00:00"
+        end_time: str = "2026-01-01T00:00:01"
+        duration: float = 0.1
+        details: str = ""
         logs: tuple = ()
+        artifacts: tuple = ()
         exception: object = None
 
     return _R(id=check_id, status=status, reason=reason, name=check_id)
 
 
+def _Diagnosis(check_id, diagnosis_status="diagnosed"):
+    @dataclass(frozen=True)
+    class _D:
+        check_id: str
+        diagnosis_status: str = "diagnosed"
+
+    return _D(check_id=check_id, diagnosis_status=diagnosis_status)
+
+
 def test_execute_action_unknown_id_is_not_executable(suite):
-    outcome = execute_action("runtime_repair", None, QAState(), ".", None)
-    suite.check("runtime_repair has no executor wired up - never a fabricated success",
+    outcome = execute_action("totally_made_up_action", None, QAState(), ".", None)
+    suite.check("an id with no real executor is never a fabricated success",
                 outcome.status == STATUS_NOT_EXECUTABLE)
     suite.check("state is unchanged", outcome.new_state == QAState())
 
@@ -367,6 +388,192 @@ def test_execute_runtime_diagnosis_real_with_mock_provider(suite):
         outcome = execute_action("runtime_diagnosis", "build-verification", state, root, provider)
     suite.check("a real diagnosis was produced via the real, unmodified G3 function", outcome.status == STATUS_OK)
     suite.check("a real RuntimeDiagnosis is now in state", len(outcome.new_state.diagnoses) == 1)
+
+
+def _diagnosis_response(affected_files=("build.js",), evidence=("intentional failure",)):
+    return json.dumps({
+        "summary": "the build script exits with a non-zero status", "severity": "error", "confidence": 0.9,
+        "root_cause": "build.js intentionally exits with a failure", "evidence": list(evidence),
+        "affected_files": list(affected_files), "affected_components": ["build.js"],
+        "recommended_action": "fix build.js so it exits 0",
+    })
+
+
+BROKEN_BUILD_JS = "console.error('Error: intentional failure');\nprocess.exit(1);\n"
+FIXED_BUILD_JS = "console.log('build ok');\nprocess.exit(0);"
+
+
+def _repair_response(replacement=FIXED_BUILD_JS, confidence=0.9, start_line=1, end_line=2):
+    return json.dumps({
+        "explanation": "fixes the build", "replacement": replacement,
+        "confidence": confidence, "start_line": start_line, "end_line": end_line,
+    })
+
+
+def test_execute_runtime_repair_requires_a_target(suite):
+    outcome = execute_action("runtime_repair", None, QAState(), ".", None)
+    suite.check("a missing target is a real, reported error, not a crash", outcome.status == STATUS_ERROR)
+    suite.check("state is unchanged on error", outcome.new_state == QAState())
+
+
+def test_execute_runtime_repair_target_with_no_matching_evidence_in_state(suite):
+    outcome = execute_action("runtime_repair", "build-verification", QAState(), ".", None)
+    suite.check("a target with no execution result/diagnosis in state is a reported error, not a crash",
+                outcome.status == STATUS_ERROR)
+    suite.check("state is unchanged on error", outcome.new_state == QAState())
+
+
+def test_execute_runtime_repair_wires_the_real_g4_call_signature(suite):
+    """Proves the executor calls G4's real `repair_runtime_failure` with
+    exactly the shape docs/34 designed - not just that *something* runs.
+    """
+    from qa_agent.agent import executor as executor_module
+    from qa_agent.ai import runtime_repair_models
+
+    captured = {}
+
+    def fake_repair(check_result, diagnosis, execution_result, repository_context, provider, root,
+                     runtime_check=None, config=None):
+        captured.update(
+            check_result=check_result, diagnosis=diagnosis, execution_result=execution_result,
+            repository_context=repository_context, provider=provider, root=root,
+            runtime_check=runtime_check, config=config,
+        )
+        return runtime_repair_models.RuntimeRepairResult(
+            check_id=check_result.id, check_name=check_result.name,
+            original_runtime_status=check_result.status, diagnosis_status=diagnosis.diagnosis_status,
+            outcome=runtime_repair_models.OUTCOME_VERIFIED,
+            eligibility=runtime_repair_models.EligibilityResult(eligible=True, reason="ok"),
+            verification_status=runtime_repair_models.VERIFICATION_VERIFIED,
+            explanation="fake verified for this test",
+        )
+
+    original = executor_module.repair_runtime_failure
+    executor_module.repair_runtime_failure = fake_repair
+    try:
+        check_result = _result("build-verification", "fail", "build exited 1")
+        diagnosis = _Diagnosis(check_id="build-verification")
+        plan = _plan("build-verification")
+        state = QAState(repository_context="a real context", runtime_plan=plan, execution_results=(check_result,),
+                         diagnoses=(diagnosis,))
+        outcome = execute_action("runtime_repair", "build-verification", state, "/some/root", "a real provider",
+                                  config="a real config")
+    finally:
+        executor_module.repair_runtime_failure = original
+
+    suite.check("executor reports STATUS_OK for a VERIFIED outcome", outcome.status == STATUS_OK)
+    suite.check("the real check_result was passed through", captured["check_result"] is check_result)
+    suite.check("the real diagnosis was passed through", captured["diagnosis"] is diagnosis)
+    suite.check("the execution_result view exposes the real .plan", captured["execution_result"].plan is plan)
+    suite.check("repository_context/provider/root/config were all passed through unchanged",
+                captured["repository_context"] == "a real context" and captured["provider"] == "a real provider"
+                and captured["root"] == "/some/root" and captured["config"] == "a real config")
+    suite.check("the real result landed in state.repairs",
+                len(outcome.new_state.repairs) == 1 and outcome.new_state.repairs[0].outcome == "verified")
+
+
+def test_execute_runtime_repair_outcome_error_is_status_error(suite):
+    from qa_agent.agent import executor as executor_module
+    from qa_agent.ai import runtime_repair_models
+
+    def fake_repair(check_result, diagnosis, execution_result, repository_context, provider, root,
+                     runtime_check=None, config=None):
+        return runtime_repair_models.RuntimeRepairResult(
+            check_id=check_result.id, check_name=check_result.name,
+            original_runtime_status=check_result.status, diagnosis_status=diagnosis.diagnosis_status,
+            outcome=runtime_repair_models.OUTCOME_ERROR,
+            eligibility=runtime_repair_models.EligibilityResult(eligible=True, reason="ok"),
+            explanation="a genuine executor-level failure", error="RuntimeError: boom",
+        )
+
+    original = executor_module.repair_runtime_failure
+    executor_module.repair_runtime_failure = fake_repair
+    try:
+        check_result = _result("build-verification", "fail", "build exited 1")
+        state = QAState(runtime_plan=_plan("build-verification"), execution_results=(check_result,),
+                         diagnoses=(_Diagnosis(check_id="build-verification"),))
+        outcome = execute_action("runtime_repair", "build-verification", state, ".", None)
+    finally:
+        executor_module.repair_runtime_failure = original
+
+    suite.check("OUTCOME_ERROR is the one outcome reported as STATUS_ERROR", outcome.status == STATUS_ERROR)
+    suite.check("the result is still recorded, never dropped", len(outcome.new_state.repairs) == 1)
+
+
+def test_execute_runtime_repair_rejected_is_still_status_ok_and_recorded(suite):
+    """A REJECTED/HELD/etc. outcome is a complete, informative conclusion,
+    not an executor failure - matches _execute_static_analysis's own
+    "executor status is about the process, not the verdict" precedent.
+    """
+    from qa_agent.agent import executor as executor_module
+    from qa_agent.ai import runtime_repair_models
+
+    def fake_repair(check_result, diagnosis, execution_result, repository_context, provider, root,
+                     runtime_check=None, config=None):
+        return runtime_repair_models.RuntimeRepairResult(
+            check_id=check_result.id, check_name=check_result.name,
+            original_runtime_status=check_result.status, diagnosis_status=diagnosis.diagnosis_status,
+            outcome=runtime_repair_models.OUTCOME_REJECTED,
+            eligibility=runtime_repair_models.EligibilityResult(eligible=True, reason="ok"),
+            explanation="a real static regression vetoed the candidate",
+        )
+
+    original = executor_module.repair_runtime_failure
+    executor_module.repair_runtime_failure = fake_repair
+    try:
+        check_result = _result("build-verification", "fail", "build exited 1")
+        state = QAState(runtime_plan=_plan("build-verification"), execution_results=(check_result,),
+                         diagnoses=(_Diagnosis(check_id="build-verification"),))
+        outcome = execute_action("runtime_repair", "build-verification", state, ".", None)
+    finally:
+        executor_module.repair_runtime_failure = original
+
+    suite.check("a rejected repair is STATUS_OK - the executor completed its real job", outcome.status == STATUS_OK)
+    suite.check("'rejected' is never rendered as if it were a success", "rejected" in outcome.summary)
+    suite.check("the real result is still recorded", len(outcome.new_state.repairs) == 1)
+
+
+def test_execute_runtime_repair_real_end_to_end_verified(suite):
+    """The full real thing, no fakes anywhere: a real broken build.js, a
+    real, actually-executed Build Verification check (so the diagnosis
+    prompt's evidence is real captured subprocess output, not a hand-typed
+    stand-in - required for the diagnosis to actually pass grounding), a
+    real G3-shaped diagnosis, a real G4 repair proposal, a real
+    temporary-workspace apply, a real candidate re-check, a real write to
+    the real repository, and a real final re-verification.
+    """
+    with TempProject() as root:
+        writer = _Writer(root)
+        writer.write("package-lock.json", "{}")
+        writer.write("package.json", json.dumps({"scripts": {"build": "node build.js"}}))
+        writer.write("build.js", BROKEN_BUILD_JS)
+
+        from qa_agent.project import build_repository_context, discover_project
+        from qa_agent.runtime import plan_runtime_qa
+
+        discovery = discover_project(root)
+        context = build_repository_context(discovery.project)
+        plan = plan_runtime_qa(context)
+
+        build_outcome = execute_action("build_verification", None, QAState(repository_context=context, runtime_plan=plan), root, None)
+        suite.check("the real build actually failed, as scripted", build_outcome.new_state.execution_results[0].status == "fail")
+
+        diagnosis_provider = MockProvider(response_text=_diagnosis_response())
+        diagnosis_outcome = execute_action(
+            "runtime_diagnosis", "build-verification", build_outcome.new_state, root, diagnosis_provider,
+        )
+        suite.check("the real diagnosis step succeeded first", diagnosis_outcome.status == STATUS_OK)
+
+        repair_provider = MockProvider(response_text=_repair_response())
+        outcome = execute_action("runtime_repair", "build-verification", diagnosis_outcome.new_state, root, repair_provider)
+        patched_contents = Path(root, "build.js").read_text(encoding="utf-8")
+
+    suite.check("the real end-to-end repair executed", outcome.status == STATUS_OK)
+    suite.check("exactly one real RuntimeRepairResult is now in state", len(outcome.new_state.repairs) == 1)
+    result = outcome.new_state.repairs[0]
+    suite.check("it really reached VERIFIED - a real re-run of the real check actually passed",
+                result.outcome == "verified" and result.verification_status == "verified")
+    suite.check("the real file on disk was actually patched", "build ok" in patched_contents)
 
 
 def test_execute_action_never_raises_on_a_genuine_crash(suite):
@@ -585,6 +792,70 @@ def test_repeated_successful_action_is_rejected_not_reexecuted(suite):
     suite.check("the repeat attempt was rejected, not re-run", any(h.outcome == HISTORY_REJECTED for h in result.history))
 
 
+def test_full_loop_diagnosis_then_repair_then_stop_real_end_to_end(suite):
+    """The complete G5.3 story, driven entirely by a real, scripted
+    sequence through the real loop - discovery -> plan -> a real failing
+    build -> diagnosis -> repair -> stop - with every AI-facing step
+    (action selection *and* the diagnosis/repair content itself) coming
+    from the one scripted provider, in the exact call order the real code
+    actually makes them.
+    """
+    with TempProject() as root:
+        writer = _Writer(root)
+        writer.write("package-lock.json", "{}")
+        writer.write("package.json", json.dumps({"scripts": {"build": "node build.js"}}))
+        writer.write("build.js", BROKEN_BUILD_JS)
+
+        provider = _SequencedMockProvider([
+            _d("project_discovery"), _d("runtime_plan"), _d("build_verification"),
+            _d("runtime_diagnosis", target="build-verification"),
+            json.loads(_diagnosis_response()),
+            _d("runtime_repair", target="build-verification"),
+            json.loads(_repair_response()),
+            _stop("repaired and verified"),
+        ])
+        result = run_agent_loop(QAState(max_iterations=10), provider, root)
+        patched_contents = Path(root, "build.js").read_text(encoding="utf-8")
+
+    suite.check("the exact scripted sequence drove real execution", [h.action_id for h in result.history] ==
+                ["project_discovery", "runtime_plan", "build_verification", "runtime_diagnosis", "runtime_repair"])
+    suite.check("a real diagnosis is in final state", len(result.final_state.diagnoses) == 1)
+    suite.check("a real, verified repair is in final state",
+                len(result.final_state.repairs) == 1 and result.final_state.repairs[0].outcome == "verified")
+    suite.check("terminated by the AI's own stop", result.termination_reason == TERMINATION_AI_STOP)
+    suite.check("the real file on disk was actually patched", "build ok" in patched_contents)
+
+
+def test_repeated_repair_attempt_on_the_same_target_is_rejected_not_reattempted(suite):
+    """The one-shot rule (docs/34's own "repeated failure" stop condition)
+    holds inside the real loop, not just in a unit test of eligibility -
+    mirrors test_repeated_successful_action_is_rejected_not_reexecuted's
+    own style exactly, one action later in the pipeline.
+    """
+    with TempProject() as root:
+        writer = _Writer(root)
+        writer.write("package-lock.json", "{}")
+        writer.write("package.json", json.dumps({"scripts": {"build": "node build.js"}}))
+        writer.write("build.js", BROKEN_BUILD_JS)
+
+        provider = _SequencedMockProvider([
+            _d("project_discovery"), _d("runtime_plan"), _d("build_verification"),
+            _d("runtime_diagnosis", target="build-verification"),
+            json.loads(_diagnosis_response()),
+            _d("runtime_repair", target="build-verification"),
+            json.loads(_repair_response()),
+            _d("runtime_repair", target="build-verification"),  # illegitimate repeat, same target
+            _stop("done"),
+        ])
+        result = run_agent_loop(QAState(max_iterations=10), provider, root)
+
+    executed_repair_count = sum(
+        1 for h in result.history if h.action_id == "runtime_repair" and h.outcome == HISTORY_EXECUTED)
+    suite.check("runtime_repair really executed only once for this target", executed_repair_count == 1)
+    suite.check("the repeat attempt was rejected, not re-run", any(h.outcome == HISTORY_REJECTED for h in result.history))
+    suite.check("still exactly one repair result in final state", len(result.final_state.repairs) == 1)
+
+
 # --- CLI ---------------------------------------------------------------
 
 def test_cli_agent_subcommand_exists_and_runs_cleanly(suite):
@@ -627,6 +898,12 @@ if __name__ == "__main__":
         test_execute_runtime_plan_requires_discovery_first,
         test_execute_build_verification_real_pass,
         test_execute_runtime_diagnosis_real_with_mock_provider,
+        test_execute_runtime_repair_requires_a_target,
+        test_execute_runtime_repair_target_with_no_matching_evidence_in_state,
+        test_execute_runtime_repair_wires_the_real_g4_call_signature,
+        test_execute_runtime_repair_outcome_error_is_status_error,
+        test_execute_runtime_repair_rejected_is_still_status_ok_and_recorded,
+        test_execute_runtime_repair_real_end_to_end_verified,
         test_execute_action_never_raises_on_a_genuine_crash,
         test_shell_command_never_executes,
         test_arbitrary_python_command_never_executes,
@@ -638,6 +915,8 @@ if __name__ == "__main__":
         test_full_loop_build_test_then_stop,
         test_full_loop_server_startup_build_then_stop,
         test_repeated_successful_action_is_rejected_not_reexecuted,
+        test_full_loop_diagnosis_then_repair_then_stop_real_end_to_end,
+        test_repeated_repair_attempt_on_the_same_target_is_rejected_not_reattempted,
         test_cli_agent_subcommand_exists_and_runs_cleanly,
         test_cli_agent_never_needs_a_live_ollama_or_openrouter_server,
     ]))

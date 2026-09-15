@@ -253,7 +253,7 @@ def test_python_start_command_finds_run_py_with_uvicorn_run(suite):
         "app/main.py": MAIN_PY_SIMPLE,
     })
     try:
-        command, evidence = server_module.discover_server_start_command(proj.path, context.project)
+        command, evidence, _cwd = server_module.discover_server_start_command(proj.path, context.project)
         suite.check("a real command was found", command is not None)
         suite.check("run.py is the file actually invoked", command is not None and command[-1] == "run.py")
         suite.check("evidence names the real reason", "uvicorn.run" in evidence)
@@ -283,7 +283,7 @@ def test_python_start_command_falls_back_to_module_style_app(suite):
         "app/main.py": MAIN_PY_SIMPLE,  # no run.py anywhere; main.py has `app = FastAPI()`
     })
     try:
-        command, evidence = server_module.discover_server_start_command(proj.path, context.project)
+        command, evidence, _cwd = server_module.discover_server_start_command(proj.path, context.project)
         suite.check("a real command was found via the module fallback", command is not None)
         suite.check("uses -m uvicorn", command is not None and "-m" in command and "uvicorn" in command)
         suite.check("names the real module:app target", command is not None and "app.main:app" in command)
@@ -299,7 +299,7 @@ def test_python_start_command_prefers_uvicorn_run_entrypoint_over_module_fallbac
         "app/main.py": MAIN_PY_SIMPLE,  # also has a real FastAPI() - fallback would also work
     })
     try:
-        command, evidence = server_module.discover_server_start_command(proj.path, context.project)
+        command, evidence, _cwd = server_module.discover_server_start_command(proj.path, context.project)
         suite.check("the real runner script wins, not the module fallback",
                      command is not None and command[-1] == "run.py")
     finally:
@@ -312,7 +312,7 @@ def test_python_start_command_reports_missing_entrypoint_evidence(suite):
         "app/models.py": "class X:\n    pass\n",  # FastAPI detected, but no runnable evidence anywhere
     })
     try:
-        command, reason = server_module.discover_server_start_command(proj.path, context.project)
+        command, reason, _cwd = server_module.discover_server_start_command(proj.path, context.project)
         suite.check("no command found", command is None)
         suite.check("a clear, honest reason is given", "no runnable entrypoint" in reason)
     finally:
@@ -326,7 +326,7 @@ def test_discover_server_start_command_prefers_js_over_python_strategy(suite):
         "requirements.txt": _fastapi_requirements(),  # both present - a hybrid/monorepo edge case
     })
     try:
-        command, evidence = server_module.discover_server_start_command(proj.path, context.project)
+        command, evidence, _cwd = server_module.discover_server_start_command(proj.path, context.project)
         suite.check("JS strategy wins when a JS package manager is detected", command == ["npm", "run", "dev"])
     finally:
         proj.__exit__(None, None, None)
@@ -339,7 +339,7 @@ def test_discover_server_start_command_falls_through_to_python_when_no_js(suite)
         "app/main.py": MAIN_PY_SIMPLE,
     })
     try:
-        command, evidence = server_module.discover_server_start_command(proj.path, context.project)
+        command, evidence, _cwd = server_module.discover_server_start_command(proj.path, context.project)
         suite.check("falls through to the Python strategy with no JS evidence at all",
                      command is not None and command[-1] == "run.py")
     finally:
@@ -468,7 +468,7 @@ def test_python_start_command_reports_missing_dependency_deterministically(suite
             False, "fastapi, uvicorn not importable via '{}': No module named 'fastapi'".format(interpreter)
         )
         try:
-            command, reason = server_module.discover_server_start_command(proj.path, context.project)
+            command, reason, _cwd = server_module.discover_server_start_command(proj.path, context.project)
         finally:
             server_module.check_python_dependencies = original
         suite.check("no command is returned when dependencies are missing", command is None)
@@ -519,7 +519,7 @@ def test_real_end_to_end_fastapi_server_via_discovered_command(suite):
         endpoints, _ = _discover(context, proj.path)
         suite.check("the real /health route was discovered", any(e.path == "/health" for e in endpoints))
 
-        command, evidence = _server.discover_server_start_command(proj.path, context.project)
+        command, evidence, _cwd = _server.discover_server_start_command(proj.path, context.project)
         suite.check("a real command was found", command is not None, " ({})".format(evidence))
 
         handle = _server.start_and_wait_ready(command, proj.path, timeout=20)

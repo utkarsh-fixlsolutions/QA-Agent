@@ -55,7 +55,7 @@ from .models import (
     ApiEndpoint,
     ApiTestResult,
 )
-from .render import render, to_dict, to_json
+from .render import render, to_csv, to_dict, to_html, to_json
 from .resolution import build_request_body, fetch_openapi_schema, resolve_and_execute, resolve_path_parameter
 from .runner import DEFAULT_CONFIG, ApiQaConfig, run_api_qa
 
@@ -90,6 +90,8 @@ __all__ = [
     "resolve_and_execute",
     "resolve_path_parameter",
     "run_api_qa",
+    "to_csv",
     "to_dict",
+    "to_html",
     "to_json",
 ]

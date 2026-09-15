@@ -40,31 +40,48 @@ from .models import CALL_PASS, CALL_SKIPPED, ApiCallResult, ApiEndpoint
 
 # --- path-parameter extraction -------------------------------------------
 
-# FastAPI's own real path-parameter syntax. Next.js's `[param]`/`[...param]`
-# convention is a real, different syntax this module does not attempt to
-# resolve - a documented scope boundary (docs/33), not a silent gap; every
-# Next.js dynamic endpoint keeps Step 30's own original behavior (always
-# skipped) unchanged.
-_PATH_PARAM_RE = re.compile(r"\{([^}/]+)\}")
+# Two real path-parameter syntaxes, both matched (docs/41-express-path
+# -param-resolution.md): FastAPI's own `{param}`, and Express's own
+# `:param` (added when Express discovery itself was added, docs/38 - but
+# never wired in here until now, so every Express dynamic endpoint was
+# silently un-resolvable: `discovery.py` correctly marked it `dynamic`,
+# but this module found zero params to resolve and skipped it, every
+# time). Next.js's `[param]`/`[...param]` convention is a real, different
+# syntax this module still does not attempt to resolve - a documented
+# scope boundary (docs/33), not a silent gap; every Next.js dynamic
+# endpoint keeps Step 30's own original behavior (always skipped) unchanged.
+_PATH_PARAM_RE = re.compile(r"\{([^}/]+)\}|:([A-Za-z0-9_]+)")
 
 MUTATION_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 
 
 def _path_param_names(path: str) -> Tuple[str, ...]:
-    return tuple(_PATH_PARAM_RE.findall(path))
+    return tuple(brace_name or colon_name for brace_name, colon_name in _PATH_PARAM_RE.findall(path))
+
+
+def _param_token(path: str, param_name: str) -> str:
+    """The real, literal token `param_name` actually appears as in `path` -
+    `{param_name}` or `:param_name`, whichever is really there. Only ever
+    called after `_path_param_names` has already found `param_name` as a
+    real match in this exact path, so this never has to guess between the
+    two syntaxes.
+    """
+    curly = "{" + param_name + "}"
+    return curly if curly in path else ":" + param_name
 
 
 def _parent_collection_path(path: str, param_name: str) -> Optional[str]:
     """The real, structural REST convention this whole strategy rests on,
     named explicitly rather than pretending to handle arbitrary path
-    shapes: the collection endpoint for `/api/users/{user_id}` is its own
-    path with the last `{user_id}` segment (and everything after it)
-    removed - `/api/users`. Returns `None` if `{param_name}` is not
-    actually the last segment of `path` (a shape this strategy does not
-    attempt to resolve - never a guess at what the "real" parent might be).
+    shapes: the collection endpoint for `/api/users/{user_id}` (or
+    Express's own `/api/users/:user_id`) is its own path with the last
+    dynamic segment (and everything after it) removed - `/api/users`.
+    Returns `None` if that segment is not actually the last segment of
+    `path` (a shape this strategy does not attempt to resolve - never a
+    guess at what the "real" parent might be).
     """
     segments = path.strip("/").split("/")
-    token = "{" + param_name + "}"
+    token = _param_token(path, param_name)
     if not segments or segments[-1] != token:
         return None
     parent = segments[:-1]
@@ -144,9 +161,9 @@ def resolve_path_parameter(dynamic_endpoint: ApiEndpoint, evidence: Tuple[_Evide
     parent_path = _parent_collection_path(dynamic_endpoint.path, param_name)
     if parent_path is None:
         return None, (
-            "'{{{}}}' is not the final path segment of '{}' - this strategy only resolves a "
+            "'{}' is not the final path segment of '{}' - this strategy only resolves a "
             "trailing dynamic segment against its own structural parent collection endpoint"
-            .format(param_name, dynamic_endpoint.path)
+            .format(_param_token(dynamic_endpoint.path, param_name), dynamic_endpoint.path)
         )
 
     for fact in evidence:
@@ -159,7 +176,7 @@ def resolve_path_parameter(dynamic_endpoint: ApiEndpoint, evidence: Tuple[_Evide
                 "usable '{}' (or 'id') field - never guessed".format(
                     fact.endpoint.method, fact.endpoint.path, param_name)
             )
-        concrete_path = dynamic_endpoint.path.replace("{" + param_name + "}", str(value))
+        concrete_path = dynamic_endpoint.path.replace(_param_token(dynamic_endpoint.path, param_name), str(value))
         evidence_text = "{}={!r} (from real response: {} {})".format(
             param_name, value, fact.endpoint.method, fact.endpoint.path)
         return concrete_path, evidence_text

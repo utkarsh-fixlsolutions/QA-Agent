@@ -7,10 +7,10 @@ pure function of `QAState` - no AI call, no randomness, no hidden state.
 Ten actions were investigated (the nine this step's own spec named, plus
 `static_assets`, a real, safe, already-implemented executor found during
 this step's own repository audit that the spec's list happened to omit).
-Nine are exposed as `implemented=True`; `runtime_repair` is deliberately
-`implemented=False` - see `ActionDefinition`'s own docstring in models.py
-for why (repair *selection* is explicitly reserved for G5.3, not a
-limitation of the underlying G4 capability, which is real and complete).
+All ten are now `implemented=True` - `runtime_repair` was deliberately
+`implemented=False` through G5.1/G5.2 (repair *selection* was explicitly
+reserved for G5.3) and became real in G5.3 (docs/34), wired to the
+existing, unmodified G4 repair pipeline via `executor.py`.
 """
 
 from __future__ import annotations
@@ -113,11 +113,15 @@ ACTION_REGISTRY: Tuple[ActionDefinition, ...] = (
     ActionDefinition(
         id="runtime_repair",
         description="Let a DIAGNOSED runtime failure enter the existing, verified Phase E/G4 repair "
-                    "pipeline (qa_agent.ai.repair_runtime_failure). The underlying capability is real and "
-                    "complete - deliberately NOT exposed as an eligible action in G5.1; repair selection "
-                    "is explicitly reserved for G5.3 (see docs/28's own roadmap).",
+                    "pipeline (qa_agent.ai.repair_runtime_failure) - propose, apply in a temporary "
+                    "workspace, statically validate, re-run the real check against a candidate copy, and "
+                    "only write to the real repository once accepted; the real check is then re-run again "
+                    "for real before this is ever reported as verified (G5.3, docs/34). Requires a target: "
+                    "which specific diagnosed failure to attempt repairing (see valid_targets()) - a check "
+                    "id that has already received any repair attempt, success or failure, is never offered "
+                    "again this session (at most one repair attempt per failure, docs/24's own rule).",
         category="repair", safety_level=SAFETY_AUTONOMOUS, modifies_files=True,
-        requires=("runtime_diagnosis",), implemented=False,
+        requires=("runtime_diagnosis",), implemented=True, requires_target=True,
     ),
 )
 
@@ -209,4 +213,6 @@ def valid_targets(action: ActionDefinition, state: QAState) -> Tuple[str, ...]:
         return ()
     if action.id == "runtime_diagnosis":
         return tuple(sorted(state.failed_check_ids - state.diagnosed_check_ids))
+    if action.id == "runtime_repair":
+        return tuple(sorted(state.diagnosed_repairable_check_ids - state.repaired_check_ids))
     return ()  # pragma: no cover - no other action currently requires a target

@@ -32,6 +32,7 @@ from dataclasses import dataclass, field, replace
 from typing import Optional, Tuple
 
 from .actions import eligible_actions
+from .completion import QA_OUTCOME_INCONCLUSIVE, compute_qa_outcome
 from .controller import select_next_action
 from .executor import execute_action
 from .models import (
@@ -107,8 +108,14 @@ class AgentResult:
     stop and the deterministic system stopping the session on its own
     (budget/no-actions/error). This is *not* a claim that the AI
     determined the QA objective was satisfied - only that it chose not to
-    continue; deciding what "objectively satisfied" means is explicitly
-    deferred to G5.4.
+    continue; deciding what "objectively satisfied" means is `qa_outcome`'s
+    job below, not this flag's.
+    `qa_outcome` (G5.3/G5.4, docs/34): `completion.compute_qa_outcome(final_state)`
+    - a deterministic verdict computed only from real, observed evidence in
+    `final_state`, regardless of *why* the session stopped (the same
+    `final_state` always yields the same `qa_outcome`, independent of
+    `termination_reason`/`ai_stopped`). Never an AI opinion, never inferred
+    from the stop reason - see `completion.py`'s own docstring.
     """
 
     final_state: QAState
@@ -116,6 +123,7 @@ class AgentResult:
     termination_reason: str = TERMINATION_NO_ACTIONS
     termination_detail: str = ""
     ai_stopped: bool = False
+    qa_outcome: str = QA_OUTCOME_INCONCLUSIVE
 
     def __post_init__(self):
         if self.termination_reason not in TERMINATIONS:
@@ -142,11 +150,12 @@ def run_agent_loop(state: QAState, provider, root, config=None,
             return AgentResult(
                 final_state=state, history=tuple(history), termination_reason=TERMINATION_MAX_ITERATIONS,
                 termination_detail="reached the {}-iteration budget".format(state.max_iterations),
+                qa_outcome=compute_qa_outcome(state),
             )
         if not eligible_actions(state):
             return AgentResult(
                 final_state=state, history=tuple(history), termination_reason=TERMINATION_NO_ACTIONS,
-                termination_detail="no eligible action remains",
+                termination_detail="no eligible action remains", qa_outcome=compute_qa_outcome(state),
             )
 
         decision = decide(state, provider)
@@ -154,7 +163,7 @@ def run_agent_loop(state: QAState, provider, root, config=None,
         if decision.decision == DECISION_STOP:
             return AgentResult(
                 final_state=state, history=tuple(history), termination_reason=TERMINATION_AI_STOP,
-                termination_detail=decision.reason, ai_stopped=True,
+                termination_detail=decision.reason, ai_stopped=True, qa_outcome=compute_qa_outcome(state),
             )
 
         if decision.decision == DECISION_ERROR:
@@ -168,6 +177,7 @@ def run_agent_loop(state: QAState, provider, root, config=None,
             return AgentResult(
                 final_state=state, history=tuple(history), termination_reason=TERMINATION_CONTROLLER_ERROR,
                 termination_detail="{} ({})".format(decision.reason, decision.error),
+                qa_outcome=compute_qa_outcome(state),
             )
 
         # decision.decision == DECISION_CONTINUE: a real, currently-eligible

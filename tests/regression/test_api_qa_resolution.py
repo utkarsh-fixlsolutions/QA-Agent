@@ -620,7 +620,7 @@ http.createServer((req, res) => {
         # same real, running server, exactly mirroring what a real
         # FastAPI project's own discovery would have produced.
         from qa_agent.api_qa import server as server_module
-        command, _ = server_module.discover_server_start_command(proj.path, context.project)
+        command, _evidence, _cwd = server_module.discover_server_start_command(proj.path, context.project)
         handle = server_module.start_and_wait_ready(command, proj.path, timeout=20)
         try:
             suite.check("the real server became ready", handle.status == server_module.STATUS_READY,

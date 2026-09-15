@@ -39,11 +39,15 @@ from .models import (
     ApiTestResult,
 )
 
-# Next.js's own real default when no port is otherwise observed in the
-# server's startup logs - a documented, honest fallback (see
-# `_resolve_base_url`'s own docstring), never presented as anything other
-# than an assumption when it is one.
-_DEFAULT_NEXTJS_URL = "http://localhost:3000"
+# The single most common local dev-server port across every framework this
+# package discovers a start command for (Next.js's own real default; also
+# Express/FastAPI's own frequent choice) - used only when nothing more
+# specific was ever observed (`server._observed_base_url` already tries a
+# real URL, then a real "port NNNN" log line, before this is ever reached)
+# - a documented, honest last-resort guess (see `_resolve_base_url`'s own
+# docstring), never presented as anything other than an assumption when it
+# is one.
+_DEFAULT_FALLBACK_URL = "http://localhost:3000"
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,12 @@ class ApiQaConfig:
     server_startup_timeout: float = 20.0
     request_timeout: float = _DEFAULT_REQUEST_TIMEOUT
     env: Optional[dict] = None
+    # A real, live TCP-connect check run after `_resolve_base_url` and
+    # before any real endpoint call (docs/39-connect-probe.md) - a matched
+    # "ready" log line alone is not trustworthy enough to start making real
+    # calls against; see `server.wait_until_connectable`'s own docstring
+    # for the real race this closes.
+    connect_probe_timeout: float = _server.DEFAULT_CONNECT_PROBE_TIMEOUT
 
 
 DEFAULT_CONFIG = ApiQaConfig()
@@ -67,17 +77,18 @@ def _skip_all(endpoints, reason):
 
 
 def _resolve_base_url(handle, warnings):
-    """Prefer a real URL observed in the server's own startup output; only
-    fall back to Next.js's documented default port when nothing was
+    """Prefer a real URL, or a real "port NNNN" log line, actually observed
+    in the server's own startup output (`server._observed_base_url`); only
+    fall back to the single most common default port when neither was ever
     observed, and say so explicitly in `warnings` - never silently assume.
     """
     if handle.base_url:
         return handle.base_url
     warnings.append(
-        "server startup logs did not include a recognizable 'http://localhost:<port>' line; "
-        "assuming Next.js's default {}".format(_DEFAULT_NEXTJS_URL)
+        "server startup logs did not include a recognizable URL or 'port <number>' line; "
+        "assuming the common default {}".format(_DEFAULT_FALLBACK_URL)
     )
-    return _DEFAULT_NEXTJS_URL
+    return _DEFAULT_FALLBACK_URL
 
 
 def run_api_qa(context, root, config=None):
@@ -103,7 +114,7 @@ def run_api_qa(context, root, config=None):
             server_detail="no Next.js App Router API route handler was discovered under this project",
         )
 
-    command, evidence = _server.discover_server_start_command(root, context.project)
+    command, evidence, server_cwd = _server.discover_server_start_command(root, context.project)
     if command is None:
         return _finish(
             endpoints=endpoints,
@@ -112,7 +123,7 @@ def run_api_qa(context, root, config=None):
         )
 
     handle = _server.start_and_wait_ready(
-        command, root, config.server_startup_timeout, env=config.env,
+        command, server_cwd, config.server_startup_timeout, env=config.env,
     )
     try:
         if handle.status == _server.STATUS_NOT_FOUND:
@@ -122,17 +133,32 @@ def run_api_qa(context, root, config=None):
                 server_status=SERVER_START_FAILED, server_detail=handle.reason,
             )
         if handle.status == _server.STATUS_CRASHED:
+            # The real reason a process "exited with code N" almost always
+            # lives in what it printed before dying (a missing module, a
+            # syntax error, an unhandled startup exception) - already
+            # captured in `handle.logs` the whole time, just never
+            # surfaced until now (the same "why did it fail" gap docs/37
+            # already closed for a failing call against a server that DID
+            # start; this closes the equivalent gap for one that never did).
             return _finish(
                 endpoints=endpoints,
                 calls=_skip_all(endpoints, "server crashed on startup: {}".format(handle.reason)),
                 server_status=SERVER_CRASHED, server_detail=handle.reason,
+                server_log_tail="".join(handle.logs)[-_server.MAX_LOG_TAIL_CHARS:],
             )
 
         base_url = _resolve_base_url(handle, warnings)
+        if not _server.wait_until_connectable(base_url, timeout=config.connect_probe_timeout):
+            warnings.append(
+                "server matched a ready signal but never accepted a real TCP connection on {} "
+                "within {:.0f}s - the calls below may still fail for that reason".format(
+                    base_url, config.connect_probe_timeout)
+            )
         calls = resolve_and_execute(endpoints, base_url, config.request_timeout)
         return _finish(
             endpoints=endpoints, calls=calls, server_status=SERVER_STARTED,
             server_detail=handle.reason, base_url=base_url,
+            server_log_tail=_server.drain_log_tail(handle),
         )
     finally:
         handle.stop()

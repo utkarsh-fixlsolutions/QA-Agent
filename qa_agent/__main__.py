@@ -29,10 +29,12 @@ from pathlib import Path
 from .adapters import ADAPTERS, ToolError
 from .api_qa import render as render_api_qa
 from .api_qa import diagnose_and_repair_api_failures, render_api_diagnosis_repair_entry, run_api_qa
+from .api_qa import to_csv as api_qa_to_csv
+from .api_qa import to_html as api_qa_to_html
 from .agent import DEFAULT_MAX_ITERATIONS as _AGENT_DEFAULT_MAX_ITERATIONS
 from .agent import DEFAULT_OBJECTIVE as _AGENT_DEFAULT_OBJECTIVE
 from .agent import HISTORY_EXECUTED, QAState, TERMINATION_CONTROLLER_ERROR, run_agent_loop
-from .ai import MockProvider, OllamaProvider, OpenRouterProvider, explain_findings, summarize_run
+from .ai import GroqProvider, MockProvider, OllamaProvider, OpenRouterProvider, explain_findings, summarize_run
 from .ai import diagnose_runtime_failures, render_diagnosis
 from .ai import repair_runtime_failures, render_runtime_repair_result
 from .ai import suggest_fixes as ai_suggest_fixes
@@ -65,7 +67,7 @@ from .runner import RunResult, run
 from .watch import WatchSession
 
 _ADAPTER_NAMES = [adapter.name for adapter in ADAPTERS]
-_AI_PROVIDER_CHOICES = ("ollama", "mock", "cloud")
+_AI_PROVIDER_CHOICES = ("ollama", "mock", "cloud", "groq")
 
 
 def _add_ai_arguments(parser):
@@ -127,8 +129,8 @@ def _construct_ai_provider(provider_name, model=None, endpoint=None, timeout=Non
     validation path, so an unsupported name is never silently swallowed
     here; it would already have been rejected earlier, loudly. Never reads
     an API key or any secret itself - a provider that needs one
-    (`OpenRouterProvider`) reads it from its own environment variable,
-    exactly as `OllamaProvider` needs no secret at all.
+    (`OpenRouterProvider`, `GroqProvider`) reads it from its own
+    environment variable, exactly as `OllamaProvider` needs no secret at all.
     """
     kwargs = {} if model is None else {"model": model}
     if provider_name == "mock":
@@ -145,6 +147,12 @@ def _construct_ai_provider(provider_name, model=None, endpoint=None, timeout=Non
         if timeout is not None:
             kwargs["timeout"] = timeout
         return OpenRouterProvider(**kwargs)
+    if provider_name == "groq":
+        if endpoint is not None:
+            kwargs["endpoint"] = endpoint
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        return GroqProvider(**kwargs)
     return None  # pragma: no cover - unreachable, see docstring
 
 
@@ -349,8 +357,9 @@ def _discover_main(argv):
     parser.add_argument(
         "--ai-provider", choices=_AI_PROVIDER_CHOICES, default="ollama",
         help="AI provider for --diagnose/--repair-runtime: 'ollama' (default, needs a local Ollama "
-             "server), 'mock' (tests), or 'cloud' (OpenRouter - needs OPENROUTER_API_KEY set in "
-             "the environment; see docs/27-openrouter-cloud-provider.md)",
+             "server), 'mock' (tests), 'cloud' (OpenRouter - needs OPENROUTER_API_KEY set in "
+             "the environment; see docs/27-openrouter-cloud-provider.md), or 'groq' (needs "
+             "GROQ_API_KEY set in the environment; see docs/42-groq-cloud-provider.md)",
     )
     parser.add_argument("--ai-model", metavar="MODEL",
                          help="override the default model for --diagnose/--repair-runtime "
@@ -374,6 +383,17 @@ def _discover_main(argv):
         ),
     )
     parser.add_argument(
+        "--api-report", metavar="PATH",
+        help=(
+            "also write the API QA results to PATH as a detailed, color-coded report "
+            "(docs/36-api-qa-report-export.md) - one row per endpoint with its real HTTP "
+            "status/code and why it failed. Format is chosen by PATH's extension: '.csv' for "
+            "a plain spreadsheet, anything else (e.g. '.html') for a self-contained, "
+            "color-coded HTML report (green 2xx, amber 4xx, red 5xx/no response, gray "
+            "skipped). Implies --api-test. Terminal output is unchanged."
+        ),
+    )
+    parser.add_argument(
         "--api-repair", action="store_true",
         help=(
             "also attempt a verified repair for each DIAGNOSED API failure (docs/31) - reuses G4's "
@@ -386,7 +406,7 @@ def _discover_main(argv):
     args = parser.parse_args(argv)
 
     want_diagnose = args.diagnose or args.repair_runtime
-    want_api_test = args.api_test or args.api_diagnose or args.api_repair
+    want_api_test = args.api_test or args.api_diagnose or args.api_repair or bool(args.api_report)
     want_api_diagnose = args.api_diagnose or args.api_repair
 
     result = discover_project(args.project_path)
@@ -399,6 +419,13 @@ def _discover_main(argv):
     if want_api_test and context is not None:
         api_result = run_api_qa(context, args.project_path)
         print(render_api_qa(api_result))
+        if args.api_report:
+            report_text = api_qa_to_csv(api_result) if args.api_report.lower().endswith(".csv") \
+                else api_qa_to_html(api_result)
+            try:
+                Path(args.api_report).write_text(report_text, encoding="utf-8")
+            except OSError as exc:
+                print(render_write_error(args.api_report, exc), file=sys.stderr)
         if want_api_diagnose:
             api_provider = _construct_ai_provider(args.ai_provider, model=args.ai_model)
             entries = diagnose_and_repair_api_failures(
@@ -449,17 +476,22 @@ def _agent_main(argv):
     like every other AI feature in this project; always launches real
     subprocesses (build/test commands, a real dev-server process it always
     terminates) the same way `discover --execute-runtime-plan` already
-    does. Never applies a repair - G5.3, not implemented yet.
+    does. May also apply a verified repair for a diagnosed failure (G5.3) -
+    proposed, applied in a temporary workspace, statically validated, and
+    only written to the real repository once accepted and re-verified by a
+    real re-run of the same check.
     """
     parser = argparse.ArgumentParser(
         prog="qa_agent agent",
         description=(
-            "Run the bounded, autonomous QA execution loop (G5.2): AI selects the next QA action from "
-            "a deterministic allowlist; the deterministic system independently validates and executes "
-            "it via the existing project discovery/runtime planning/execution/diagnosis engines "
-            "(G1-G4), unmodified. Repeats until the AI stops, the iteration budget is reached, no "
-            "eligible action remains, or a real provider/controller failure occurs. Never applies a "
-            "repair - that integration is a later stage (G5.3), not implemented yet."
+            "Run the bounded, autonomous QA execution loop (G5.2-G5.4): AI selects the next QA action "
+            "from a deterministic allowlist; the deterministic system independently validates and "
+            "executes it via the existing project discovery/runtime planning/execution/diagnosis/repair "
+            "engines (G1-G4), unmodified. Repeats until the AI stops, the iteration budget is reached, "
+            "no eligible action remains, or a real provider/controller failure occurs. A repair (G5.3) "
+            "is only ever reported as verified after a real re-run of the original check actually "
+            "passes. The session's own final QA result (passed/failed/inconclusive, G5.4) is computed "
+            "deterministically from real evidence only, independent of why the session stopped."
         ),
     )
     parser.add_argument("project_path", help="directory to run the agent against")
@@ -467,8 +499,9 @@ def _agent_main(argv):
                          help="a short QA objective shown to the AI (default: {!r})".format(_AGENT_DEFAULT_OBJECTIVE))
     parser.add_argument(
         "--ai-provider", choices=_AI_PROVIDER_CHOICES, default="ollama",
-        help="AI provider: 'ollama' (default, needs a local Ollama server), 'mock' (tests), or 'cloud' "
-             "(OpenRouter - needs OPENROUTER_API_KEY set in the environment)",
+        help="AI provider: 'ollama' (default, needs a local Ollama server), 'mock' (tests), 'cloud' "
+             "(OpenRouter - needs OPENROUTER_API_KEY set in the environment), or 'groq' (needs "
+             "GROQ_API_KEY set in the environment)",
     )
     parser.add_argument("--ai-model", metavar="MODEL", help="override the default model for the chosen provider")
     parser.add_argument(
@@ -500,9 +533,11 @@ def _agent_main(argv):
     print()
     print("  Termination: {} - {}".format(result.termination_reason, result.termination_detail))
     print("  AI-selected stop: {}".format("yes" if result.ai_stopped else "no"))
+    print("  QA outcome: {}".format(result.qa_outcome))
     print()
-    print("  Note: this reports what the agent did, not whether the QA objective was \"satisfied\" -")
-    print("        that judgment is explicitly deferred to a later stage (G5.4), not made here.")
+    print("  Note: QA outcome is computed only from real, observed evidence in the final state -")
+    print("        never from the AI's own opinion, and never from why the session stopped. An")
+    print("        \"inconclusive\" outcome means not enough was actually run to say more.")
 
     return 2 if result.termination_reason == TERMINATION_CONTROLLER_ERROR else 0
 

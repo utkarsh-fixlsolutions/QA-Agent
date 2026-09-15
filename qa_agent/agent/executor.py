@@ -18,13 +18,13 @@ unmodified function this project already built and already tested (G1-G4):
     environment_validation/
     static_assets                -> run_runtime_plan, scoped to one planned check
     runtime_diagnosis            -> diagnose_runtime_failure (G3), for one target check
+    runtime_repair                -> repair_runtime_failure (G4), for one target check (G5.3, docs/34)
 
-`runtime_repair` has no entry in `_EXECUTORS` at all - not because it is
-forgotten, but because `actions.eligible_actions()` never offers it in the
-first place (G5.1's own `implemented=False`), so `execute_action` would
-never legitimately be called with it; if it somehow were, `_EXECUTORS.get`
-returns `None` and `STATUS_NOT_EXECUTABLE` is returned, never a silent
-no-op success and never a real repair.
+An unrecognized action id still has no entry in `_EXECUTORS` at all -
+`_EXECUTORS.get` returns `None` and `STATUS_NOT_EXECUTABLE` is returned,
+never a silent no-op success - but this is now a genuinely impossible case
+for every id `eligible_actions()` can ever offer (every registry entry is
+`implemented=True` as of G5.3); it remains as a defensive fallback only.
 
 Every handler returns a structured `ExecutionOutcome`, never raises out of
 `execute_action` itself - a genuine crash inside one handler is caught and
@@ -38,7 +38,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from qa_agent.ai import diagnose_runtime_failure
+from qa_agent.ai import diagnose_runtime_failure, repair_runtime_failure
+from qa_agent.ai import OUTCOME_ERROR as _REPAIR_OUTCOME_ERROR
 from qa_agent.project import build_repository_context, discover_project
 from qa_agent.runner import run as run_static_analysis
 from qa_agent.runtime import plan_runtime_qa, run_runtime_plan
@@ -180,11 +181,70 @@ def _execute_runtime_diagnosis(target, state: QAState, root, provider, config) -
     return ExecutionOutcome(status=STATUS_OK, summary=summary, new_state=new_state)
 
 
+@dataclass(frozen=True)
+class _ExecutionResultView:
+    """The one field `repair_runtime_failure()` (G4) actually reads off its
+    `execution_result` argument - `.plan`, used only to re-run one check in
+    isolation via `_run_single_check`/`run_runtime_plan`. `QAState` has no
+    `RuntimeExecutionResult` of its own (G5.2 accumulates individual
+    `RuntimeCheckResult`s one at a time instead), so this is a minimal,
+    real, non-guessed stand-in - the same duck-typing precedent
+    `runtime_repair.py`'s own `_RuntimeRepairFinding` already established
+    for handing G4 exactly the shape it needs, nothing more.
+    """
+
+    plan: object
+
+
+def _execute_runtime_repair(target, state: QAState, root, provider, config) -> ExecutionOutcome:
+    """One real G4 `repair_runtime_failure` call (docs/24), for exactly the
+    one target check id the controller already validated (G5.3, docs/34).
+    This is a thin execution of an existing, unmodified G4 function - every
+    eligibility/proposal/apply/validate/verify decision inside it is G4's
+    own, untouched; this function only resolves the real inputs G4 needs
+    out of `QAState` and records the real result.
+    """
+    if target is None:
+        return ExecutionOutcome(status=STATUS_ERROR, summary="runtime_repair requires a target check id", new_state=state)
+    check_result = next((r for r in state.execution_results if getattr(r, "id", None) == target), None)
+    diagnosis = next((d for d in state.diagnoses if getattr(d, "check_id", None) == target), None)
+    if check_result is None or diagnosis is None:
+        return ExecutionOutcome(
+            status=STATUS_ERROR,
+            summary="runtime_repair target '{}' has no matching execution result and/or diagnosis in state"
+                    .format(target),
+            new_state=state,
+        )
+    runtime_check = None
+    if state.runtime_plan is not None:
+        runtime_check = next((c for c in state.runtime_plan.checks if c.id == target), None)
+    result = repair_runtime_failure(
+        check_result, diagnosis, _ExecutionResultView(plan=state.runtime_plan),
+        state.repository_context, provider, root, runtime_check=runtime_check, config=config,
+    )
+    new_state = replace(state, repairs=state.repairs + (result,))
+    # STATUS_ERROR only for the one outcome that is a genuine executor-level
+    # failure (no workspace, an apply crash, an unexpected exception inside
+    # G4 itself) - every other outcome (not_eligible/rejected/held/
+    # validation_failed/applied_but_still_failing/verified) is STATUS_OK:
+    # the executor did its real job and produced a real, informative
+    # conclusion, exactly mirroring _execute_static_analysis's own
+    # "executor status is about the executor's own process, never a verdict
+    # on the underlying result" rule. Never claim success here beyond what
+    # `result.outcome`/`result.explanation` themselves say - G4's own
+    # VERIFIED-only-on-a-real-re-check rule is what this summary reports
+    # verbatim, never re-interpreted.
+    status = STATUS_ERROR if result.outcome == _REPAIR_OUTCOME_ERROR else STATUS_OK
+    summary = "{}: {}".format(result.outcome, result.explanation)
+    return ExecutionOutcome(status=status, summary=summary, new_state=new_state)
+
+
 _EXECUTORS = {
     "project_discovery": _execute_project_discovery,
     "runtime_plan": _execute_runtime_plan,
     "static_analysis": _execute_static_analysis,
     "runtime_diagnosis": _execute_runtime_diagnosis,
+    "runtime_repair": _execute_runtime_repair,
 }
 _EXECUTORS.update({
     action_id: _make_runtime_check_executor(check_id)

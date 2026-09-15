@@ -102,6 +102,24 @@ def _diagnosis_lines(diagnoses) -> list:
     return lines
 
 
+def _repair_lines(repairs) -> list:
+    """Same shape as `_diagnosis_lines`, one layer later (G5.3, docs/34) -
+    context only, never load-bearing: `valid_targets`/eligibility (not this
+    prompt text) is what actually prevents re-selecting an already-repaired
+    check id, so this section exists purely so the AI's own 'reason' text
+    can refer to what already happened, the same way it can already refer
+    to diagnoses.
+    """
+    if not repairs:
+        return ["(none yet)"]
+    lines = []
+    for repair in repairs:
+        lines.append("  - {} [{}]: {}".format(
+            getattr(repair, "check_id", "?"), getattr(repair, "outcome", "?"),
+            getattr(repair, "explanation", "")))
+    return lines
+
+
 def _action_lines(actions, state: QAState) -> list:
     if not actions:
         return ["(none - nothing is currently eligible)"]
@@ -134,6 +152,8 @@ def build_action_selection_prompt(state: QAState, eligible_actions: Tuple[object
     lines += _check_result_lines(state.execution_results)
     lines += ["", "DIAGNOSES SO FAR", ""]
     lines += _diagnosis_lines(state.diagnoses)
+    lines += ["", "REPAIRS SO FAR", ""]
+    lines += _repair_lines(state.repairs)
     lines += ["", "AVAILABLE ACTIONS (choose next_action from this list only, or stop)", ""]
     lines += _action_lines(eligible_actions, state)
     lines += [

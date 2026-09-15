@@ -162,6 +162,36 @@ class QAState:
         return {getattr(d, "check_id", None) for d in self.diagnoses}
 
     @property
+    def diagnosed_repairable_check_ids(self):
+        """Check ids whose diagnosis is genuinely `DIAGNOSIS_DIAGNOSED`
+        ("diagnosed", duplicated as a literal string - this package's own
+        established zero-import rule, the same one `failed_check_ids`
+        already applies to the three diagnosable status strings) - the
+        subset of `diagnosed_check_ids` a repair could actually be proposed
+        for. `INSUFFICIENT_CONTEXT`/`INVALID_RESPONSE`/`AI_ERROR`/
+        `NOT_APPLICABLE` diagnoses never make their check id eligible for
+        `runtime_repair` (G4's own `check_repair_eligibility` would refuse
+        them anyway; this is the same fact expressed one layer earlier, in
+        the eligibility set the AI is even shown).
+        """
+        return {
+            getattr(d, "check_id", None) for d in self.diagnoses
+            if getattr(d, "diagnosis_status", None) == "diagnosed"
+        }
+
+    @property
+    def repaired_check_ids(self):
+        """Every check id that already has *any* `RuntimeRepairResult` in
+        `self.repairs`, regardless of its outcome - success or failure
+        alike. This is the whole mechanism behind the "at most one repair
+        attempt per failure" rule at the G5.3 level (docs/24's own bounded-
+        attempts rule, restated here): once a check id appears here, it
+        never becomes a valid `runtime_repair` target again this session,
+        so there is no separate retry-counter to get wrong.
+        """
+        return {getattr(r, "check_id", None) for r in self.repairs}
+
+    @property
     def completed_action_ids(self):
         """Which registry action ids count as "already done", computed
         fresh from the real state every time - never a separately-tracked
@@ -189,6 +219,11 @@ class QAState:
         # for every other action.
         if not (self.failed_check_ids - self.diagnosed_check_ids):
             completed.add("runtime_diagnosis")
+        # runtime_repair (G5.3): the exact same dynamic-completion shape as
+        # runtime_diagnosis above - "completed" means only "nothing real
+        # and repairable is currently outstanding," not "ran once."
+        if not (self.diagnosed_repairable_check_ids - self.repaired_check_ids):
+            completed.add("runtime_repair")
         return frozenset(completed)
 
 

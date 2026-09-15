@@ -168,6 +168,15 @@ class ApiTestResult:
     route, or one skipped because the server never started, still appears
     here - honestly, not silently dropped). `calls` has exactly one entry
     per endpoint in `endpoints`, in the same order.
+
+    `server_log_tail` (docs/37-api-qa-server-log-capture.md): a real,
+    bounded tail of whatever the dev server itself printed to its own
+    stdout/stderr while `calls` were being made - empty when the server was
+    never actually started, or printed nothing during that window. This is
+    what makes a failure's real *why* visible for cases `http_client.py`
+    alone cannot explain (an application-level exception whose response
+    body was empty, e.g. an unhandled Next.js route error) - the server's
+    own real console output, never fabricated or summarized.
     """
 
     root_path: str
@@ -180,6 +189,7 @@ class ApiTestResult:
     finished_at: str = ""
     total_duration: float = 0.0
     warnings: Tuple[str, ...] = field(default_factory=tuple)
+    server_log_tail: str = ""
 
     def __post_init__(self):
         if self.server_status not in SERVER_STATUSES:

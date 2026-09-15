@@ -42,6 +42,8 @@ from qa_agent.api_qa import (  # noqa: E402
     discover_api_endpoints,
     render,
     run_api_qa,
+    to_csv,
+    to_html,
 )
 
 
@@ -229,6 +231,171 @@ def test_discover_dedupes_identical_method_path_pairs(suite):
         proj.__exit__(None, None, None)
 
 
+# --- discovery: Next.js Pages Router (docs/38) ------------------------------
+
+def test_discover_pages_router_finds_method_via_req_method_check(suite):
+    context, proj = _context_for({
+        "package.json": json.dumps({"name": "x", "scripts": {"dev": "next dev"}, "dependencies": {"next": "14.0.0"}}),
+        "pages/api/health.ts": (
+            "export default function handler(req, res) {\n"
+            "  if (req.method === 'GET') { res.status(200).json({ok: true}); return; }\n"
+            "  res.status(405).end();\n"
+            "}\n"
+        ),
+    })
+    try:
+        endpoints, warnings = discover_api_endpoints(context, proj.path)
+        suite.check("exactly one endpoint found", len(endpoints) == 1, " ({})".format(len(endpoints)))
+        suite.check("method is GET, from the real req.method check", endpoints and endpoints[0].method == "GET")
+        suite.check("path is /api/health", endpoints and endpoints[0].path == "/api/health")
+        suite.check("no 'assumed GET' warning - a real check was found", not any("assuming" in w for w in warnings))
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_discover_pages_router_index_file_maps_to_parent_path(suite):
+    context, proj = _context_for({
+        "package.json": json.dumps({"name": "x", "scripts": {"dev": "next dev"}, "dependencies": {"next": "14.0.0"}}),
+        "pages/api/companions/index.ts": (
+            "export default function handler(req, res) { res.status(200).json([]); }\n"
+        ),
+    })
+    try:
+        endpoints, _ = discover_api_endpoints(context, proj.path)
+        suite.check("index.ts maps to its parent directory's own path",
+                     endpoints and endpoints[0].path == "/api/companions", " ({})".format(
+                         endpoints[0].path if endpoints else None))
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_discover_pages_router_dynamic_segment(suite):
+    context, proj = _context_for({
+        "package.json": json.dumps({"name": "x", "scripts": {"dev": "next dev"}, "dependencies": {"next": "14.0.0"}}),
+        "pages/api/companions/[id].ts": (
+            "export default function handler(req, res) { res.status(200).json({}); }\n"
+        ),
+    })
+    try:
+        endpoints, _ = discover_api_endpoints(context, proj.path)
+        suite.check("dynamic segment preserved literally",
+                     endpoints and endpoints[0].path == "/api/companions/[id]")
+        suite.check("marked dynamic", endpoints and endpoints[0].dynamic is True)
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_discover_pages_router_no_method_check_assumes_get_and_warns(suite):
+    context, proj = _context_for({
+        "package.json": json.dumps({"name": "x", "scripts": {"dev": "next dev"}, "dependencies": {"next": "14.0.0"}}),
+        "pages/api/ping.ts": "export default function handler(req, res) { res.status(200).json({pong: true}); }\n",
+    })
+    try:
+        endpoints, warnings = discover_api_endpoints(context, proj.path)
+        suite.check("assumes GET when no method check exists",
+                     endpoints and endpoints[0].method == "GET")
+        suite.check("the assumption is explicitly flagged, not silent",
+                     any("assuming" in w and "pages/api/ping.ts" in w for w in warnings), " ({})".format(warnings))
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_discover_pages_router_no_default_export_warns_and_skips(suite):
+    context, proj = _context_for({
+        "package.json": json.dumps({"name": "x", "scripts": {"dev": "next dev"}, "dependencies": {"next": "14.0.0"}}),
+        "pages/api/helper.ts": "export function notAHandler() { return 1; }\n",
+    })
+    try:
+        endpoints, warnings = discover_api_endpoints(context, proj.path)
+        suite.check("no endpoint fabricated with no default export", endpoints == ())
+        suite.check("a clear warning is recorded instead", any("no 'export default'" in w for w in warnings))
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_discover_pages_router_gated_on_real_nextjs_framework_fact(suite):
+    context, proj = _context_for({
+        "package.json": json.dumps({"name": "x", "scripts": {"start": "node server.js"}}),
+        "pages/api/health.ts": "export default function handler(req, res) { res.status(200).json({}); }\n",
+    })
+    try:
+        endpoints, warnings = discover_api_endpoints(context, proj.path)
+        suite.check("nothing discovered without a real Next.js framework fact", endpoints == ())
+        suite.check("no warnings either - the strategy never even looked", warnings == ())
+    finally:
+        proj.__exit__(None, None, None)
+
+
+# --- discovery: Express (docs/38) -------------------------------------------
+
+def test_discover_express_finds_a_simple_route(suite):
+    context, proj = _context_for({
+        "package.json": json.dumps({"name": "x", "scripts": {"start": "node server.js"}, "dependencies": {"express": "4.19.0"}}),
+        "server.js": (
+            "const express = require('express');\n"
+            "const app = express();\n"
+            "app.get('/api/health', (req, res) => res.json({ok: true}));\n"
+        ),
+    })
+    try:
+        endpoints, _ = discover_api_endpoints(context, proj.path)
+        suite.check("exactly one endpoint found", len(endpoints) == 1, " ({})".format(len(endpoints)))
+        suite.check("method is GET", endpoints and endpoints[0].method == "GET")
+        suite.check("path is /api/health", endpoints and endpoints[0].path == "/api/health")
+        suite.check("source_file points at the real file", endpoints and endpoints[0].source_file == "server.js")
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_discover_express_finds_router_calls_and_dynamic_segments(suite):
+    context, proj = _context_for({
+        "package.json": json.dumps({"name": "x", "scripts": {"start": "node server.js"}, "dependencies": {"express": "4.19.0"}}),
+        "routes/users.js": (
+            "const router = require('express').Router();\n"
+            "router.get('/api/users/:id', (req, res) => res.json({}));\n"
+            "router.post(\"/api/users\", (req, res) => res.json({}));\n"
+        ),
+    })
+    try:
+        endpoints, _ = discover_api_endpoints(context, proj.path)
+        by_path = {(e.method, e.path): e for e in endpoints}
+        suite.check("GET with a dynamic :id segment discovered",
+                     ("GET", "/api/users/:id") in by_path and by_path[("GET", "/api/users/:id")].dynamic is True)
+        suite.check("POST discovered too, not dynamic",
+                     ("POST", "/api/users") in by_path and by_path[("POST", "/api/users")].dynamic is False)
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_discover_express_gated_on_real_express_framework_fact(suite):
+    context, proj = _context_for({
+        "package.json": json.dumps({"name": "x", "scripts": {"start": "node server.js"}}),
+        "server.js": "app.get('/api/health', (req, res) => res.json({}));\n",
+    })
+    try:
+        endpoints, warnings = discover_api_endpoints(context, proj.path)
+        suite.check("nothing discovered without a real Express framework fact", endpoints == ())
+        suite.check("no warnings either - the strategy never even looked", warnings == ())
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_discover_express_ignores_non_literal_first_argument(suite):
+    context, proj = _context_for({
+        "package.json": json.dumps({"name": "x", "scripts": {"start": "node server.js"}, "dependencies": {"express": "4.19.0"}}),
+        "server.js": (
+            "app.get(someMiddleware, (req, res) => res.json({}));\n"
+            "app.get('/api/real', (req, res) => res.json({}));\n"
+        ),
+    })
+    try:
+        endpoints, _ = discover_api_endpoints(context, proj.path)
+        suite.check("only the real literal-path call is discovered",
+                     [e.path for e in endpoints] == ["/api/real"], " ({})".format([e.path for e in endpoints]))
+    finally:
+        proj.__exit__(None, None, None)
+
+
 # --- http client -----------------------------------------------------------
 
 class _FakeHeaders:
@@ -398,9 +565,10 @@ def test_discover_server_start_command_prefers_dev_over_start(suite):
         "package-lock.json": "{}",
     })
     try:
-        command, evidence = server_module.discover_server_start_command(proj.path, context.project)
+        command, evidence, cwd = server_module.discover_server_start_command(proj.path, context.project)
         suite.check("dev script chosen over start", command is not None and "dev" in command)
         suite.check("evidence names the real script", "scripts.dev" in evidence)
+        suite.check("cwd is the real project root", str(cwd) == str(proj.path))
     finally:
         proj.__exit__(None, None, None)
 
@@ -411,9 +579,55 @@ def test_discover_server_start_command_none_when_no_script(suite):
         "package-lock.json": "{}",
     })
     try:
-        command, reason = server_module.discover_server_start_command(proj.path, context.project)
+        command, reason, cwd = server_module.discover_server_start_command(proj.path, context.project)
         suite.check("no command found", command is None)
         suite.check("a clear reason is given", "no npm dev/start script" in reason)
+        suite.check("no cwd for a command that was never found", cwd is None)
+    finally:
+        proj.__exit__(None, None, None)
+
+
+# --- server lifecycle: monorepo/workspace discovery (docs/40) -----------
+
+def test_discover_server_start_command_falls_back_to_a_monorepo_package(suite):
+    context, proj = _context_for({
+        "package.json": json.dumps({"name": "root", "private": True}),  # no dev/start script here
+        "package-lock.json": "{}",
+        "client/package.json": json.dumps({
+            "name": "client", "scripts": {"dev": "vite"}, "dependencies": {"react": "18.0.0"},
+        }),
+        "server/package.json": json.dumps({
+            "name": "server", "scripts": {"dev": "node index.js"}, "dependencies": {"express": "4.19.0"},
+        }),
+    })
+    try:
+        command, evidence, cwd = server_module.discover_server_start_command(proj.path, context.project)
+        suite.check("a command was found", command is not None, " (evidence/reason: {})".format(evidence))
+        suite.check("the backend package (server) is chosen over the frontend-only one (client)",
+                     "server" in evidence, " (evidence: {})".format(evidence))
+        suite.check("cwd is the real package directory, not the workspace root",
+                     cwd is not None and str(cwd).replace("\\", "/").endswith("/server"), " (cwd: {})".format(cwd))
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_discover_server_start_command_ambiguous_monorepo_is_never_guessed(suite):
+    context, proj = _context_for({
+        "package.json": json.dumps({"name": "root", "private": True}),
+        "package-lock.json": "{}",
+        "api/package.json": json.dumps({
+            "name": "api", "scripts": {"dev": "node index.js"}, "dependencies": {"express": "4.19.0"},
+        }),
+        "worker/package.json": json.dumps({
+            "name": "worker", "scripts": {"dev": "node worker.js"}, "dependencies": {"bullmq": "5.0.0"},
+        }),
+    })
+    try:
+        command, reason, cwd = server_module.discover_server_start_command(proj.path, context.project)
+        suite.check("never guesses between two equally-real backend-looking candidates", command is None)
+        suite.check("the real candidates are named in the reason, not hidden",
+                     "api" in reason and "worker" in reason, " (reason: {})".format(reason))
+        suite.check("no cwd for a command that was never found", cwd is None)
     finally:
         proj.__exit__(None, None, None)
 
@@ -576,6 +790,196 @@ server.listen(4123, () => console.log('ready - Local:        http://localhost:41
         proj.__exit__(None, None, None)
 
 
+def test_run_api_qa_captures_server_log_tail_during_the_run(suite):
+    """docs/37-api-qa-server-log-capture.md: `server_log_tail` is real
+    output the dev server printed to its own console *after* it became
+    ready - not what `http_client.py` alone can see over HTTP (the "why" a
+    real application-level 500 happened, e.g. a stack trace, when the HTTP
+    response body itself is empty or unhelpful).
+    """
+    if not _npm_available():
+        suite.check("(skipped: npm not on PATH)", True)
+        return
+    proj = TempProject()
+    try:
+        proj.write("package.json", json.dumps({
+            "name": "x", "scripts": {"dev": "node server.js"}, "dependencies": {"next": "15.0.0"},
+        }))
+        proj.write("package-lock.json", "{}")
+        # Prints a distinctive, stack-trace-shaped line to its own stdout
+        # when the failing route is actually hit - standing in for what a
+        # real `next dev` prints on an unhandled route exception, and never
+        # put in the HTTP response body itself (which stays empty), so the
+        # only way to see it is the server's own real console output.
+        proj.write("server.js", """
+const http = require('http');
+const server = http.createServer((req, res) => {
+  if (req.url === '/api/broken') {
+    console.log('SENTINEL_STACK_TRACE_MARKER: something exploded');
+    res.writeHead(500);
+    res.end();
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+});
+server.listen(4126, () => console.log('ready - Local:        http://localhost:4126'));
+""")
+        proj.write("app/api/broken/route.ts", "export async function GET() { return Response.json({}); }\n")
+
+        result = discover_project(proj.path)
+        context = build_repository_context(result.project)
+        api_result = run_api_qa(context, proj.path, config=ApiQaConfig(server_startup_timeout=20))
+
+        suite.check("server really started", api_result.server_status == SERVER_STARTED,
+                     " (was {}: {})".format(api_result.server_status, api_result.server_detail))
+        suite.check(
+            "the server's own real console output printed during the call is captured",
+            "SENTINEL_STACK_TRACE_MARKER" in api_result.server_log_tail,
+            " (got: {!r})".format(api_result.server_log_tail),
+        )
+        text = render(api_result)
+        suite.check("the terminal report surfaces it too", "SENTINEL_STACK_TRACE_MARKER" in text)
+    finally:
+        proj.__exit__(None, None, None)
+
+
+# --- connect probe (docs/39-connect-probe.md) -------------------------------
+
+def test_wait_until_connectable_true_once_a_real_listener_binds(suite):
+    """A real, minimal race: nothing is listening yet, then something
+    really does bind the port shortly after - `wait_until_connectable`
+    must notice it within its own timeout, not just at the very first poll.
+    """
+    import socket
+    import threading
+    import time
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()  # port is free again, nothing listening yet
+
+    def bind_after_delay():
+        time.sleep(0.3)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", port))
+        listener.listen(1)
+        time.sleep(2)
+        listener.close()
+
+    t = threading.Thread(target=bind_after_delay, daemon=True)
+    t.start()
+    try:
+        start = time.perf_counter()
+        ok = server_module.wait_until_connectable(
+            "http://127.0.0.1:{}".format(port), timeout=5.0, poll_interval=0.05,
+        )
+        elapsed = time.perf_counter() - start
+        suite.check("reports connectable once the real bind happens", ok is True)
+        suite.check("returns promptly after the real bind, not only at the timeout", elapsed < 2.0,
+                     " ({:.2f}s)".format(elapsed))
+    finally:
+        t.join(timeout=5)
+
+
+def test_wait_until_connectable_false_when_nothing_ever_binds(suite):
+    import socket
+    import time
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()  # confirmed free; never bound again by anything
+
+    start = time.perf_counter()
+    ok = server_module.wait_until_connectable(
+        "http://127.0.0.1:{}".format(port), timeout=0.5, poll_interval=0.05,
+    )
+    elapsed = time.perf_counter() - start
+    suite.check("honestly reports not connectable", ok is False)
+    suite.check("never blocks past its own timeout", elapsed < 2.0, " ({:.2f}s)".format(elapsed))
+
+
+def test_run_api_qa_waits_out_a_delayed_port_bind_before_calling(suite):
+    """The real bug this closes (found dogfooding a real Express project
+    through the web frontend): a wrapper process (nodemon in that case)
+    prints a real 'ready'-shaped log line before the real child process it
+    spawns has actually finished binding the port - the very first real
+    call then got a real, honest connection-refused. Reproduced directly:
+    the server prints its ready line *immediately*, but only actually binds
+    the port after a short, real delay.
+    """
+    if not _npm_available():
+        suite.check("(skipped: npm not on PATH)", True)
+        return
+    proj = TempProject()
+    try:
+        proj.write("package.json", json.dumps({
+            "name": "x", "scripts": {"dev": "node server.js"}, "dependencies": {"next": "15.0.0"},
+        }))
+        proj.write("package-lock.json", "{}")
+        proj.write("server.js", """
+console.log('ready - Local:        http://localhost:4557');
+setTimeout(() => {
+  const http = require('http');
+  http.createServer((req, res) => {
+    res.writeHead(200, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({ok: true}));
+  }).listen(4557);
+}, 1200);
+""")
+        proj.write("app/api/health/route.ts", "export async function GET() { return Response.json({ok:true}); }\n")
+
+        result = discover_project(proj.path)
+        context = build_repository_context(result.project)
+        api_result = run_api_qa(
+            context, proj.path,
+            config=ApiQaConfig(server_startup_timeout=10, connect_probe_timeout=5),
+        )
+        suite.check("server really started", api_result.server_status == SERVER_STARTED)
+        suite.check(
+            "the real call succeeds instead of racing a connection-refused",
+            len(api_result.calls) == 1 and api_result.calls[0].status == CALL_PASS,
+            " (got: {})".format([(c.status, c.error or c.reason) for c in api_result.calls]),
+        )
+        suite.check("no false 'never connected' warning, since it really did connect in time",
+                     not any("never accepted a real TCP connection" in w for w in api_result.warnings))
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_run_api_qa_warns_honestly_when_the_port_never_binds(suite):
+    if not _npm_available():
+        suite.check("(skipped: npm not on PATH)", True)
+        return
+    proj = TempProject()
+    try:
+        proj.write("package.json", json.dumps({
+            "name": "x", "scripts": {"dev": "node server.js"}, "dependencies": {"next": "15.0.0"},
+        }))
+        proj.write("package-lock.json", "{}")
+        # Prints a real ready-shaped line but never actually binds anything.
+        proj.write("server.js", "console.log('ready - Local:        http://localhost:4558');\nsetInterval(() => {}, 1000);\n")
+        proj.write("app/api/health/route.ts", "export async function GET() { return Response.json({ok:true}); }\n")
+
+        result = discover_project(proj.path)
+        context = build_repository_context(result.project)
+        api_result = run_api_qa(
+            context, proj.path,
+            config=ApiQaConfig(server_startup_timeout=5, connect_probe_timeout=1),
+        )
+        suite.check(
+            "an honest warning names the real gap, rather than silently proceeding",
+            any("never accepted a real TCP connection" in w for w in api_result.warnings),
+            " (warnings: {})".format(api_result.warnings),
+        )
+        suite.check("the subsequent call still honestly fails (never fabricated a pass)",
+                     len(api_result.calls) == 1 and api_result.calls[0].status == CALL_FAIL)
+    finally:
+        proj.__exit__(None, None, None)
+
+
 # --- reporting ----------------------------------------------------------
 
 def test_render_shows_endpoint_method_path_status_and_timing(suite):
@@ -615,6 +1019,66 @@ def test_render_shows_warnings(suite):
     result = ApiTestResult(root_path="/x", server_status=SERVER_SKIPPED, warnings=("a real warning",))
     text = render(result)
     suite.check("warnings are surfaced", "a real warning" in text)
+
+
+# --- to_csv / to_html (docs/36-api-qa-report-export.md) -------------------
+
+def test_to_csv_has_one_row_per_call_with_real_fields(suite):
+    ok = _endpoint(path="/api/health")
+    bad = _endpoint(method="POST", path="/api/broken")
+    calls = (
+        ApiCallResult(endpoint=ok, status=CALL_PASS, status_code=200, response_time_ms=12.5, reason="HTTP 200"),
+        ApiCallResult(endpoint=bad, status=CALL_FAIL, status_code=500, response_time_ms=8.0, reason="HTTP 500 response"),
+    )
+    result = ApiTestResult(root_path="/x", endpoints=(ok, bad), calls=calls, server_status=SERVER_STARTED)
+    text = to_csv(result)
+    rows = text.strip().splitlines()
+    suite.check("header row present", rows[0].startswith("method,path,status,status_code"))
+    suite.check("2 data rows (one per call)", len(rows) == 3)
+    suite.check("passing call's real status code present", "200" in rows[1])
+    suite.check("failing call's real reason present", "HTTP 500 response" in rows[2])
+
+
+def test_to_csv_handles_no_calls_gracefully(suite):
+    result = ApiTestResult(root_path="/x", server_status=SERVER_SKIPPED)
+    text = to_csv(result)
+    suite.check("only the header row, no crash", len(text.strip().splitlines()) == 1)
+
+
+def test_to_html_color_codes_each_status_bucket(suite):
+    passing = _endpoint(path="/api/ok")
+    client_err = _endpoint(method="GET", path="/api/missing")
+    server_err = _endpoint(method="GET", path="/api/broken")
+    unreachable = _endpoint(method="GET", path="/api/down")
+    skipped = _endpoint(method="GET", path="/api/dyn/[id]")
+    calls = (
+        ApiCallResult(endpoint=passing, status=CALL_PASS, status_code=200),
+        ApiCallResult(endpoint=client_err, status=CALL_FAIL, status_code=404, reason="HTTP 404 response"),
+        ApiCallResult(endpoint=server_err, status=CALL_FAIL, status_code=500, reason="HTTP 500 response"),
+        ApiCallResult(endpoint=unreachable, status=CALL_FAIL, error="could not reach it"),
+        ApiCallResult(endpoint=skipped, status=CALL_SKIPPED, reason="dynamic, not resolved"),
+    )
+    result = ApiTestResult(
+        root_path="/x", endpoints=(passing, client_err, server_err, unreachable, skipped),
+        calls=calls, server_status=SERVER_STARTED, base_url="http://localhost:3000",
+    )
+    text = to_html(result)
+    suite.check("well-formed enough to open", text.startswith("<!doctype html>"))
+    suite.check("every endpoint path appears", all(
+        e.path.replace("[", "[").replace("]", "]") in text for e in result.endpoints
+    ))
+    suite.check("2xx uses the pass color", '#dcfce7' in text and '200' in text)
+    suite.check("4xx bucket labeled", ">4xx<" in text)
+    suite.check("5xx bucket labeled", ">5xx<" in text)
+    suite.check("no-response call labeled distinctly from a real 5xx", ">NO RESPONSE<" in text)
+    suite.check("skipped call labeled", ">SKIPPED<" in text)
+    suite.check("the real failure reason is shown, not fabricated", "could not reach it" in text)
+
+
+def test_to_html_handles_no_calls_gracefully(suite):
+    result = ApiTestResult(root_path="/x", server_status=SERVER_SKIPPED)
+    text = to_html(result)
+    suite.check("does not crash and says nothing was called", "No endpoint calls were made" in text)
 
 
 # --- CLI wiring ----------------------------------------------------------
@@ -670,6 +1134,36 @@ http.createServer((req, res) => {
         proj.__exit__(None, None, None)
 
 
+def test_cli_api_report_writes_html_by_default(suite):
+    proj = TempProject()
+    try:
+        proj.write("package.json", json.dumps({"name": "x", "scripts": {"start": "node server.js"}}))
+        proj.write("server.js", "console.log('hi');\n")
+        report_path = proj.path / "report.html"
+        completed = run_agent(["discover", str(proj.path), "--api-report", str(report_path)])
+        suite.check("exits cleanly", completed.returncode == 0, " (rc={})".format(completed.returncode))
+        suite.check("--api-report alone implies --api-test", "API QA Results" in completed.stdout)
+        suite.check("report file was written", report_path.is_file())
+        text = report_path.read_text(encoding="utf-8")
+        suite.check("it's the HTML report", text.startswith("<!doctype html>"))
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_cli_api_report_writes_csv_for_csv_extension(suite):
+    proj = TempProject()
+    try:
+        proj.write("package.json", json.dumps({"name": "x", "scripts": {"start": "node server.js"}}))
+        proj.write("server.js", "console.log('hi');\n")
+        report_path = proj.path / "report.csv"
+        completed = run_agent(["discover", str(proj.path), "--api-report", str(report_path)])
+        suite.check("exits cleanly", completed.returncode == 0)
+        text = report_path.read_text(encoding="utf-8")
+        suite.check("it's the CSV report", text.startswith("method,path,status,status_code"))
+    finally:
+        proj.__exit__(None, None, None)
+
+
 if __name__ == "__main__":
     suite = Suite("API QA v1")
     sys.exit(suite.run([
@@ -686,6 +1180,16 @@ if __name__ == "__main__":
         test_discover_ignores_node_modules_and_next_build_output,
         test_discover_returns_empty_for_a_non_nextjs_project,
         test_discover_dedupes_identical_method_path_pairs,
+        test_discover_pages_router_finds_method_via_req_method_check,
+        test_discover_pages_router_index_file_maps_to_parent_path,
+        test_discover_pages_router_dynamic_segment,
+        test_discover_pages_router_no_method_check_assumes_get_and_warns,
+        test_discover_pages_router_no_default_export_warns_and_skips,
+        test_discover_pages_router_gated_on_real_nextjs_framework_fact,
+        test_discover_express_finds_a_simple_route,
+        test_discover_express_finds_router_calls_and_dynamic_segments,
+        test_discover_express_gated_on_real_express_framework_fact,
+        test_discover_express_ignores_non_literal_first_argument,
         test_call_endpoint_pass_on_2xx_valid_json,
         test_call_endpoint_pass_on_2xx_non_json_content_type,
         test_call_endpoint_fails_on_500_http_error,
@@ -698,6 +1202,8 @@ if __name__ == "__main__":
         test_call_endpoint_uses_the_endpoint_method,
         test_discover_server_start_command_prefers_dev_over_start,
         test_discover_server_start_command_none_when_no_script,
+        test_discover_server_start_command_falls_back_to_a_monorepo_package,
+        test_discover_server_start_command_ambiguous_monorepo_is_never_guessed,
         test_start_and_wait_ready_reports_not_found_for_a_missing_binary,
         test_start_and_wait_ready_detects_a_ready_signal,
         test_start_and_wait_ready_detects_a_crash,
@@ -706,11 +1212,22 @@ if __name__ == "__main__":
         test_run_api_qa_reports_a_crashed_server,
         test_run_api_qa_dynamic_routes_are_never_called,
         test_run_api_qa_end_to_end_real_server,
+        test_run_api_qa_captures_server_log_tail_during_the_run,
+        test_wait_until_connectable_true_once_a_real_listener_binds,
+        test_wait_until_connectable_false_when_nothing_ever_binds,
+        test_run_api_qa_waits_out_a_delayed_port_bind_before_calling,
+        test_run_api_qa_warns_honestly_when_the_port_never_binds,
         test_render_shows_endpoint_method_path_status_and_timing,
         test_render_shows_evidence_on_failure,
         test_render_handles_no_calls_gracefully,
         test_render_shows_warnings,
+        test_to_csv_has_one_row_per_call_with_real_fields,
+        test_to_csv_handles_no_calls_gracefully,
+        test_to_html_color_codes_each_status_bucket,
+        test_to_html_handles_no_calls_gracefully,
         test_cli_api_test_flag_reports_when_no_app_router_present,
         test_cli_without_api_test_flag_never_runs_api_qa,
         test_cli_api_test_end_to_end,
+        test_cli_api_report_writes_html_by_default,
+        test_cli_api_report_writes_csv_for_csv_extension,
     ]))
