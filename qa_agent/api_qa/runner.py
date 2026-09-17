@@ -62,6 +62,12 @@ class ApiQaConfig:
     # calls against; see `server.wait_until_connectable`'s own docstring
     # for the real race this closes.
     connect_probe_timeout: float = _server.DEFAULT_CONNECT_PROBE_TIMEOUT
+    # A second, still-real readiness check run after the TCP probe succeeds
+    # (Phase 1: environment readiness gate) - a real HTTP request, lenient
+    # about status code (any real response, even a 404/500, proves the
+    # server is genuinely answering); only a true connection-level failure
+    # on every candidate path blocks the run, exactly like the TCP gate.
+    http_readiness_timeout: float = _server.DEFAULT_HTTP_READINESS_TIMEOUT
     # docs/45-synthetic-mutation-testing.md: whether a mutating call or a
     # dynamic path parameter may fall back to a clearly-labeled synthetic
     # value (see resolution.py's own `DEFAULT_ALLOW_SYNTHETIC_MUTATIONS`)
@@ -226,8 +232,10 @@ def run_api_qa(context, root, config=None, on_progress=None):
             )
             reason = (
                 "Server is not reachable. Stopping the run. The process {} but never accepted "
-                "a real TCP connection on {} ({}) within {:.0f}s.".format(
-                    signal_desc, base_url, url_desc, config.connect_probe_timeout)
+                "a real TCP connection on {} ({}) within {:.0f}s. Command: {} (cwd: {}, "
+                "startup timeout: {:.0f}s).".format(
+                    signal_desc, base_url, url_desc, config.connect_probe_timeout,
+                    " ".join(command), server_cwd, config.server_startup_timeout)
             )
             return _finish(
                 endpoints=endpoints,
@@ -235,6 +243,28 @@ def run_api_qa(context, root, config=None, on_progress=None):
                 server_status=SERVER_UNREACHABLE, server_detail=reason, base_url=base_url,
                 server_log_tail=_server.drain_log_tail(handle),
             )
+
+        readiness = _server.check_http_readiness(
+            base_url, endpoints, timeout=config.http_readiness_timeout,
+        )
+        if not readiness.reached:
+            # TCP itself connected (the gate above already passed) but
+            # nothing ever answered as HTTP - a real, distinct failure from
+            # both "unreachable at the TCP level" and "an endpoint returned
+            # an error", never conflated with either (Phase 1, section 6).
+            reason = (
+                "Server is not reachable. Stopping the run. {} (base URL: {}). "
+                "Command: {} (cwd: {}).".format(
+                    readiness.detail, base_url, " ".join(command), server_cwd)
+            )
+            return _finish(
+                endpoints=endpoints,
+                calls=_skip_all(endpoints, reason),
+                server_status=SERVER_UNREACHABLE, server_detail=reason, base_url=base_url,
+                server_log_tail=_server.drain_log_tail(handle),
+                http_readiness_detail=readiness.detail,
+            )
+
         primary_cb, negative_cb, schema_cb = _combine_progress(on_progress)
         calls = resolve_and_execute(
             endpoints, base_url, config.request_timeout, on_progress=primary_cb,
@@ -252,6 +282,7 @@ def run_api_qa(context, root, config=None, on_progress=None):
             server_detail=handle.reason, base_url=base_url,
             server_log_tail=_server.drain_log_tail(handle),
             negative_calls=negative_calls, schema_validations=schema_validations,
+            http_readiness_detail=readiness.detail,
         )
     finally:
         handle.stop()

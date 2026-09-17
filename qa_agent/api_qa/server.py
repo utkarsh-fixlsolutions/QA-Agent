@@ -34,7 +34,9 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -646,3 +648,100 @@ def wait_until_connectable(base_url, timeout=DEFAULT_CONNECT_PROBE_TIMEOUT,
         if time.perf_counter() >= deadline:
             return False
         time.sleep(poll_interval)
+
+
+# --- HTTP readiness check (Phase 1: environment readiness gate) ------------
+#
+# A successful TCP connect only proves *something* accepted the connection -
+# never that it actually speaks HTTP, or that this is really the app's own
+# server and not, say, a stray unrelated process that happened to bind the
+# port first. This is a second, still-real (never inferred from log text)
+# piece of evidence, deliberately lenient about *what* it receives: any real
+# HTTP response at all - including a 404 or 500 - proves the server is
+# genuinely answering requests, and must never be confused with the server
+# being unreachable. Only a real connection-level failure on every candidate
+# path (refused, reset, timed out) counts as a readiness failure.
+
+DEFAULT_HTTP_READINESS_TIMEOUT = 5.0
+
+# Tried in order; a real, already-discovered health/keep-alive-shaped
+# endpoint (see `_health_shaped_endpoint_path`) is always tried first when
+# one exists - real evidence outranks every one of these plain guesses.
+_DEFAULT_READINESS_CANDIDATE_PATHS = ("/health", "/api/health", "/")
+
+_HEALTH_PATH_MARKERS = ("health", "keep-alive", "keepalive")
+
+
+def _health_shaped_endpoint_path(endpoints):
+    """A real, already-discovered endpoint whose own path looks like a
+    health/liveness check - reused as the readiness probe's first candidate
+    when one exists, never invented. `endpoints` is whatever `discover_api_
+    endpoints` already found; this never does any discovery of its own.
+    """
+    for endpoint in endpoints:
+        lowered = endpoint.path.lower()
+        if any(marker in lowered for marker in _HEALTH_PATH_MARKERS):
+            return endpoint.path
+    return None
+
+
+@dataclass(frozen=True)
+class HttpReadinessResult:
+    """`reached=True` means a real HTTP response (any status code) was
+    received on at least one candidate path - the server is genuinely
+    answering HTTP requests, whatever that specific path's own status was.
+    `reached=False` means every candidate path failed at the connection
+    level - a real, distinct fact from an application-level 404/500.
+    """
+
+    reached: bool
+    path: str
+    status_code: Optional[int]
+    detail: str
+
+
+def check_http_readiness(base_url, endpoints=(), timeout=DEFAULT_HTTP_READINESS_TIMEOUT):
+    """One lightweight real GET against the first candidate path that
+    answers at all - never part of `resolve_and_execute`'s own real test
+    calls, and never itself a second copy of the TCP gate: this only runs
+    after `wait_until_connectable` has already succeeded. Real evidence
+    only; never raises.
+    """
+    candidates = []
+    health_path = _health_shaped_endpoint_path(endpoints)
+    if health_path is not None:
+        candidates.append(health_path)
+    for path in _DEFAULT_READINESS_CANDIDATE_PATHS:
+        if path not in candidates:
+            candidates.append(path)
+
+    base = base_url.rstrip("/")
+    last_error = None
+    for path in candidates:
+        url = base + path if path.startswith("/") else base + "/" + path
+        try:
+            request = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return HttpReadinessResult(
+                    True, path, response.getcode(),
+                    "received a real HTTP {} from {} - the server is answering".format(
+                        response.getcode(), path),
+                )
+        except urllib.error.HTTPError as exc:
+            # A real HTTP response, even an error status - the server really
+            # is answering; an application-level error is not a readiness
+            # failure (see this function's own docstring).
+            return HttpReadinessResult(
+                True, path, exc.code,
+                "received a real HTTP {} from {} (an application-level response, "
+                "not a connection failure - the server is answering)".format(exc.code, path),
+            )
+        except (urllib.error.URLError, OSError):
+            last_error = "no response from {}".format(path)
+            continue
+
+    return HttpReadinessResult(
+        False, candidates[-1] if candidates else "", None,
+        "TCP connected, but no real HTTP response was received on any candidate path ({}): {}".format(
+            ", ".join(candidates), last_error or "no candidate paths to try"),
+    )

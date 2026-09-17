@@ -310,6 +310,11 @@ class ApiTestResult:
     server_log_tail: str = ""
     negative_calls: Tuple[NegativeCallResult, ...] = ()
     schema_validations: Tuple[SchemaValidationResult, ...] = ()
+    # Phase 1 (environment readiness gate): a real GET's own outcome against
+    # a health-shaped/`/health`/`/api/health`/`/` candidate, run once TCP
+    # connectivity is confirmed - "" only when the server was never reached
+    # at all (no readiness probe was ever attempted).
+    http_readiness_detail: str = ""
 
     def __post_init__(self):
         if self.server_status not in SERVER_STATUSES:

@@ -27,6 +27,7 @@ from qa_agent.project import build_repository_context, discover_project  # noqa:
 from qa_agent.api_qa import discovery as discovery_module  # noqa: E402
 from qa_agent.api_qa import http_client as http_client_module  # noqa: E402
 from qa_agent.api_qa import server as server_module  # noqa: E402
+from qa_agent.api_qa import runner as runner_module  # noqa: E402
 from qa_agent.api_qa import (  # noqa: E402
     CALL_FAIL,
     CALL_PASS,
@@ -34,6 +35,7 @@ from qa_agent.api_qa import (  # noqa: E402
     SERVER_CRASHED,
     SERVER_SKIPPED,
     SERVER_STARTED,
+    SERVER_UNREACHABLE,
     ApiCallResult,
     ApiEndpoint,
     ApiQaConfig,
@@ -833,6 +835,12 @@ server.listen(4123, () => console.log('ready - Local:        http://localhost:41
         suite.check("a real failing endpoint is reported as fail, with its real status code",
                      by_path.get("/api/broken") is not None and by_path["/api/broken"].status == CALL_FAIL
                      and by_path["/api/broken"].status_code == 500)
+        suite.check(
+            "the HTTP readiness gate (Phase 1) really ran and preferred the real, "
+            "already-discovered /api/health endpoint over a guessed candidate",
+            "/api/health" in api_result.http_readiness_detail,
+            " (was: {!r})".format(api_result.http_readiness_detail),
+        )
     finally:
         proj.__exit__(None, None, None)
 
@@ -1093,6 +1101,280 @@ def test_run_api_qa_stops_fast_when_the_port_never_binds(suite):
         proj.__exit__(None, None, None)
 
 
+def test_run_api_qa_blocks_on_timeout_when_no_ready_signal_and_nothing_binds(suite):
+    """Case F (Phase 1): the process never prints anything ready-shaped at
+    all, and never binds a port either - a real, distinct scenario from
+    `test_run_api_qa_stops_fast_when_the_port_never_binds` (which does
+    match a ready-shaped line), exercising the other half of runner.py's
+    own signal_desc wording. The run must report one honest environment
+    failure once the configured timeout elapses - never a wall of
+    per-endpoint failures.
+    """
+    if not _npm_available():
+        suite.check("(skipped: npm not on PATH)", True)
+        return
+    proj = TempProject()
+    try:
+        proj.write("package.json", json.dumps({
+            "name": "x", "scripts": {"dev": "node server.js"}, "dependencies": {"next": "15.0.0"},
+        }))
+        proj.write("package-lock.json", "{}")
+        # Stays alive, prints nothing recognizable, never binds anything.
+        proj.write("server.js", "setInterval(() => {}, 1000);\n")
+        proj.write("app/api/a/route.ts", "export async function GET() { return Response.json({}); }\n")
+        proj.write("app/api/b/route.ts", "export async function GET() { return Response.json({}); }\n")
+
+        result = discover_project(proj.path)
+        context = build_repository_context(result.project)
+        api_result = run_api_qa(
+            context, proj.path,
+            config=ApiQaConfig(server_startup_timeout=2, connect_probe_timeout=1),
+        )
+        suite.check("server_status is unreachable, not started",
+                     api_result.server_status == SERVER_UNREACHABLE, " (was {})".format(api_result.server_status))
+        suite.check("the reason correctly says no ready signal was ever recognized",
+                     "without a recognized ready signal" in api_result.server_detail,
+                     " (was: {!r})".format(api_result.server_detail))
+        suite.check("every endpoint is honestly skipped, never a wall of fabricated failures",
+                     len(api_result.calls) == 2 and all(c.status == CALL_SKIPPED for c in api_result.calls),
+                     " (got: {})".format([(c.status, c.reason) for c in api_result.calls]))
+    finally:
+        proj.__exit__(None, None, None)
+
+
+# --- HTTP readiness check (Phase 1: environment readiness gate) ---------
+
+def test_check_http_readiness_reached_on_a_real_200(suite):
+    import http.server
+    import threading
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        result = server_module.check_http_readiness("http://127.0.0.1:{}".format(port), timeout=2)
+        suite.check("reached is True on a real 200", result.reached is True)
+        suite.check("status code captured", result.status_code == 200)
+    finally:
+        httpd.shutdown()
+        t.join(timeout=5)
+
+
+def test_check_http_readiness_reached_on_a_real_404_not_confused_with_unreachable(suite):
+    """Case E: a real application-level error response still proves the
+    server is genuinely answering - must never be treated the same as a
+    connection failure.
+    """
+    import http.server
+    import threading
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        result = server_module.check_http_readiness("http://127.0.0.1:{}".format(port), timeout=2)
+        suite.check("reached is True even though every path 404s", result.reached is True,
+                     " (result: {})".format(result))
+        suite.check("status code is the real 404, not hidden", result.status_code == 404)
+        suite.check("detail clearly says this is an application response, not a connection failure",
+                     "not a connection failure" in result.detail, " (detail: {!r})".format(result.detail))
+    finally:
+        httpd.shutdown()
+        t.join(timeout=5)
+
+
+def test_check_http_readiness_not_reached_when_nothing_is_listening(suite):
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()  # confirmed free, nothing listening
+    result = server_module.check_http_readiness("http://127.0.0.1:{}".format(port), timeout=1)
+    suite.check("reached is False when nothing is listening at all", result.reached is False)
+    suite.check("status_code is None, never fabricated", result.status_code is None)
+
+
+def test_check_http_readiness_prefers_a_real_health_shaped_endpoint(suite):
+    import http.server
+    import threading
+
+    seen_paths = []
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen_paths.append(self.path)
+            self.send_response(200 if self.path == "/api/keep-alive" else 500)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        endpoint = ApiEndpoint(method="GET", path="/api/keep-alive", source_file="app/api/keep-alive/route.ts")
+        result = server_module.check_http_readiness(
+            "http://127.0.0.1:{}".format(port), endpoints=[endpoint], timeout=2,
+        )
+        suite.check("the real, already-discovered health-shaped endpoint is tried first",
+                     result.path == "/api/keep-alive", " (result: {})".format(result))
+        suite.check("that real endpoint's own path is what was actually requested first",
+                     seen_paths[:1] == ["/api/keep-alive"], " (seen: {})".format(seen_paths))
+    finally:
+        httpd.shutdown()
+        t.join(timeout=5)
+
+
+def test_run_api_qa_blocks_when_tcp_connects_but_nothing_ever_speaks_http(suite):
+    """The genuinely new Phase 1 gate, proven through the full public entry
+    point: something really does bind the port and accept real TCP
+    connections (the pre-Phase-1 TCP-only gate would have let this
+    straight through to API execution), but it never speaks HTTP at all -
+    a real, distinct failure only the new HTTP readiness check can catch.
+    """
+    if not _npm_available():
+        suite.check("(skipped: npm not on PATH)", True)
+        return
+    proj = TempProject()
+    try:
+        proj.write("package.json", json.dumps({
+            "name": "x", "scripts": {"dev": "{} raw_socket_server.py".format(sys.executable)},
+        }))
+        proj.write("package-lock.json", "{}")
+        # A raw TCP sink: binds a real port, accepts real connections, and
+        # closes each one immediately without ever sending an HTTP response.
+        proj.write("raw_socket_server.py", """
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('127.0.0.1', 0))
+port = s.getsockname()[1]
+s.listen(5)
+print('Server ready on http://localhost:{}'.format(port))
+sys.stdout.flush()
+while True:
+    conn, _ = s.accept()
+    conn.close()
+""")
+        proj.write("app/api/x/route.ts", "export async function GET() { return Response.json({}); }\n")
+
+        result = discover_project(proj.path)
+        context = build_repository_context(result.project)
+        api_result = run_api_qa(
+            context, proj.path,
+            config=ApiQaConfig(server_startup_timeout=10, connect_probe_timeout=5, http_readiness_timeout=3),
+        )
+        suite.check("server_status is unreachable - TCP connecting alone was not enough",
+                     api_result.server_status == SERVER_UNREACHABLE, " (was {})".format(api_result.server_status))
+        suite.check(
+            "zero real API calls were attempted",
+            len(api_result.calls) == 1 and api_result.calls[0].status == CALL_SKIPPED,
+            " (got: {})".format([(c.status, c.reason) for c in api_result.calls]),
+        )
+        suite.check(
+            "the reason distinguishes TCP success from the HTTP-level failure, never conflating them",
+            "TCP connected" in api_result.server_detail, " (was: {!r})".format(api_result.server_detail),
+        )
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_run_api_qa_proceeds_when_the_readiness_probe_only_gets_a_real_404(suite):
+    """Case E, full stack: TCP connects and every readiness-probe candidate
+    path (none of which are real endpoints in this fixture) 404s - that
+    must never be confused with the server being unreachable; the one real,
+    actually-discovered endpoint must still be called and pass.
+    """
+    if not _npm_available():
+        suite.check("(skipped: npm not on PATH)", True)
+        return
+    proj = TempProject()
+    try:
+        proj.write("package.json", json.dumps({
+            "name": "x", "scripts": {"dev": "node server.js"}, "dependencies": {"next": "15.0.0"},
+        }))
+        proj.write("package-lock.json", "{}")
+        proj.write("server.js", """
+const http = require('http');
+http.createServer((req, res) => {
+  if (req.url === '/api/widgets') {
+    res.writeHead(200, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({ok: true}));
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+}).listen(4562, () => console.log('ready - Local:        http://localhost:4562'));
+""")
+        proj.write("app/api/widgets/route.ts", "export async function GET() { return Response.json({}); }\n")
+
+        result = discover_project(proj.path)
+        context = build_repository_context(result.project)
+        api_result = run_api_qa(
+            context, proj.path, config=ApiQaConfig(server_startup_timeout=10, connect_probe_timeout=5),
+        )
+        suite.check("server status is started, never blocked by the readiness probe's own 404s",
+                     api_result.server_status == SERVER_STARTED, " (was {})".format(api_result.server_status))
+        suite.check(
+            "the real endpoint was actually called and passed",
+            len(api_result.calls) == 1 and api_result.calls[0].status == CALL_PASS,
+            " (got: {})".format([(c.status, c.reason) for c in api_result.calls]),
+        )
+        suite.check(
+            "the readiness detail names a real application-level response, not a connection failure",
+            "not a connection failure" in api_result.http_readiness_detail,
+            " (was: {!r})".format(api_result.http_readiness_detail),
+        )
+    finally:
+        proj.__exit__(None, None, None)
+
+
+# --- base URL resolution (Phase 1) ---------------------------------------
+
+def test_resolve_base_url_prefers_a_real_observed_url_over_guessing(suite):
+    handle = server_module.ServerHandle(
+        proc=None, status=server_module.STATUS_READY, reason="matched ready signal",
+        logs=(), elapsed=0.1, base_url="http://localhost:4321",
+    )
+    warnings = []
+    base_url, was_guessed = runner_module._resolve_base_url(handle, warnings)
+    suite.check("the real observed URL is used", base_url == "http://localhost:4321")
+    suite.check("never marked as guessed when it is real evidence", was_guessed is False)
+    suite.check("no warning is added when real evidence was found", warnings == [])
+
+
+def test_resolve_base_url_falls_back_to_the_documented_default_and_says_so(suite):
+    handle = server_module.ServerHandle(
+        proc=None, status=server_module.STATUS_ALIVE_NO_READY_SIGNAL, reason="stayed running",
+        logs=(), elapsed=0.1, base_url="",
+    )
+    warnings = []
+    base_url, was_guessed = runner_module._resolve_base_url(handle, warnings)
+    suite.check("falls back to the documented default port", base_url == "http://localhost:3000")
+    suite.check("explicitly marked as guessed, never presented as observed", was_guessed is True)
+    suite.check("a clear warning explains the fallback was used",
+                 len(warnings) == 1 and "assuming the common default" in warnings[0], " (warnings: {})".format(warnings))
+
+
 # --- reporting ----------------------------------------------------------
 
 def test_render_shows_endpoint_method_path_status_and_timing(suite):
@@ -1332,6 +1614,15 @@ if __name__ == "__main__":
         test_run_api_qa_waits_out_a_delayed_port_bind_before_calling,
         test_run_api_qa_observes_the_real_port_past_a_wrapper_false_ready_line,
         test_run_api_qa_stops_fast_when_the_port_never_binds,
+        test_run_api_qa_blocks_on_timeout_when_no_ready_signal_and_nothing_binds,
+        test_check_http_readiness_reached_on_a_real_200,
+        test_check_http_readiness_reached_on_a_real_404_not_confused_with_unreachable,
+        test_check_http_readiness_not_reached_when_nothing_is_listening,
+        test_check_http_readiness_prefers_a_real_health_shaped_endpoint,
+        test_run_api_qa_blocks_when_tcp_connects_but_nothing_ever_speaks_http,
+        test_run_api_qa_proceeds_when_the_readiness_probe_only_gets_a_real_404,
+        test_resolve_base_url_prefers_a_real_observed_url_over_guessing,
+        test_resolve_base_url_falls_back_to_the_documented_default_and_says_so,
         test_render_shows_endpoint_method_path_status_and_timing,
         test_render_shows_evidence_on_failure,
         test_render_handles_no_calls_gracefully,

@@ -1526,3 +1526,19 @@ Confirms Part 5's own measurement: pyright dominates multi-tool wall time, tools
 **Verified:** `test_api_qa_zod_schema.py` - 35/35. Full-suite confirmation in progress at time of writing.
 
 **Deferred, per the user's own explicit priority:** Joi (same shape as Zod, lower priority); nested `z.object()` sub-schemas (recorded as `"object"`, never descended into); ORM/DB models and static OpenAPI/GraphQL spec files (separate, named next steps).
+
+---
+
+## HTTP Readiness Gate - Phase 1 (2026-09-17)
+
+**Goal:** strict, scoped milestone - reliably start the app, determine where it's really listening, verify reachability, only then allow API testing. See docs/52-http-readiness-gate.md.
+
+**Audit finding:** the exact bug the user described (matched ready log → guessed port → failed TCP probe → still executed API calls) was already fixed by docs/46+docs/48, confirmed by reading `runner.py` directly - `wait_until_connectable` failing already stops the whole run before any real call. What was genuinely missing: no HTTP-level readiness check existed at all (only raw TCP), so something that binds a port but never speaks HTTP would have slipped through to real API execution; and `_resolve_base_url`'s precedence had no direct test.
+
+**Fix:** `server.py` gains `check_http_readiness` - one real GET against a health-shaped discovered endpoint if one exists, else `/health`/`/api/health`/`/`, lenient about status code (a real 404 still proves the server is answering) but not about a true connection failure. `runner.py` runs it right after the TCP gate; failure stops the run exactly like a TCP failure, both now naming the real command/cwd/timeout.
+
+**Files changed:** `qa_agent/api_qa/server.py`, `qa_agent/api_qa/runner.py`, `qa_agent/api_qa/models.py` (`http_readiness_detail`, additive), `tests/regression/test_api_qa.py` (+25 checks), `docs/52-http-readiness-gate.md` (new).
+
+**Verified:** `test_api_qa.py` 191/191. Real end-to-end against a tiny controlled demo app (never started manually): success case (real port, both endpoints pass), and two distinct negative cases - ready log with no real listener, and a real TCP listener that never speaks HTTP (the one scenario the old TCP-only gate could not have caught). `python tests/run_all.py --quick`: 43/45 before and after, same 2 pre-existing unrelated flakes, zero regressions.
+
+**Deferred:** no config-declared health endpoint; no live FastAPI-path demo walkthrough (covered by its own existing 66/66 suite instead); everything else (synthetic data, contract discovery, AI diagnosis/repair, UI, memory) explicitly out of scope for this milestone.
