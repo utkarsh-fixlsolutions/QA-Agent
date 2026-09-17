@@ -203,7 +203,7 @@ def test_build_request_body_synthesizes_missing_required_fields_by_default(suite
             "properties": {"name": {"type": "string"}, "email": {"type": "string", "format": "email"}},
         }},
     )
-    body, evidence, synthetic_fields = build_request_body(schema_doc, "POST", "/api/users")
+    body, evidence, synthetic_fields, _evidence_source = build_request_body(schema_doc, "POST", "/api/users")
     suite.check("a real, sendable body is produced instead of a skip", body is not None)
     suite.check("both missing fields are named as synthetic", set(synthetic_fields) == {"name", "email"})
     suite.check("the email field uses a real, format-aware placeholder", body["email"] == "qa-agent-test@example.com")
@@ -223,7 +223,7 @@ def test_build_request_body_mixes_real_defaults_with_synthesized_fields(suite):
             "properties": {"role": {"type": "string", "default": "member"}, "email": {"type": "string"}},
         }},
     )
-    body, _, synthetic_fields = build_request_body(schema_doc, "POST", "/api/users")
+    body, _, synthetic_fields, _evidence_source = build_request_body(schema_doc, "POST", "/api/users")
     suite.check("the real schema default is kept exactly", body["role"] == "member")
     suite.check("only the field with no default is marked synthetic", synthetic_fields == ("email",))
 
@@ -236,7 +236,7 @@ def test_build_request_body_falls_back_to_source_derived_hints_with_no_openapi(s
         method="POST", path="/api/items", source_file="x", dynamic=False,
         body_field_hints=("title", "price"),
     )
-    body, evidence, synthetic_fields = build_request_body(None, "POST", "/api/items", endpoint=endpoint)
+    body, evidence, synthetic_fields, _evidence_source = build_request_body(None, "POST", "/api/items", endpoint=endpoint)
     suite.check("a body is built from source-derived hints alone", set(body.keys()) == {"title", "price"})
     suite.check("both fields are honestly marked synthetic", set(synthetic_fields) == {"title", "price"})
     suite.check("evidence names the real source file", "x" in evidence)
@@ -247,7 +247,7 @@ def test_build_request_body_minimal_fallback_when_body_read_but_no_field_names(s
         method="POST", path="/api/items", source_file="x", dynamic=False,
         body_field_hints=(), reads_request_body=True,
     )
-    body, evidence, synthetic_fields = build_request_body(None, "POST", "/api/items", endpoint=endpoint)
+    body, evidence, synthetic_fields, _evidence_source = build_request_body(None, "POST", "/api/items", endpoint=endpoint)
     suite.check("a minimal, one-field synthetic body is sent rather than skipping", body == {"qa-agent-test": True})
     suite.check("the minimal field is named as synthetic", synthetic_fields == ("qa-agent-test",))
     suite.check("evidence is honest about the situation", "no specific field names" in evidence)
@@ -258,7 +258,7 @@ def test_build_request_body_still_skips_when_no_body_evidence_at_all(suite):
     fields from nothing, even with synthesis allowed.
     """
     endpoint = ApiEndpoint(method="POST", path="/api/items", source_file="x", dynamic=False)
-    body, reason, synthetic_fields = build_request_body(None, "POST", "/api/items", endpoint=endpoint)
+    body, reason, synthetic_fields, _evidence_source = build_request_body(None, "POST", "/api/items", endpoint=endpoint)
     suite.check("still an honest skip", body is None)
     suite.check("a clear reason is given", "no OpenAPI schema" in reason)
     suite.check("nothing synthesized", synthetic_fields == ())
@@ -272,7 +272,7 @@ def test_build_request_body_synthesis_disabled_by_config_flag(suite):
         method="POST", path="/api/items", source_file="x", dynamic=False,
         body_field_hints=("title",),
     )
-    body, reason, synthetic_fields = build_request_body(
+    body, reason, synthetic_fields, _evidence_source = build_request_body(
         None, "POST", "/api/items", endpoint=endpoint, allow_synthetic_mutations=False,
     )
     suite.check("no fallback used when synthesis is disabled", body is None)

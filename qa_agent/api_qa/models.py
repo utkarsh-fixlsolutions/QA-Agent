@@ -66,6 +66,24 @@ CALL_SKIPPED = "skipped"
 
 CALL_STATUSES = (CALL_PASS, CALL_FAIL, CALL_SKIPPED)
 
+# Phase 2 (API contract understanding, docs/53): the explicit provenance
+# label for a mutating call's own constructed request body - which tier of
+# evidence actually justified it, in this closed priority order (strongest
+# first). A structured fact a report/test can check directly, alongside the
+# existing human-readable `resolution_evidence` trace - never a replacement
+# for it.
+EVIDENCE_OPENAPI = "openapi"          # a live or static OpenAPI/Swagger schema
+EVIDENCE_SCHEMA = "schema"            # an explicit validation schema (Zod, ...)
+EVIDENCE_TEST_EXAMPLE = "test_example"  # a real example found in the project's own tests/collections
+EVIDENCE_SOURCE_HINT = "source"       # route/controller source-code evidence
+EVIDENCE_SYNTHETIC = "synthetic"      # no real evidence at all - an invented placeholder
+EVIDENCE_UNKNOWN = "unknown"          # CONTRACT UNKNOWN - no body evidence, nothing sent
+
+BODY_EVIDENCE_SOURCES = (
+    EVIDENCE_OPENAPI, EVIDENCE_SCHEMA, EVIDENCE_TEST_EXAMPLE,
+    EVIDENCE_SOURCE_HINT, EVIDENCE_SYNTHETIC, EVIDENCE_UNKNOWN,
+)
+
 
 @dataclass(frozen=True)
 class ApiEndpoint:
@@ -121,6 +139,14 @@ class ApiEndpoint:
     # `body_field_hints` (a real name *and* a real type, not just a name)
     # - checked first in resolution.py's fallback chain when present.
     zod_fields: Tuple[Tuple[str, str], ...] = ()
+    # Real (field_name, real_value) pairs (Phase 2, docs/53) found in the
+    # project's own existing test files or Postman-style collections
+    # (`test_evidence.py`) for a real HTTP call this endpoint's own
+    # (method, path) structurally matches - stronger evidence than a bare
+    # `body_field_hints` name alone (a real, previously-working value, not
+    # just a name to guess a type for), checked ahead of it in resolution.py's
+    # fallback chain but behind explicit schema evidence (OpenAPI/Zod).
+    test_evidence_fields: Tuple[Tuple[str, object], ...] = ()
 
     def __post_init__(self):
         if self.method not in METHODS:
@@ -198,6 +224,17 @@ class ApiCallResult:
     # `resolution_evidence`'s own human-readable trace.
     synthetic: bool = False
     synthetic_fields: Tuple[str, ...] = ()
+    # Phase 2 (API contract understanding, docs/53): which evidence tier
+    # actually justified this call's own request body, one of
+    # `BODY_EVIDENCE_SOURCES` - `""` for a call with no body at all (a GET,
+    # or a mutation whose body was never constructed). Orthogonal to
+    # `synthetic`: a body can be sourced from real OpenAPI/test evidence and
+    # still be marked `synthetic=True` (this project's own existing,
+    # conservative rule - see `build_request_body`'s own docstring for why
+    # even a schema-`example`-derived value is marked synthetic today) -
+    # `body_evidence_source` records *why* the value was chosen, `synthetic`
+    # records whether it is safe to treat as a verified default.
+    body_evidence_source: str = ""
 
     def __post_init__(self):
         if self.status not in CALL_STATUSES:

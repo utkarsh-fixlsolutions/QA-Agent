@@ -169,7 +169,7 @@ def test_build_request_body_uses_real_zod_types_not_just_names(suite):
         method="POST", path="/api/users", source_file="x", dynamic=False,
         zod_fields=(("widgetCount", "number"), ("isPublished", "boolean"), ("contact", "email")),
     )
-    body, evidence, synthetic_fields = build_request_body(None, "POST", "/api/users", endpoint=endpoint)
+    body, evidence, synthetic_fields, _evidence_source = build_request_body(None, "POST", "/api/users", endpoint=endpoint)
     suite.check("a real number-typed field gets a real number, not a string",
                  body["widgetCount"] == 1 and isinstance(body["widgetCount"], int))
     suite.check("a real boolean-typed field gets a real boolean, not a string",
@@ -191,7 +191,7 @@ def test_zod_fields_take_priority_over_body_field_hints(suite):
         body_field_hints=("somethingElseEntirely",),
         zod_fields=(("realField", "string"),),
     )
-    body, _, synthetic_fields = build_request_body(None, "POST", "/api/users", endpoint=endpoint)
+    body, _, synthetic_fields, _evidence_source = build_request_body(None, "POST", "/api/users", endpoint=endpoint)
     suite.check("the real Zod field is used", "realField" in body)
     suite.check("the weaker name-only hint is not used instead", "somethingElseEntirely" not in body)
     suite.check("synthetic fields reflect the real Zod evidence used", synthetic_fields == ("realField",))

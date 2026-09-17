@@ -57,10 +57,17 @@ from .analysis import (
 from .discovery import discover_api_endpoints
 from .http_client import call_endpoint
 from .models import (
+    BODY_EVIDENCE_SOURCES,
     CALL_FAIL,
     CALL_PASS,
     CALL_SKIPPED,
     CALL_STATUSES,
+    EVIDENCE_OPENAPI,
+    EVIDENCE_SCHEMA,
+    EVIDENCE_SOURCE_HINT,
+    EVIDENCE_SYNTHETIC,
+    EVIDENCE_TEST_EXAMPLE,
+    EVIDENCE_UNKNOWN,
     METHODS,
     SERVER_ALREADY_RUNNING,
     SERVER_CRASHED,
@@ -80,11 +87,13 @@ from .resolution import (
     DEFAULT_ALLOW_SYNTHETIC_MUTATIONS,
     build_request_body,
     fetch_openapi_schema,
+    find_static_openapi_schema,
     generate_and_execute_negative_cases,
     resolve_and_execute,
     resolve_path_parameter,
     validate_response_schemas,
 )
+from .test_evidence import build_test_evidence_registry, find_test_evidence_for_endpoint
 from .runner import DEFAULT_CONFIG, ApiQaConfig, run_api_qa
 from .synthesis import synthesize_value
 
@@ -94,6 +103,7 @@ __all__ = [
     "API_SEVERITY_HIGH",
     "API_SEVERITY_LOW",
     "API_SEVERITY_MEDIUM",
+    "BODY_EVIDENCE_SOURCES",
     "CALL_FAIL",
     "CALL_PASS",
     "CALL_SKIPPED",
@@ -105,6 +115,12 @@ __all__ = [
     "CLASSIFICATIONS",
     "DEFAULT_ALLOW_SYNTHETIC_MUTATIONS",
     "DEFAULT_CONFIG",
+    "EVIDENCE_OPENAPI",
+    "EVIDENCE_SCHEMA",
+    "EVIDENCE_SOURCE_HINT",
+    "EVIDENCE_SYNTHETIC",
+    "EVIDENCE_TEST_EXAMPLE",
+    "EVIDENCE_UNKNOWN",
     "METHODS",
     "SERVER_ALREADY_RUNNING",
     "SERVER_CRASHED",
@@ -122,6 +138,7 @@ __all__ = [
     "NegativeCallResult",
     "SchemaValidationResult",
     "build_request_body",
+    "build_test_evidence_registry",
     "call_endpoint",
     "classify_call_outcome",
     "classify_call_severity",
@@ -132,6 +149,8 @@ __all__ = [
     "discover_api_endpoints",
     "expected_actual",
     "fetch_openapi_schema",
+    "find_static_openapi_schema",
+    "find_test_evidence_for_endpoint",
     "generate_and_execute_negative_cases",
     "render",
     "render_api_diagnosis_repair_entry",

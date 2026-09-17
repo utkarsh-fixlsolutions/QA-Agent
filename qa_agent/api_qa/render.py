@@ -78,7 +78,10 @@ def render(result):
             if call.response_sample:
                 lines.append("        body: {}".format(call.response_sample[:200]))
         if call.resolution_evidence:
-            lines.append("        evidence: {}".format(call.resolution_evidence))
+            evidence_line = "        evidence: {}".format(call.resolution_evidence)
+            if call.body_evidence_source:
+                evidence_line += "  [source: {}]".format(call.body_evidence_source)
+            lines.append(evidence_line)
 
     lines.append("")
     # docs/45: real-evidence and synthetic outcomes are always reported as
@@ -148,6 +151,10 @@ def _call_to_dict(call):
         # layers are expected to show that distinction, never hide it.
         "synthetic": call.synthetic,
         "synthetic_fields": list(call.synthetic_fields),
+        # Phase 2 (API contract understanding, docs/53): which evidence tier
+        # actually justified this call's own request body - `""` for a call
+        # with no body at all. See `models.BODY_EVIDENCE_SOURCES`.
+        "body_evidence_source": call.body_evidence_source,
     }
 
 
@@ -240,6 +247,7 @@ _CSV_FIELDNAMES = (
     "method", "path", "classification", "status", "status_code", "response_time_ms",
     "reason", "error", "response_sample", "resolved_path", "resolution_evidence",
     "source_file", "severity", "expected", "actual", "synthetic", "synthetic_fields",
+    "body_evidence_source",
 )
 
 
@@ -298,6 +306,8 @@ def _html_row(call):
     code = call.status_code if call.status_code is not None else "-"
     timing = "{:.0f}ms".format(call.response_time_ms) if call.response_time_ms is not None else "-"
     detail = call.error or call.reason or ""
+    if call.body_evidence_source:
+        detail = "{} [Evidence: {}]".format(detail, call.body_evidence_source).strip()
     if call.synthetic:
         # docs/45: a synthetic result is never left visually identical to a
         # real-evidence one - same color bucket (it really is a real HTTP

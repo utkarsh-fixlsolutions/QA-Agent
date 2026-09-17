@@ -28,7 +28,12 @@ from typing import Optional
 from . import server as _server
 from .discovery import discover_api_endpoints
 from .http_client import DEFAULT_TIMEOUT_SECONDS as _DEFAULT_REQUEST_TIMEOUT
-from .resolution import generate_and_execute_negative_cases, resolve_and_execute, validate_response_schemas
+from .resolution import (
+    find_static_openapi_schema,
+    generate_and_execute_negative_cases,
+    resolve_and_execute,
+    validate_response_schemas,
+)
 from .models import (
     CALL_SKIPPED,
     SERVER_CRASHED,
@@ -265,17 +270,28 @@ def run_api_qa(context, root, config=None, on_progress=None):
                 http_readiness_detail=readiness.detail,
             )
 
+        # Phase 2 (API contract understanding, docs/53): a real, already-
+        # checked-out OpenAPI/Swagger file, when the project ships one -
+        # found once here (root is only available at this layer), passed
+        # down as a fallback only ever used once the live `/openapi.json`
+        # fetch itself comes back empty (see resolution.py's own `_schema()`
+        # docstring for the exact precedence).
+        static_schema_doc = find_static_openapi_schema(root)
+
         primary_cb, negative_cb, schema_cb = _combine_progress(on_progress)
         calls = resolve_and_execute(
             endpoints, base_url, config.request_timeout, on_progress=primary_cb,
             allow_synthetic_mutations=config.allow_synthetic_mutations,
+            static_schema_doc=static_schema_doc,
         )
         negative_calls = generate_and_execute_negative_cases(
             endpoints, calls, base_url, config.request_timeout, on_progress=negative_cb,
             allow_synthetic_mutations=config.allow_synthetic_mutations,
+            static_schema_doc=static_schema_doc,
         )
         schema_validations = validate_response_schemas(
             endpoints, calls, base_url, config.request_timeout, on_progress=schema_cb,
+            static_schema_doc=static_schema_doc,
         )
         return _finish(
             endpoints=endpoints, calls=calls, server_status=SERVER_STARTED,
