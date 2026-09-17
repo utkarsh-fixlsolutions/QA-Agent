@@ -47,6 +47,7 @@ import os
 import re
 from pathlib import Path
 
+from . import zod_schema as _zod_schema
 from .models import METHODS, ApiEndpoint
 
 _MAX_READ_BYTES = 2_000_000
@@ -72,6 +73,99 @@ _EXPORT_CONST_RE = re.compile(
 
 _ROUTE_GROUP_RE = re.compile(r"^\(.*\)$")
 _DYNAMIC_SEGMENT_RE = re.compile(r"\[.*\]")
+
+# --- request-body field hints (docs/45-synthetic-mutation-testing.md) ------
+#
+# A narrow, named regex-over-text scope - not a JS/TS parser - matching the
+# handful of overwhelmingly common ways a Next.js/Express handler reads its
+# own request body. Anything outside these shapes (a custom body-parsing
+# helper, an unusual variable name deep inside a helper function) is not
+# recognized - `reads_request_body` simply stays `False` for that endpoint,
+# the same "named scope boundary, never silently mishandled" discipline
+# every other strategy in this module already follows.
+MUTATION_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+
+# `const { a, b } = await request.json()` / `await req.json()` (Next.js
+# App Router's own real request object, or a common `req` alias for it).
+# The `(?:const|let|var)` anchor is required, not cosmetic: without it,
+# `[^}]+` happily matches across an *unrelated* earlier `{` (e.g. a
+# function body's own opening brace) all the way to the destructure's own
+# closing `}`, capturing "function POST(request) {\n  const { title" as one
+# bogus "field name" instead of the real destructured identifiers - found
+# via a real end-to-end test (docs/45) that caught exactly this.
+_JSON_DESTRUCTURE_RE = re.compile(
+    r"(?:const|let|var)\s*\{\s*([^}]+)\}\s*=\s*await\s+(?:request|req)\.json\(\s*\)"
+)
+# Bare (non-destructured) form of the same read - no field names available
+# from this shape alone, but still real evidence the handler reads a body.
+_JSON_BARE_RE = re.compile(
+    r"=\s*await\s+(?:request|req)\.json\(\s*\)"
+)
+# `const { a, b } = req.body` (Express / Next.js Pages Router) - same
+# `const`/`let`/`var` anchor, for the same reason as `_JSON_DESTRUCTURE_RE`.
+_BODY_DESTRUCTURE_RE = re.compile(r"(?:const|let|var)\s*\{\s*([^}]+)\}\s*=\s*req\.body\b")
+# `req.body.fieldName` direct property access (Express / Pages Router).
+_BODY_ACCESS_RE = re.compile(r"req\.body\.([A-Za-z_$][A-Za-z0-9_$]*)")
+# Bare `req.body` used on its own (no destructure, no `.field` access) -
+# still real evidence of a body read, no field names from this shape alone.
+_BODY_BARE_RE = re.compile(r"req\.body\b(?!\s*\.\s*[A-Za-z_$])")
+
+_DESTRUCTURE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*")
+
+
+def _names_from_destructure(group_text):
+    """`{ a, b: renamed, c = defaultVal, ...rest }` -> `("a", "b", "c")` -
+    each comma-separated entry's own real bound identifier, a `: rename`
+    or `= default` clause discarded (the real request field is the name
+    *before* either), and a `...rest` spread entry dropped entirely (it
+    names no single real field). Never guesses a name that isn't literally
+    present in the source text.
+    """
+    names = []
+    for part in group_text.split(","):
+        part = part.strip()
+        if not part or part.startswith("..."):
+            continue
+        match = _DESTRUCTURE_IDENTIFIER_RE.match(part)
+        if match:
+            names.append(match.group(0))
+    return names
+
+
+def _extract_body_field_hints(text):
+    """Returns `(field_hints, reads_body)` for one route file's full text -
+    every recognized request-body read pattern is checked (not just the
+    first match), field names deduplicated in first-seen order across all
+    of them. `reads_body` is `True` whenever any recognized shape (bare or
+    destructured) was found, even if no specific field name could be
+    extracted from it - `build_request_body`'s own minimal-fallback case
+    (docs/45) depends on this distinction.
+    """
+    seen = set()
+    hints = []
+
+    def _add(name):
+        if name not in seen:
+            seen.add(name)
+            hints.append(name)
+
+    reads_body = False
+    for match in _JSON_DESTRUCTURE_RE.finditer(text):
+        reads_body = True
+        for name in _names_from_destructure(match.group(1)):
+            _add(name)
+    for match in _BODY_DESTRUCTURE_RE.finditer(text):
+        reads_body = True
+        for name in _names_from_destructure(match.group(1)):
+            _add(name)
+    for match in _BODY_ACCESS_RE.finditer(text):
+        reads_body = True
+        _add(match.group(1))
+    if not hints:
+        if _JSON_BARE_RE.search(text) or _BODY_BARE_RE.search(text):
+            reads_body = True
+
+    return tuple(hints), reads_body
 
 
 def _read_text_capped(path):
@@ -116,13 +210,21 @@ def _extract_methods(text):
     return tuple(m for m in METHODS if m in found)
 
 
-def _discover_nextjs_endpoints(context, root):
+def _discover_nextjs_endpoints(context, root, zod_registry=None):
     """Returns `(endpoints, warnings)`. Never raises - any per-file read
     failure is skipped with a warning, exactly like `run_runtime_plan`'s
     own "one check's failure never stops the rest" discipline, applied
     here to "one route file's failure never stops discovery of the rest".
     Unchanged from Step 30 - only its name changed, to make room for a
     second strategy below.
+
+    `zod_registry` (docs/50-zod-schema-discovery.md, optional): a real,
+    whole-project map of Zod schema variable name -> its own real required
+    fields (`zod_schema.build_zod_schema_registry`), built once by the
+    combined entry point below. When a mutating route's own handler text
+    references one of those real schema names, its real fields are
+    attached as `ApiEndpoint.zod_fields` - stronger evidence than
+    `body_field_hints` alone (a real type, not just a name).
     """
     root = Path(root)
     project = context.project
@@ -155,13 +257,19 @@ def _discover_nextjs_endpoints(context, root):
                 continue
             url_path = _url_path_from_route_file(app_dir_abs, route_file_abs)
             dynamic = bool(_DYNAMIC_SEGMENT_RE.search(url_path))
+            hints, reads_body = _extract_body_field_hints(text)
+            zod_fields = _zod_schema.find_referenced_schema_fields(text, zod_registry) if zod_registry else ()
             for method in methods:
                 key = (method, url_path)
                 if key in seen:
                     continue
                 seen.add(key)
+                is_mutation = method in MUTATION_METHODS
                 endpoints.append(ApiEndpoint(
                     method=method, path=url_path, source_file=source_file, dynamic=dynamic,
+                    body_field_hints=hints if is_mutation else (),
+                    reads_request_body=reads_body if is_mutation else False,
+                    zod_fields=zod_fields if is_mutation else (),
                 ))
 
     endpoints.sort(key=lambda e: (e.path, e.method))
@@ -189,6 +297,69 @@ _PYTHON_ROUTE_DECORATOR_RE = re.compile(
     re.IGNORECASE,
 )
 _FASTAPI_DYNAMIC_SEGMENT_RE = re.compile(r"\{[^}]+\}")
+
+# --- request-body-read evidence, Python/FastAPI (docs/47) ------------------
+#
+# Deliberately narrower than the JS/TS strategies' own `body_field_hints`
+# (docs/45): this only ever detects THAT a handler reads a request body,
+# never WHICH fields - resolving a `payload: SomeModel` parameter's own
+# real field names would need locating and parsing that model's class
+# definition (possibly in another file entirely), a real, named scope
+# boundary this module does not attempt (the same "no Zod/Joi/Pydantic-
+# model AST parsing" boundary docs/45 already drew for the JS side, applied
+# here to its Python equivalent). Built because the assumption docs/45
+# originally made - "FastAPI already serves a live OpenAPI document, so it
+# needs no source-derived fallback" - turned out false for a real,
+# security-conscious FastAPI project that disables `/openapi.json`
+# entirely, leaving every one of its POST/PUT/PATCH/DELETE endpoints with
+# no fallback at all and a wall of honest skips.
+#
+# `payload: SomeModel` / `body: SomeModel` - a real, capitalized type
+# annotation, the overwhelmingly common way a FastAPI handler declares a
+# Pydantic request body. `Optional[X]`/`List[X]` are peeked through to
+# reach the real inner type name. A small stoplist excludes FastAPI/stdlib
+# types that are never a request body themselves - matched by the same
+# "narrow, named convention, not a full parser" discipline as the rest of
+# this module; a differently-wrapped annotation (`Annotated[X, Body()]`,
+# a body split across multiple named parameters) is a real, accepted gap,
+# not silently mishandled.
+_FASTAPI_BODY_PARAM_RE = re.compile(
+    r":\s*(?:Optional\[|List\[)?([A-Z][A-Za-z0-9_]*)\b"
+)
+_FASTAPI_NON_BODY_PARAM_TYPES = frozenset({
+    "Request", "Response", "HTTPException", "BackgroundTasks", "UploadFile",
+    "WebSocket", "Session", "AsyncSession", "UUID", "Path", "Query", "Header",
+    "Cookie", "Body", "Form", "File", "Depends", "Security", "Annotated",
+    "Optional", "List", "Dict", "Any", "Union", "Type", "Request",
+})
+# `body = await request.json()` / `await req.json()` - Python's own bare-
+# assignment equivalent of the JS strategies' own `_JSON_BARE_RE` (no
+# `const`/`let`/`var` exists in Python, so no such anchor is needed or
+# possible here).
+_PY_JSON_BARE_RE = re.compile(r"=\s*await\s+(?:request|req)\.json\(\s*\)")
+
+# The per-route window this evidence is searched within is capped, not the
+# whole rest of the file up to the next route - the same "cap the search,
+# never scan unbounded real text" convention `_MAX_READ_BYTES` already
+# establishes for this module - so a long handler's own unrelated, deeper
+# local-variable type annotations are far less likely to be mistaken for a
+# body parameter than a full, unbounded function-body scan would risk.
+_PY_BODY_EVIDENCE_WINDOW_CHARS = 2000
+
+
+def _reads_request_body_python(handler_text):
+    """`True` when `handler_text` (the real source between one route
+    decorator and the next, or end of file - the same per-route windowing
+    the Express strategy already uses) shows real evidence of reading a
+    request body, by either recognized shape above. Never returns field
+    names - see this section's own module-level docstring for why.
+    """
+    if _PY_JSON_BARE_RE.search(handler_text):
+        return True
+    for match in _FASTAPI_BODY_PARAM_RE.finditer(handler_text):
+        if match.group(1) not in _FASTAPI_NON_BODY_PARAM_TYPES:
+            return True
+    return False
 
 
 def _find_python_files(root_abs):
@@ -236,7 +407,13 @@ def _discover_fastapi_endpoints(context, root):
         if text is None:
             warnings.append("could not read Python file: {}".format(source_file))
             continue
-        for match in _PYTHON_ROUTE_DECORATOR_RE.finditer(text):
+        # Route decorators in source order, so each one's own handler can
+        # be approximated as "the text up to the next route decorator in
+        # this same file" (bounded, see `_PY_BODY_EVIDENCE_WINDOW_CHARS`) -
+        # the same technique the Express strategy already uses for its own
+        # per-route `body_field_hints` windowing.
+        matches = list(_PYTHON_ROUTE_DECORATOR_RE.finditer(text))
+        for i, match in enumerate(matches):
             path = match.group(2)
             if not path:
                 # A decorator matched with an empty string literal path -
@@ -245,8 +422,14 @@ def _discover_fastapi_endpoints(context, root):
             method = match.group(1).upper()
             line = text.count("\n", 0, match.start()) + 1
             dynamic = bool(_FASTAPI_DYNAMIC_SEGMENT_RE.search(path))
+            reads_body = False
+            if method in MUTATION_METHODS:
+                next_start = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+                window_end = min(next_start, match.end() + _PY_BODY_EVIDENCE_WINDOW_CHARS)
+                reads_body = _reads_request_body_python(text[match.end():window_end])
             endpoints.append(ApiEndpoint(
                 method=method, path=path, source_file=source_file, dynamic=dynamic, line=line,
+                reads_request_body=reads_body,
             ))
 
     endpoints.sort(key=lambda e: (e.path, e.method, e.source_file))
@@ -327,12 +510,14 @@ def _extract_pages_methods(text):
     return tuple(m.upper() for m in METHODS if m in {f.upper() for f in found}), False
 
 
-def _discover_nextjs_pages_endpoints(context, root):
+def _discover_nextjs_pages_endpoints(context, root, zod_registry=None):
     """Returns `(endpoints, warnings)`. Never attempted at all unless
     `project.frameworks` already, really contains "Next.js" - a bare
     `pages`-named directory alone is far too common outside Next.js
     (unlike `route.ts`/`route.js`'s own distinctive App Router filenames)
     to be trustworthy evidence by itself.
+
+    `zod_registry`: see `_discover_nextjs_endpoints`'s own docstring.
     """
     project = context.project
     if not _is_nextjs_project(project):
@@ -369,13 +554,19 @@ def _discover_nextjs_pages_endpoints(context, root):
                 )
             url_path = _url_path_from_pages_file(pages_dir_abs, route_file_abs)
             dynamic = bool(_DYNAMIC_SEGMENT_RE.search(url_path))
+            hints, reads_body = _extract_body_field_hints(text)
+            zod_fields = _zod_schema.find_referenced_schema_fields(text, zod_registry) if zod_registry else ()
             for method in methods:
                 key = (method, url_path)
                 if key in seen:
                     continue
                 seen.add(key)
+                is_mutation = method in MUTATION_METHODS
                 endpoints.append(ApiEndpoint(
                     method=method, path=url_path, source_file=source_file, dynamic=dynamic,
+                    body_field_hints=hints if is_mutation else (),
+                    reads_request_body=reads_body if is_mutation else False,
+                    zod_fields=zod_fields if is_mutation else (),
                 ))
 
     endpoints.sort(key=lambda e: (e.path, e.method))
@@ -420,8 +611,10 @@ def _find_js_files(root_abs):
     return found
 
 
-def _discover_express_endpoints(context, root):
-    """Returns `(endpoints, warnings)`. Never attempted at all unless
+def _discover_express_endpoints(context, root, zod_registry=None):
+    """`zod_registry`: see `_discover_nextjs_endpoints`'s own docstring.
+
+    Returns `(endpoints, warnings)`. Never attempted at all unless
     `project.frameworks` already, really contains "Express" (Phase F's own
     detection, reused rather than re-implemented here) - the same
     evidence-gated scoping the FastAPI/Pages Router strategies apply via
@@ -448,7 +641,16 @@ def _discover_express_endpoints(context, root):
         if text is None:
             warnings.append("could not read JS/TS file: {}".format(source_file))
             continue
-        for match in _EXPRESS_ROUTE_CALL_RE.finditer(text):
+        # Route calls in source order, so each one's own handler body can be
+        # approximated as "the text up to the next route call in this same
+        # file" (docs/45) - a real, named scope boundary (not a full JS/TS
+        # parse: a route call site that isn't immediately followed by its
+        # own handler's real closing brace before the next route call would
+        # see a widened, slightly-too-generous window) rather than falling
+        # back to whole-file hints, which would wrongly blend two different
+        # routes' fields together.
+        matches = list(_EXPRESS_ROUTE_CALL_RE.finditer(text))
+        for i, match in enumerate(matches):
             path = match.group(2)
             if not path.startswith("/"):
                 # A real call matched, but its first argument is not a
@@ -463,8 +665,16 @@ def _discover_express_endpoints(context, root):
             if key in seen:
                 continue
             seen.add(key)
+            hints, reads_body, zod_fields = (), False, ()
+            if method in MUTATION_METHODS:
+                window_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+                window_text = text[match.end():window_end]
+                hints, reads_body = _extract_body_field_hints(window_text)
+                if zod_registry:
+                    zod_fields = _zod_schema.find_referenced_schema_fields(window_text, zod_registry)
             endpoints.append(ApiEndpoint(
                 method=method, path=path, source_file=source_file, dynamic=dynamic, line=line,
+                body_field_hints=hints, reads_request_body=reads_body, zod_fields=zod_fields,
             ))
 
     endpoints.sort(key=lambda e: (e.path, e.method, e.source_file))
@@ -490,10 +700,21 @@ def discover_api_endpoints(context, root):
     framework evidence, but guarded anyway rather than assumed impossible).
     """
     root = Path(root)
-    nextjs_endpoints, nextjs_warnings = _discover_nextjs_endpoints(context, root)
-    pages_endpoints, pages_warnings = _discover_nextjs_pages_endpoints(context, root)
+    # docs/50-zod-schema-discovery.md: one whole-project pass, built only
+    # when there's any real, already-detected JS/TS framework evidence at
+    # all - a pure Python/FastAPI project never pays for a JS-file walk it
+    # could not possibly need. Shared across all three JS/TS strategies
+    # below so a schema defined in one file is still found when the route
+    # that references it lives in a completely different one.
+    zod_registry = (
+        _zod_schema.build_zod_schema_registry(root)
+        if (_is_nextjs_project(context.project) or _is_express_project(context.project))
+        else {}
+    )
+    nextjs_endpoints, nextjs_warnings = _discover_nextjs_endpoints(context, root, zod_registry)
+    pages_endpoints, pages_warnings = _discover_nextjs_pages_endpoints(context, root, zod_registry)
     fastapi_endpoints, fastapi_warnings = _discover_fastapi_endpoints(context, root)
-    express_endpoints, express_warnings = _discover_express_endpoints(context, root)
+    express_endpoints, express_warnings = _discover_express_endpoints(context, root, zod_registry)
 
     endpoints = []
     seen = set()

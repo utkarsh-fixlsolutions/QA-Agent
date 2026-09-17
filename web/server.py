@@ -24,8 +24,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import List, Optional
 
@@ -355,13 +357,16 @@ def _diagnosis_entry_to_dict(entry):
 # pre-existing engine bug, out of today's scope) - described honestly
 # below instead of promising a PASS/FAIL that can't actually happen.
 _MUTATION_BODY_DESC = (
-    "Attempt to build a request body from the target's OpenAPI schema (required fields with a "
-    "declared default only), then call. Skipped if no OpenAPI schema is reachable or a required "
-    "field has no schema default."
+    "Build a request body from the target's OpenAPI schema when one is reachable (real defaults "
+    "first; a required field with no default is synthesized - clearly labeled 'synthetic data' in "
+    "the result, docs/45), or from field names found directly in the route's own source code when "
+    "no OpenAPI schema exists. Skipped only if neither source gives any real evidence the endpoint "
+    "reads a body at all."
 )
 _MUTATION_BODY_DYNAMIC_DESC = (
-    "Resolve the dynamic path parameter from a prior passing GET response and attempt to build a "
-    "request body from the OpenAPI schema, then call. Skipped if either cannot be resolved this way."
+    "Resolve the dynamic path parameter from a prior passing GET response when one exists, or a "
+    "synthesized id otherwise (docs/45) - and build a request body the same way "
+    "_MUTATION_BODY_DESC does. Skipped only when nothing - real or synthetic - can be produced."
 )
 _NOT_EXECUTED_DESC = (
     "Discovered as a real route, but the live test run's execution engine does not currently attempt "
@@ -372,8 +377,9 @@ _TEST_CASE_RULES = {
     ("GET", False): "Call directly and verify a 2xx response with valid JSON (when the response "
                     "claims a JSON content-type).",
     ("GET", True): "Resolve the dynamic path parameter from a prior passing GET response on the "
-                   "parent collection endpoint, then call and verify a 2xx response. Skipped if no "
-                   "such prior evidence is found, or if the path names more than one dynamic segment.",
+                   "parent collection endpoint when one exists, or a synthesized id otherwise "
+                   "(docs/45) - then call and verify a 2xx response. Skipped only if the path names "
+                   "more than one dynamic segment (never attempted for that shape).",
     ("POST", False): _MUTATION_BODY_DESC,
     ("POST", True): _MUTATION_BODY_DYNAMIC_DESC,
     ("PUT", False): _MUTATION_BODY_DESC,
@@ -382,9 +388,9 @@ _TEST_CASE_RULES = {
     ("PATCH", True): _MUTATION_BODY_DYNAMIC_DESC,
     ("DELETE", False): "Call directly (no request body needed for DELETE). Mutates state on the "
                        "target if it actually succeeds - only test against a disposable target.",
-    ("DELETE", True): "Resolve the dynamic path parameter from a prior passing GET response, then "
-                      "call. Skipped if no such prior evidence is found. Mutates state on the target "
-                      "if it actually succeeds - only test against a disposable target.",
+    ("DELETE", True): "Resolve the dynamic path parameter from a prior passing GET response when one "
+                      "exists, or a synthesized id otherwise (docs/45), then call. Mutates state on "
+                      "the target if it actually succeeds - only test against a disposable target.",
     ("HEAD", False): _NOT_EXECUTED_DESC.format("HEAD"),
     ("HEAD", True): _NOT_EXECUTED_DESC.format("HEAD"),
     ("OPTIONS", False): _NOT_EXECUTED_DESC.format("OPTIONS"),
@@ -464,12 +470,19 @@ async def plan(files: List[UploadFile] = File(...)):
     return JSONResponse(response)
 
 
-def _run_analysis(project_root: Path, run_api_test: bool, diagnose: bool, started: float) -> dict:
+def _run_analysis(
+    project_root: Path, run_api_test: bool, diagnose: bool, started: float, on_progress=None,
+) -> dict:
     """Everything `/api/analyze` actually does, moved out of the route
     itself (docs/43) so it can run inside `asyncio.to_thread` - FastAPI's
     single event loop would otherwise block on this module's own
     synchronous, potentially multi-minute calls (`run_api_qa`, `subprocess
     .run`) for the whole duration of every request.
+
+    `on_progress` (optional, docs/44-live-progress.md): forwarded straight
+    to `run_api_qa` - `None` (the default, what `/api/analyze` itself still
+    passes) leaves this function's behavior completely unchanged; only the
+    new job-based `/api/analyze/start` flow provides a real callback.
     """
     discovery = discover_project(str(project_root))
     _stage(started, "discovery done")
@@ -509,12 +522,14 @@ def _run_analysis(project_root: Path, run_api_test: bool, diagnose: bool, starte
         api_result = run_api_qa(
             context, str(project_root),
             config=ApiQaConfig(server_startup_timeout=45.0, connect_probe_timeout=20.0),
+            on_progress=on_progress,
         )
-        _stage(started, "API testing done ({} call(s), server {})".format(
-            len(api_result.calls), api_result.server_status))
+        _stage(started, "API testing done ({} call(s), {} negative case(s), {} schema check(s), server {})".format(
+            len(api_result.calls), len(api_result.negative_calls), len(api_result.schema_validations),
+            api_result.server_status))
         api_data = api_qa_to_dict(api_result)
         api_data["root_path"] = "."  # the real temp path is a server-side detail, never shown
-        for call in api_data["calls"]:
+        for call in api_data["calls"] + api_data["negative_calls"] + api_data["schema_validations"]:
             call["source_file"] = _relativize(call["source_file"], project_root) if Path(call["source_file"]).is_absolute() else call["source_file"]
         if install_result is not None:
             api_data["install_error"] = install_result
@@ -587,6 +602,122 @@ async def analyze(
 
     shutil.rmtree(work_dir, ignore_errors=True)
     return JSONResponse(response)
+
+
+# --- live progress: background job + polling (docs/44-live-progress.md) ----
+#
+# `/api/analyze` above stays exactly as it always has - one blocking request,
+# one final JSON response - so nothing that already depends on it changes.
+# This is a second, additive way to run the same underlying `_run_analysis`:
+# the frontend gets a job id immediately, then polls for real progress while
+# the real work continues in the background. A plain in-memory registry is
+# enough for a single-process local dev tool (not a durable job queue) -
+# `_JOBS_LOCK` guards it since `on_progress` is invoked from the worker
+# thread `asyncio.to_thread` runs `_run_analysis` on, not the event loop.
+
+_JOBS_LOCK = threading.Lock()
+_JOBS: "OrderedDict[str, dict]" = OrderedDict()
+_MAX_JOBS = 30  # bounded so a long-running session never grows this unboundedly
+_background_tasks: set = set()  # strong refs - an unreferenced asyncio.Task can be GC'd mid-flight
+
+
+def _new_job() -> str:
+    job_id = uuid.uuid4().hex
+    with _JOBS_LOCK:
+        _JOBS[job_id] = {
+            "status": "running", "done": 0, "total": 0, "label": "", "result": None, "error": None,
+        }
+        while len(_JOBS) > _MAX_JOBS:
+            _JOBS.popitem(last=False)
+    return job_id
+
+
+def _update_job(job_id: str, **fields) -> None:
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is not None:
+            job.update(fields)
+
+
+def _get_job(job_id: str) -> Optional[dict]:
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        return dict(job) if job is not None else None
+
+
+async def _run_analysis_job(
+    job_id: str, project_root: Path, run_api_test: bool, diagnose: bool, started: float, work_dir: Path,
+) -> None:
+    def on_progress(done, total, label):
+        _update_job(job_id, done=done, total=total, label=label)
+
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(_run_analysis, project_root, run_api_test, diagnose, started, on_progress),
+            timeout=OVERALL_DEADLINE_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        # Same accepted limitation `/api/analyze` itself already documents -
+        # a plain thread cannot be forcibly stopped mid-call, so work_dir is
+        # left in place rather than risking a new failure mode underneath it.
+        _stage(started, "TIMEOUT - exceeded {:.0f}s ceiling; work_dir left in place: {}".format(
+            OVERALL_DEADLINE_SECONDS, work_dir))
+        _update_job(
+            job_id, status="error",
+            error="analysis exceeded the {:.0f}s time limit and was stopped from the caller's side. "
+                  "This can happen on a very large project or a very slow/blocked server start. Try "
+                  "again with \"Also run live API tests\" unchecked, or on a smaller "
+                  "project.".format(OVERALL_DEADLINE_SECONDS),
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 - guarantee a real, terminal job state, never a stuck "running"
+        _stage(started, "ERROR: {}".format(exc))
+        shutil.rmtree(work_dir, ignore_errors=True)
+        _update_job(job_id, status="error", error="analysis failed: {}".format(exc))
+        return
+
+    shutil.rmtree(work_dir, ignore_errors=True)
+    _update_job(job_id, status="done", result=response)
+
+
+@app.post("/api/analyze/start")
+async def analyze_start(
+    files: List[UploadFile] = File(...),
+    run_api_test: bool = Form(False),
+    diagnose: bool = Form(False),
+):
+    started = time.perf_counter()
+    work_dir = Path(tempfile.gettempdir()) / "qa_agent_web" / uuid.uuid4().hex
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        project_root = await _receive_upload(files, work_dir)
+    except _UploadError as exc:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
+    _stage(started, "upload received ({} file(s))".format(len(files)))
+
+    job_id = _new_job()
+    task = asyncio.create_task(
+        _run_analysis_job(job_id, project_root, run_api_test, diagnose, started, work_dir)
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    return JSONResponse({"job_id": job_id})
+
+
+@app.get("/api/analyze/status/{job_id}")
+async def analyze_status(job_id: str):
+    job = _get_job(job_id)
+    if job is None:
+        return JSONResponse({"error": "unknown job id"}, status_code=404)
+    payload = {"status": job["status"], "done": job["done"], "total": job["total"], "label": job["label"]}
+    if job["status"] == "done":
+        payload["result"] = job["result"]
+    elif job["status"] == "error":
+        payload["error"] = job["error"]
+    return JSONResponse(payload)
 
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"

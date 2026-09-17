@@ -12,6 +12,8 @@ import html
 import io
 import json
 
+from .analysis import CLASSIFICATIONS, classify_call_outcome, classify_call_severity, expected_actual
+
 _STATUS_SYMBOLS = {"pass": "PASS", "fail": "FAIL", "skipped": "SKIP"}
 
 # Only the most recent lines are worth showing inline in a terminal report -
@@ -53,9 +55,15 @@ def render(result):
     endpoint_width = max(len(_endpoint_column(c)) for c in result.calls) + 2
     status_width = max(len(_status_label(c)) for c in result.calls) + 2
 
-    counts = {}
     for call in result.calls:
-        symbol = _STATUS_SYMBOLS.get(call.status, call.status.upper())
+        # docs/48-fail-fast-and-classification.md: the final, user-facing
+        # label every endpoint is shown under - one of exactly four
+        # (Working/Failing/Not Working/Skipped) - replaces the old bare
+        # PASS/FAIL/SKIP symbol here; `status`/severity remain the
+        # underlying evidence it's computed from, unchanged everywhere else.
+        symbol = classify_call_outcome(call)
+        if call.synthetic:
+            symbol = "{} [SYNTHETIC: {}]".format(symbol, ", ".join(call.synthetic_fields))
         timing = "({:.0f}ms)".format(call.response_time_ms) if call.response_time_ms is not None else "(-)"
         lines.append("  {:<{ew}} -> {:<{sw}} {:<8} {}".format(
             _endpoint_column(call), _status_label(call), timing, symbol,
@@ -71,12 +79,31 @@ def render(result):
                 lines.append("        body: {}".format(call.response_sample[:200]))
         if call.resolution_evidence:
             lines.append("        evidence: {}".format(call.resolution_evidence))
-        counts[call.status] = counts.get(call.status, 0) + 1
 
     lines.append("")
-    summary = ", ".join("{} {}".format(count, status) for status, count in sorted(counts.items()))
-    lines.append("  {} call(s) - {}. Total time: {:.2f}s".format(
-        len(result.calls), summary, result.total_duration,
+    # docs/45: real-evidence and synthetic outcomes are always reported as
+    # two separate tallies - never combined into one number that would
+    # overstate how much of a "pass" count came from real evidence.
+    counts = _summary_counts(result.calls)
+    real, synthetic = counts["real_evidence"], counts["synthetic"]
+    real_summary = ", ".join(
+        "{} {}".format(n, status) for status, n in sorted(real.items()) if n
+    ) or "none"
+    summary_line = "  {} call(s) - {} (real evidence)".format(len(result.calls), real_summary)
+    if synthetic["pass"] or synthetic["fail"]:
+        synthetic_summary = ", ".join(
+            "{} {}".format(n, status) for status, n in sorted(synthetic.items()) if n
+        )
+        summary_line += "; {} (synthetic data)".format(synthetic_summary)
+    summary_line += ". Total time: {:.2f}s".format(result.total_duration)
+    lines.append(summary_line)
+
+    # docs/48: the same four-label classification every call line above is
+    # already shown under, tallied once so a reader gets the shape of the
+    # whole run at a glance without counting lines.
+    classification_counts = _classification_counts(result.calls)
+    lines.append("  Classification: {}".format(
+        ", ".join("{} {}".format(classification_counts[label], label) for label in CLASSIFICATIONS)
     ))
 
     if result.server_log_tail and any(c.status != "pass" for c in result.calls):
@@ -88,6 +115,7 @@ def render(result):
 
 
 def _call_to_dict(call):
+    expected, actual = expected_actual(call)
     return {
         "method": call.endpoint.method,
         "path": call.endpoint.path,
@@ -103,7 +131,85 @@ def _call_to_dict(call):
         "resolution_evidence": call.resolution_evidence,
         "error": call.error,
         "reason": call.reason,
+        "severity": classify_call_severity(call),
+        # docs/48-fail-fast-and-classification.md: the final, closed-set
+        # user-facing label (Working/Failing/Not Working/Skipped) - see
+        # `classify_call_outcome`'s own docstring for exactly what each
+        # one means and how it's derived from `status`/`status_code`.
+        "classification": classify_call_outcome(call),
+        "expected": expected,
+        "actual": actual,
+        # docs/45-synthetic-mutation-testing.md: `True` only when at least
+        # one value used for this call's path/body was invented rather than
+        # real evidence/a schema default - `synthetic_fields` names exactly
+        # which ones. Never blended into the pass/fail meaning of `status`
+        # itself - a synthetic PASS is still a real HTTP PASS against a
+        # real server, just built from a placeholder value, and reporting
+        # layers are expected to show that distinction, never hide it.
+        "synthetic": call.synthetic,
+        "synthetic_fields": list(call.synthetic_fields),
     }
+
+
+def _negative_call_to_dict(nc):
+    return {
+        "method": nc.endpoint.method,
+        "path": nc.endpoint.path,
+        "source_file": nc.endpoint.source_file,
+        "case_name": nc.case_name,
+        "expected": nc.expected,
+        "status": nc.status,
+        "actual_status_code": nc.actual_status_code,
+        "actual_summary": nc.actual_summary,
+        "severity": nc.severity or None,
+        "synthetic": nc.synthetic,
+        "synthetic_fields": list(nc.synthetic_fields),
+    }
+
+
+def _schema_validation_to_dict(sv):
+    return {
+        "method": sv.endpoint.method,
+        "path": sv.endpoint.path,
+        "source_file": sv.endpoint.source_file,
+        "status": sv.status,
+        "missing_fields": list(sv.missing_fields),
+        "type_mismatches": list(sv.type_mismatches),
+        "severity": sv.severity or None,
+        "reason": sv.reason,
+    }
+
+
+def _summary_counts(calls):
+    """docs/45-synthetic-mutation-testing.md: real-evidence and synthetic
+    results are counted separately so a report never blends "the target
+    really handled a real request correctly" with "the target handled a
+    request we had to invent placeholder data for" into one combined
+    number. A `CALL_SKIPPED` result is never synthetic (nothing was ever
+    actually invented and sent - the call simply never happened), so the
+    synthetic bucket only ever needs pass/fail.
+    """
+    real = {"pass": 0, "fail": 0, "skipped": 0}
+    synthetic = {"pass": 0, "fail": 0}
+    for call in calls:
+        if call.synthetic:
+            if call.status in synthetic:
+                synthetic[call.status] += 1
+        else:
+            real[call.status] = real.get(call.status, 0) + 1
+    return {"real_evidence": real, "synthetic": synthetic}
+
+
+def _classification_counts(calls):
+    """docs/48-fail-fast-and-classification.md: one tally across the four
+    `CLASSIFICATIONS` labels - every key always present, `0` when a bucket
+    is genuinely empty, never omitted (so a caller can always print all
+    four without a `KeyError`).
+    """
+    counts = {label: 0 for label in CLASSIFICATIONS}
+    for call in calls:
+        counts[classify_call_outcome(call)] += 1
+    return counts
 
 
 def to_dict(result):
@@ -118,6 +224,9 @@ def to_dict(result):
         "warnings": list(result.warnings),
         "calls": [_call_to_dict(c) for c in result.calls],
         "server_log_tail": result.server_log_tail,
+        "negative_calls": [_negative_call_to_dict(nc) for nc in result.negative_calls],
+        "schema_validations": [_schema_validation_to_dict(sv) for sv in result.schema_validations],
+        "summary": dict(_summary_counts(result.calls), classification=_classification_counts(result.calls)),
     }
 
 
@@ -128,9 +237,9 @@ def to_json(result, indent=2):
 # --- CSV/HTML file export (docs/36-api-qa-report-export.md) ----------------
 
 _CSV_FIELDNAMES = (
-    "method", "path", "status", "status_code", "response_time_ms",
+    "method", "path", "classification", "status", "status_code", "response_time_ms",
     "reason", "error", "response_sample", "resolved_path", "resolution_evidence",
-    "source_file",
+    "source_file", "severity", "expected", "actual", "synthetic", "synthetic_fields",
 )
 
 
@@ -189,11 +298,18 @@ def _html_row(call):
     code = call.status_code if call.status_code is not None else "-"
     timing = "{:.0f}ms".format(call.response_time_ms) if call.response_time_ms is not None else "-"
     detail = call.error or call.reason or ""
+    if call.synthetic:
+        # docs/45: a synthetic result is never left visually identical to a
+        # real-evidence one - same color bucket (it really is a real HTTP
+        # PASS/FAIL against the real server), but always an explicit,
+        # un-missable suffix naming exactly which field(s) were invented.
+        detail = "{} [Synthetic Data: {}]".format(detail, ", ".join(call.synthetic_fields)).strip()
     sample = call.response_sample[:200] if call.response_sample else ""
     return (
         '<tr>'
         '<td class="method">{method}</td>'
         '<td class="path">{path}</td>'
+        '<td><strong>{classification}</strong></td>'
         '<td><span class="badge" style="color:{fg};background:{bg}">{label}</span></td>'
         '<td class="code">{code}</td>'
         '<td class="timing">{timing}</td>'
@@ -201,6 +317,7 @@ def _html_row(call):
         '</tr>'
     ).format(
         method=_esc(call.endpoint.method), path=_esc(call.endpoint.path),
+        classification=_esc(classify_call_outcome(call)),
         fg=fg, bg=bg, label=label, code=_esc(code), timing=_esc(timing),
         detail=_esc(detail),
         sample=(" &mdash; <code>{}</code>".format(_esc(sample)) if sample else ""),
@@ -243,7 +360,7 @@ _HTML_TEMPLATE = """<!doctype html>
 </div>
 {warnings_block}
 <table>
-  <thead><tr><th>Method</th><th>Path</th><th>Result</th><th>HTTP</th><th>Time</th><th>Detail</th></tr></thead>
+  <thead><tr><th>Method</th><th>Path</th><th>Classification</th><th>Result</th><th>HTTP</th><th>Time</th><th>Detail</th></tr></thead>
   <tbody>
     {rows}
   </tbody>
@@ -262,15 +379,15 @@ def to_html(result):
     -log.md's Dependency philosophy) - one color-coded row per call.
     """
     rows = "\n    ".join(_html_row(c) for c in result.calls) or (
-        '<tr><td colspan="6">No endpoint calls were made.</td></tr>'
+        '<tr><td colspan="7">No endpoint calls were made.</td></tr>'
     )
-    counts = {}
-    for call in result.calls:
-        counts[call.status] = counts.get(call.status, 0) + 1
-    summary = "{} call(s) - {}".format(
-        len(result.calls),
-        ", ".join("{} {}".format(n, s) for s, n in sorted(counts.items())) or "none",
-    )
+    counts = _summary_counts(result.calls)
+    real, synthetic = counts["real_evidence"], counts["synthetic"]
+    real_summary = ", ".join("{} {}".format(n, s) for s, n in sorted(real.items()) if n) or "none"
+    summary = "{} call(s) - {} (real evidence)".format(len(result.calls), real_summary)
+    if synthetic["pass"] or synthetic["fail"]:
+        synthetic_summary = ", ".join("{} {}".format(n, s) for s, n in sorted(synthetic.items()) if n)
+        summary += "; {} (synthetic data)".format(synthetic_summary)
     warnings_block = ""
     if result.warnings:
         items = "".join("<div>&bull; {}</div>".format(_esc(w)) for w in result.warnings)

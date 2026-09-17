@@ -39,6 +39,14 @@ SERVER_ALREADY_RUNNING = "already_running"
 SERVER_START_FAILED = "start_failed"
 SERVER_CRASHED = "crashed"
 SERVER_SKIPPED = "skipped"
+# docs/48-fail-fast-and-classification.md: distinct from SERVER_START_FAILED
+# (the process itself never started) and SERVER_CRASHED (it started, then
+# exited) - the process really did start and is still running, it just
+# never accepted one single real TCP connection within the real connect-
+# probe's own timeout. `run_api_qa` stops the whole run here, honestly,
+# rather than proceeding to call every endpoint against a server that was
+# never confirmed reachable.
+SERVER_UNREACHABLE = "unreachable"
 
 SERVER_STATUSES = (
     SERVER_STARTED,
@@ -46,6 +54,7 @@ SERVER_STATUSES = (
     SERVER_START_FAILED,
     SERVER_CRASHED,
     SERVER_SKIPPED,
+    SERVER_UNREACHABLE,
 )
 
 # One call's outcome - PASS/FAIL mirror runtime/execution_models.py's own
@@ -86,6 +95,32 @@ class ApiEndpoint:
     source_file: str
     dynamic: bool = False
     line: Optional[int] = None
+    # Source-derived request-body field names (docs/45-synthetic-mutation
+    # -testing.md), populated only for a mutating endpoint whose handler's
+    # own source was recognized reading `request.json()`/`req.body` in one
+    # of discovery.py's own documented shapes - never guessed from a method
+    # alone. Used by resolution.py's `build_request_body` only as a
+    # fallback when no live OpenAPI schema describes this operation at all.
+    body_field_hints: Tuple[str, ...] = ()
+    # `True` when the handler's own source was recognized reading a request
+    # body at all (`await request.json()`/`req.body`, bare or destructured)
+    # even when no specific field names could be extracted from that read
+    # (e.g. `const body = await request.json()` with no destructuring) -
+    # lets `build_request_body` tell "this endpoint definitely reads a
+    # body, but we don't know its shape" (a minimal synthetic body is
+    # reasonable) apart from "no evidence this endpoint reads a body at
+    # all" (an honest skip stays the only reasonable outcome).
+    reads_request_body: bool = False
+    # Real (field_name, zod_type_token) pairs (docs/50-zod-schema-discovery
+    # .md), resolved from a real `z.object({...})` schema definition this
+    # endpoint's own handler actually references (`x.parse(...)`/
+    # `x.safeParse(...)`/a `validate(x)` middleware call) - required fields
+    # only (`.optional()`/`.nullable()`/`.default(...)` fields are real
+    # evidence they are *not* required, so they're excluded, never
+    # invented into a body that doesn't need them). Stronger evidence than
+    # `body_field_hints` (a real name *and* a real type, not just a name)
+    # - checked first in resolution.py's fallback chain when present.
+    zod_fields: Tuple[Tuple[str, str], ...] = ()
 
     def __post_init__(self):
         if self.method not in METHODS:
@@ -151,11 +186,94 @@ class ApiCallResult:
     resolution_evidence: str = ""
     error: str = ""
     reason: str = ""
+    # docs/45-synthetic-mutation-testing.md: `synthetic` is `True` only when
+    # at least one value used for this call's path or body was invented
+    # (qa_agent/api_qa/synthesis.py) rather than found as real evidence or a
+    # real schema-declared default/example/enum. `synthetic_fields` names
+    # exactly which field(s) (or the path parameter) were invented - never
+    # just a bare yes/no - so a report can say precisely what was faked
+    # rather than casting doubt on the whole call. Both stay at their
+    # default (`False`/`()`) for every real-evidence call, unchanged from
+    # today - this is a strictly additive fact, never a replacement for
+    # `resolution_evidence`'s own human-readable trace.
+    synthetic: bool = False
+    synthetic_fields: Tuple[str, ...] = ()
 
     def __post_init__(self):
         if self.status not in CALL_STATUSES:
             raise ValueError(
                 "ApiCallResult({!r} {!r}) has an unrecognized status {!r}".format(
+                    self.endpoint.method, self.endpoint.path, self.status
+                )
+            )
+
+
+@dataclass(frozen=True)
+class NegativeCallResult:
+    """One deterministic, evidence-gated negative test case (docs/43-negative
+    -tests-schema-validation-severity.md) - always derived from a real prior
+    fact this same session already observed (a schema-derived valid body
+    that actually worked, or a real id resolved from evidence), never a
+    guess. Kept deliberately separate from `ApiCallResult` rather than mixed
+    into `ApiTestResult.calls`: here `status == CALL_PASS` means "the target
+    correctly rejected bad input" and `CALL_FAIL` means "it incorrectly
+    accepted bad input, or crashed" - the exact inverse of what those same
+    constants mean for a normal `ApiCallResult`, so folding the two together
+    would make every existing renderer misread this one silently.
+
+    `raw_call` is the real, underlying `ApiCallResult` this case's own HTTP
+    call actually produced - full detail (response_sample, error, etc.) is
+    always available there rather than duplicated onto this shape.
+    """
+
+    endpoint: ApiEndpoint
+    case_name: str
+    expected: str
+    status: str
+    actual_status_code: Optional[int] = None
+    actual_summary: str = ""
+    severity: str = ""
+    raw_call: Optional[ApiCallResult] = None
+    # docs/45: mirrors `ApiCallResult.synthetic`/`synthetic_fields` - `True`
+    # when the *positive* call this negative case was derived from was
+    # itself synthetic (its body/path used an invented value), so a
+    # negative-case verdict is never presented with more confidence than
+    # the positive evidence it was actually built from.
+    synthetic: bool = False
+    synthetic_fields: Tuple[str, ...] = ()
+
+    def __post_init__(self):
+        if self.status not in CALL_STATUSES:
+            raise ValueError(
+                "NegativeCallResult({!r} {!r} {!r}) has an unrecognized status {!r}".format(
+                    self.endpoint.method, self.endpoint.path, self.case_name, self.status
+                )
+            )
+
+
+@dataclass(frozen=True)
+class SchemaValidationResult:
+    """Whether one GET endpoint's real, already-captured 2xx response
+    (`ApiCallResult.response_json`) actually matches its own declared
+    OpenAPI response schema - a pure check over data this session already
+    has, never a new HTTP call. `status` is `CALL_SKIPPED` (never guessed
+    pass/fail) whenever no response schema is declared for that operation.
+    Deliberately never flips the originating `ApiCallResult.status` - a
+    schema mismatch is additional information alongside an existing PASS,
+    never a retroactive fail.
+    """
+
+    endpoint: ApiEndpoint
+    status: str
+    missing_fields: Tuple[str, ...] = ()
+    type_mismatches: Tuple[str, ...] = ()
+    severity: str = ""
+    reason: str = ""
+
+    def __post_init__(self):
+        if self.status not in CALL_STATUSES:
+            raise ValueError(
+                "SchemaValidationResult({!r} {!r}) has an unrecognized status {!r}".format(
                     self.endpoint.method, self.endpoint.path, self.status
                 )
             )
@@ -190,6 +308,8 @@ class ApiTestResult:
     total_duration: float = 0.0
     warnings: Tuple[str, ...] = field(default_factory=tuple)
     server_log_tail: str = ""
+    negative_calls: Tuple[NegativeCallResult, ...] = ()
+    schema_validations: Tuple[SchemaValidationResult, ...] = ()
 
     def __post_init__(self):
         if self.server_status not in SERVER_STATUSES:

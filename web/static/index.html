@@ -123,6 +123,14 @@
   .run-stats .label { font-size: 0.6875rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
   .run-stats .value { font-size: 0.875rem; font-weight: 700; }
 
+  .progress-wrap { margin-bottom: 1.25rem; }
+  .progress-wrap.hidden { display: none; }
+  .progress-head { display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--muted); margin-bottom: 0.3rem; }
+  .progress-head .count { font-weight: 700; color: var(--text); }
+  .progress-track { height: 0.5rem; border-radius: 999px; background: var(--gray-bg); overflow: hidden; }
+  .progress-fill { height: 100%; background: var(--accent); border-radius: 999px; transition: width 0.3s ease; width: 0%; }
+  .progress-label { margin-top: 0.3rem; font-size: 0.75rem; color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
+
   .pipeline { display: flex; align-items: flex-start; margin-bottom: 1.5rem; }
   .step { display: flex; flex-direction: column; align-items: center; flex: 1; position: relative; }
   .step .node {
@@ -174,6 +182,7 @@
   .badge.b-5xx, .badge.error { color: var(--red-fg); background: var(--red-bg); }
   .badge.b-noresponse { color: var(--darkred-fg); background: var(--darkred-bg); }
   .badge.b-skipped, .badge.info, .badge.style, .badge.note { color: var(--gray-fg); background: var(--gray-bg); }
+  .badge.b-synthetic { color: var(--amber-fg); background: var(--amber-bg); }
   .result-card .detail { margin-top: 0.35rem; font-size: 0.75rem; color: var(--muted); }
   .result-card .timing { font-size: 0.75rem; color: var(--muted); margin-left: auto; }
 
@@ -184,6 +193,7 @@
   .summary-grid .ic.green { background: var(--green-bg); color: var(--green-fg); }
   .summary-grid .ic.red { background: var(--red-bg); color: var(--red-fg); }
   .summary-grid .ic.gray { background: var(--gray-bg); color: var(--gray-fg); }
+  .summary-grid .ic.amber { background: var(--amber-bg); color: var(--amber-fg); }
   .summary-grid .lbl { font-size: 0.75rem; color: var(--muted); display: block; }
   .summary-grid .num { font-size: 1.05rem; font-weight: 700; }
 
@@ -296,6 +306,14 @@
               <div><span class="label">Current Step</span><br><span class="value" id="currentStepVal">&mdash;</span></div>
             </div>
           </div>
+          <div class="progress-wrap hidden" id="progressWrap">
+            <div class="progress-head">
+              <span>Testing endpoints&hellip;</span>
+              <span class="count" id="progressCount">0 / 0</span>
+            </div>
+            <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+            <div class="progress-label" id="progressLabel">&nbsp;</div>
+          </div>
           <div class="pipeline" id="pipeline"></div>
           <pre id="terminal"></pre>
         </div>
@@ -320,6 +338,14 @@
         <h2>API Test Results <span style="float:right;font-weight:400;color:var(--muted);font-size:0.8125rem" id="resultsCount"></span></h2>
         <div id="apiWarnings"></div>
         <div id="resultCards"></div>
+      </div>
+
+      <div class="panel hidden" id="negativeTestsPanel">
+        <h2>Negative Tests <span style="float:right;font-weight:400;color:var(--muted);font-size:0.8125rem" id="negativeTestsCount"></span></h2>
+        <table id="negativeTestsTable">
+          <thead><tr><th>Method</th><th>Path</th><th>Case</th><th>Expected</th><th>Actual</th><th>Result</th><th>Severity</th></tr></thead>
+          <tbody></tbody>
+        </table>
       </div>
 
       <div class="panel hidden" id="summaryPanel">
@@ -523,6 +549,17 @@ function severityBadgeClass(sev) {
   return "info";
 }
 
+// Distinct from severityBadgeClass above (static-analysis error/warning/info)
+// - this is the API engine's own critical/high/medium/low scale
+// (qa_agent/api_qa/analysis.py), reusing the same badge color buckets
+// resultBucket already established rather than inventing a new palette.
+function apiSeverityBadgeClass(sev) {
+  if (sev === "critical") return "b-5xx";
+  if (sev === "high") return "b-4xx";
+  if (sev === "medium") return "b-3xx";
+  return "b-skipped";
+}
+
 function renderDiscovery(discovery) {
   const body = document.getElementById("discoveryBody");
   const project = discovery.project;
@@ -599,7 +636,7 @@ function applyPlanResults(api) {
     const c = byKey[key];
     if (!c) { cell.innerHTML = '<span class="badge b-skipped">NOT TESTED</span>'; continue; }
     const b = resultBucket(c);
-    cell.innerHTML = '<span class="badge ' + b.cls + '">' + b.label + '</span>';
+    cell.innerHTML = '<span class="badge ' + b.cls + '">' + esc(c.classification || b.label) + '</span>';
   }
 }
 
@@ -620,12 +657,15 @@ function renderResultCards(api, diagnoses) {
   }
   const diagByKey = {};
   for (const d of (diagnoses || [])) diagByKey[d.method + " " + d.path] = d;
+  const svByKey = {};
+  for (const sv of (api.schema_validations || [])) svByKey[sv.method + " " + sv.path] = sv;
 
   for (const c of api.calls) {
     const b = resultBucket(c);
     const detail = c.error || c.reason || "";
     const evidence = c.resolution_evidence ? "Used: " + c.resolution_evidence : "";
     const diag = diagByKey[c.method + " " + c.path];
+    const sv = svByKey[c.method + " " + c.path];
     const card = document.createElement("div");
     card.className = "result-card";
     card.innerHTML =
@@ -633,41 +673,151 @@ function renderResultCards(api, diagnoses) {
         '<span class="method">' + esc(c.method) + '</span>' +
         '<span class="path">' + esc(c.path) + '</span>' +
         '<span class="code">' + esc(c.status_code == null ? "–" : c.status_code) + '</span>' +
-        '<span class="badge ' + b.cls + '">' + b.label + '</span>' +
+        '<span class="badge ' + b.cls + '">' + esc(c.classification || b.label) + '</span>' +
+        (c.severity ? '<span class="badge ' + apiSeverityBadgeClass(c.severity) + '" title="Severity">' + esc(c.severity.toUpperCase()) + '</span>' : '') +
+        (sv && sv.status !== "skipped" ? '<span class="badge ' + (sv.status === "pass" ? "b-2xx" : "b-4xx") + '" title="Response schema validation">SCHEMA ' + (sv.status === "pass" ? "OK" : "MISMATCH") + '</span>' : '') +
+        (c.synthetic ? '<span class="badge b-synthetic" title="Built from invented placeholder data, not real evidence: ' + esc((c.synthetic_fields || []).join(", ")) + '">SYNTHETIC DATA</span>' : '') +
       '</div>' +
       (c.response_time_ms ? '<div class="timing" style="margin-top:0.25rem">' + Math.round(c.response_time_ms) + 'ms</div>' : '') +
       (detail ? '<div class="detail">' + esc(detail) + '</div>' : '') +
       (evidence ? '<div class="detail">' + esc(evidence) + '</div>' : '') +
-      (diag ? _diagnosisBlock(diag) : '');
+      (c.status === "fail" && c.expected ? _expectedActualBlock(c) : '') +
+      (sv && sv.status === "fail" ? _schemaMismatchBlock(sv) : '') +
+      (diag ? _diagnosisBlock(diag, c) : '');
     wrap.appendChild(card);
   }
 }
 
-function _diagnosisBlock(diag) {
+function _expectedActualBlock(c) {
+  return '<div class="detail" style="margin-top:0.4rem">' +
+    '<strong>Expected:</strong> ' + esc(c.expected) + '<br>' +
+    '<strong>Actual:</strong> ' + esc(c.actual) +
+    '</div>';
+}
+
+function _schemaMismatchBlock(sv) {
+  const parts = [];
+  if (sv.missing_fields && sv.missing_fields.length) parts.push('missing field(s): ' + sv.missing_fields.join(", "));
+  if (sv.type_mismatches && sv.type_mismatches.length) parts.push(sv.type_mismatches.join("; "));
+  return '<div class="detail" style="margin-top:0.4rem;color:var(--amber-fg)">' +
+    '&#9888; Response does not match its declared schema' + (parts.length ? " - " + esc(parts.join(" · ")) : "") +
+    '</div>';
+}
+
+function renderProgress(done, total, label) {
+  const wrap = document.getElementById("progressWrap");
+  wrap.classList.remove("hidden");
+  document.getElementById("progressCount").textContent = done + " / " + total;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  document.getElementById("progressFill").style.width = pct + "%";
+  document.getElementById("progressLabel").textContent = label || " ";
+}
+
+function hideProgress() {
+  document.getElementById("progressWrap").classList.add("hidden");
+  document.getElementById("progressFill").style.width = "0%";
+  document.getElementById("progressCount").textContent = "0 / 0";
+  document.getElementById("progressLabel").textContent = " ";
+}
+
+// Live progress (docs/44-live-progress.md): /api/analyze/start returns a
+// job id immediately; this polls /api/analyze/status/<id> until the real
+// background run finishes, updating the progress bar from each real,
+// already-known (done, total, label) the server reports - never a guessed
+// or animated percentage. Returns the same {ok, data} shape the old direct
+// `fetch("/api/analyze")` call produced, so everything downstream in run()
+// that already reads resp.ok/data is completely unaffected.
+async function runAnalyzeJob(form) {
+  const startResp = await fetch("/api/analyze/start", { method: "POST", body: form });
+  const startData = await startResp.json();
+  if (!startResp.ok) return { ok: false, data: startData };
+  const jobId = startData.job_id;
+
+  while (true) {
+    await new Promise(r => setTimeout(r, 800));
+    let statusResp, statusData;
+    try {
+      statusResp = await fetch("/api/analyze/status/" + jobId);
+      statusData = await statusResp.json();
+    } catch (err) {
+      return { ok: false, data: { error: "lost connection while polling for progress: " + String(err) } };
+    }
+    if (!statusResp.ok) return { ok: false, data: statusData };
+    renderProgress(statusData.done, statusData.total, statusData.label);
+    if (statusData.status === "running") continue;
+    if (statusData.status === "done") return { ok: true, data: statusData.result };
+    return { ok: false, data: { error: statusData.error || "analysis failed", timed_out: !!statusData.timed_out } };
+  }
+}
+
+function renderNegativeTests(api) {
+  const panel = document.getElementById("negativeTestsPanel");
+  const cases = (api && api.negative_calls) || [];
+  if (cases.length === 0) {
+    panel.classList.add("hidden");
+    return;
+  }
+  panel.classList.remove("hidden");
+  document.getElementById("negativeTestsCount").textContent = cases.length + " case(s)";
+  const tbody = document.querySelector("#negativeTestsTable tbody");
+  tbody.innerHTML = "";
+  for (const nc of cases) {
+    const tr = document.createElement("tr");
+    const b = nc.status === "pass" ? { cls: "b-2xx", label: "PASS" } : { cls: "b-4xx", label: "FAIL" };
+    tr.innerHTML =
+      '<td><span class="method">' + esc(nc.method) + '</span></td>' +
+      '<td class="mono">' + esc(nc.path) + '</td>' +
+      '<td>' + esc(nc.case_name) + '</td>' +
+      '<td>' + esc(nc.expected) + '</td>' +
+      '<td>' + esc(nc.actual_summary || "") + '</td>' +
+      '<td><span class="badge ' + b.cls + '">' + b.label + '</span></td>' +
+      '<td>' + (nc.severity ? '<span class="badge ' + apiSeverityBadgeClass(nc.severity) + '">' + esc(nc.severity.toUpperCase()) + '</span>' : '') +
+        (nc.synthetic ? ' <span class="badge b-synthetic" title="Derived from a positive call that used synthetic data">SYNTHETIC</span>' : '') + '</td>';
+    tbody.appendChild(tr);
+  }
+}
+
+function _diagnosisBlock(diag, call) {
+  // docs/45-synthetic-mutation-testing.md: a FAIL built from synthetic
+  // (invented) data must never be diagnosed with the same confidence as
+  // one built from real evidence - the AI write-up says so explicitly,
+  // right alongside the diagnosis itself, never left to the SYNTHETIC DATA
+  // badge on the card above to carry that context alone.
+  const syntheticNote = (call && call.synthetic)
+    ? '<div class="detail" style="color:var(--amber-fg)">&#9888; This call used synthetic (invented) data for: ' +
+      esc((call.synthetic_fields || []).join(", ")) + ' - treat this diagnosis as lower-confidence than one against real evidence.</div>'
+    : '';
   if (diag.diagnosis_status !== "diagnosed") {
     return '<div class="detail" style="margin-top:0.5rem;color:var(--amber-fg)">' +
-      '&#129302; AI diagnosis: ' + esc(diag.summary || diag.diagnosis_status) + '</div>';
+      '&#129302; AI diagnosis: ' + esc(diag.summary || diag.diagnosis_status) + '</div>' + syntheticNote;
   }
   return '<div style="margin-top:0.6rem;padding-top:0.6rem;border-top:1px dashed var(--border)">' +
     '<div style="font-size:0.75rem;font-weight:700;color:var(--accent)">&#129302; AI diagnosis (' + esc(diag.model) + ')</div>' +
+    syntheticNote +
     '<div class="detail" style="margin-top:0.25rem"><strong>Root cause:</strong> ' + esc(diag.likely_root_cause || diag.summary) + '</div>' +
     (diag.recommended_action ? '<div class="detail"><strong>Suggested fix:</strong> ' + esc(diag.recommended_action) + '</div>' : '') +
     '</div>';
 }
 
 function renderSummary(api) {
-  const counts = { pass: 0, fail: 0, skipped: 0 };
-  for (const c of api.calls) {
-    if (c.status === "pass") counts.pass++;
-    else if (c.status === "skipped") counts.skipped++;
-    else counts.fail++;
-  }
+  // docs/45-synthetic-mutation-testing.md: real-evidence and synthetic
+  // outcomes are two separate tallies computed once, server-side, by
+  // render.py's own `_summary_counts` (`api.summary`) - never recomputed
+  // or re-blended here, so the web view can't silently drift from the
+  // CLI/CSV/HTML reports' own real-vs-synthetic split.
+  const summary = api.summary || { real_evidence: { pass: 0, fail: 0, skipped: 0 }, synthetic: { pass: 0, fail: 0 } };
+  const real = summary.real_evidence, synth = summary.synthetic;
+  const hasSynthetic = (synth.pass || 0) + (synth.fail || 0) > 0;
   document.getElementById("summaryPanel").classList.remove("hidden");
   document.getElementById("summaryGrid").innerHTML =
     '<div class="item"><div class="ic blue">&#128203;</div><div><span class="lbl">Total Endpoints</span><span class="num">' + api.calls.length + '</span></div></div>' +
-    '<div class="item"><div class="ic green">&#10003;</div><div><span class="lbl">Passed</span><span class="num">' + counts.pass + '</span></div></div>' +
-    '<div class="item"><div class="ic red">&#10007;</div><div><span class="lbl">Failed</span><span class="num">' + counts.fail + '</span></div></div>' +
-    '<div class="item"><div class="ic gray">&#8856;</div><div><span class="lbl">Skipped</span><span class="num">' + counts.skipped + '</span></div></div>' +
+    '<div class="item"><div class="ic green">&#10003;</div><div><span class="lbl">Passed (real evidence)</span><span class="num">' + real.pass + '</span></div></div>' +
+    '<div class="item"><div class="ic red">&#10007;</div><div><span class="lbl">Failed (real evidence)</span><span class="num">' + real.fail + '</span></div></div>' +
+    '<div class="item"><div class="ic gray">&#8856;</div><div><span class="lbl">Skipped</span><span class="num">' + real.skipped + '</span></div></div>' +
+    (hasSynthetic
+      ? '<div class="item"><div class="ic amber">&#9888;</div><div><span class="lbl">Passed (synthetic data)</span><span class="num">' + synth.pass + '</span></div></div>' +
+        '<div class="item"><div class="ic amber">&#9888;</div><div><span class="lbl">Failed (synthetic data)</span><span class="num">' + synth.fail + '</span></div></div>'
+      : '') +
     '<div class="item" style="grid-column:1/-1"><div class="ic gray">&#9201;</div><div><span class="lbl">Total Time</span><span class="num">' + api.total_duration.toFixed(2) + 's</span></div></div>';
 }
 
@@ -697,7 +847,9 @@ async function run() {
   document.getElementById("planPanel").classList.add("hidden");
   document.getElementById("runPanel").classList.remove("hidden");
   document.getElementById("resultsPanel").classList.add("hidden");
+  document.getElementById("negativeTestsPanel").classList.add("hidden");
   document.getElementById("summaryPanel").classList.add("hidden");
+  hideProgress();
   document.getElementById("nextStepsPanel").classList.add("hidden");
   document.getElementById("agentStatusText").textContent = "Running…";
   termLines = [];
@@ -741,13 +893,13 @@ async function run() {
   const stepTimer3 = setTimeout(() => { setStep(3, "API Testing"); termLine("Running API tests…"); }, 2600);
 
   try {
-    const resp = await fetch("/api/analyze", { method: "POST", body: form });
-    const data = await resp.json();
+    const { ok, data } = await runAnalyzeJob(form);
     clearTimeout(stepTimer); clearTimeout(stepTimer2); clearTimeout(stepTimer3);
     stopElapsed();
-    if (!resp.ok) {
+    hideProgress();
+    if (!ok) {
       renderPipeline(0, 0);
-      termLine("Error: " + esc(data.error || resp.statusText), "fail");
+      termLine("Error: " + esc(data.error || "unknown error"), "fail");
       document.getElementById("runTitle").textContent = "Run failed";
       document.getElementById("runSpinner").outerHTML = '<div class="spinner done" style="background:var(--red-bg);color:var(--red-fg)" id="runSpinner">&#10007;</div>';
       document.getElementById("agentStatusText").textContent = "Agent Ready";
@@ -808,11 +960,13 @@ async function run() {
         }
       }
       renderResultCards(api, data.diagnoses);
+      renderNegativeTests(api);
       renderSummary(api);
       applyPlanResults(api);
       renderPipeline(5, null);
     } else {
       termLine('<span class="dim">Live API testing was not requested.</span>');
+      renderNegativeTests(null);
       applyPlanResults(null);
       renderPipeline(4, null);
       document.getElementById("pipeline").querySelectorAll(".step")[2].classList.add("hidden");
@@ -828,6 +982,7 @@ async function run() {
   } catch (err) {
     clearTimeout(stepTimer); clearTimeout(stepTimer2); clearTimeout(stepTimer3);
     stopElapsed();
+    hideProgress();
     termLine("Request failed: " + esc(String(err)), "fail");
     document.getElementById("agentStatusText").textContent = "Agent Ready";
   } finally {

@@ -74,9 +74,10 @@ def _evidence(path, response_json, method="GET"):
 def test_resolve_path_parameter_succeeds_with_real_evidence(suite):
     endpoint = _endpoint(path="/api/users/{user_id}")
     evidence = (_evidence("/api/users", [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]),)
-    concrete, note = resolve_path_parameter(endpoint, evidence)
+    concrete, note, synthetic_field = resolve_path_parameter(endpoint, evidence)
     suite.check("resolves to the real, concrete path", concrete == "/api/users/1")
     suite.check("the evidence trace names the real source", "GET /api/users" in note and "user_id" in note)
+    suite.check("real evidence is never marked synthetic", synthetic_field is None)
 
 
 def test_resolve_path_parameter_prefers_exact_param_name_over_id_fallback(suite):
@@ -84,14 +85,14 @@ def test_resolve_path_parameter_prefers_exact_param_name_over_id_fallback(suite)
     # Real data has BOTH a generic 'id' and the exact 'user_id' field -
     # the exact name must win, never the fallback, when both are present.
     evidence = (_evidence("/api/users", [{"id": 999, "user_id": 1, "name": "Alice"}]),)
-    concrete, note = resolve_path_parameter(endpoint, evidence)
+    concrete, note, _ = resolve_path_parameter(endpoint, evidence)
     suite.check("the exact field name wins over the generic 'id' fallback", concrete == "/api/users/1")
 
 
 def test_resolve_path_parameter_falls_back_to_id_for_id_shaped_param(suite):
     endpoint = _endpoint(path="/api/users/{user_id}")
     evidence = (_evidence("/api/users", [{"id": 7, "name": "Alice"}]),)  # only 'id', no 'user_id'
-    concrete, note = resolve_path_parameter(endpoint, evidence)
+    concrete, note, _ = resolve_path_parameter(endpoint, evidence)
     suite.check("falls back to the generic 'id' field for an _id-shaped param", concrete == "/api/users/7")
 
 
@@ -99,26 +100,29 @@ def test_resolve_path_parameter_never_falls_back_to_id_for_non_id_shaped_param(s
     """The core anti-guessing guarantee: a parameter whose own name does
     not signal it is an identifier (e.g. 'slug') must never be resolved
     from an unrelated 'id' field - that would be a semantic mismatch, not
-    a genuine resolution.
+    a genuine resolution. `allow_synthetic_mutations=False` here to prove
+    the underlying evidence-based resolution itself never guesses,
+    independent of docs/45's own separate synthetic-fallback behavior.
     """
     endpoint = _endpoint(path="/api/articles/{slug}")
     evidence = (_evidence("/api/articles", [{"id": 1, "title": "Hello"}]),)
-    concrete, reason = resolve_path_parameter(endpoint, evidence)
+    concrete, reason, _ = resolve_path_parameter(endpoint, evidence, allow_synthetic_mutations=False)
     suite.check("never resolved from an unrelated 'id' field", concrete is None)
     suite.check("a clear, honest reason is given", "slug" in reason)
 
 
 def test_resolve_path_parameter_skips_when_no_matching_parent_endpoint_evidence(suite):
     endpoint = _endpoint(path="/api/users/{user_id}")
-    concrete, reason = resolve_path_parameter(endpoint, ())
+    concrete, reason, synthetic_field = resolve_path_parameter(endpoint, (), allow_synthetic_mutations=False)
     suite.check("no evidence at all -> not resolved", concrete is None)
     suite.check("a clear, honest reason is given", "no evidence-based value" in reason)
+    suite.check("no synthetic field reported for a real skip", synthetic_field is None)
 
 
 def test_resolve_path_parameter_skips_when_parent_response_has_no_usable_field(suite):
     endpoint = _endpoint(path="/api/users/{user_id}")
     evidence = (_evidence("/api/users", [{"name": "Alice"}]),)  # real list, but no id-shaped field
-    concrete, reason = resolve_path_parameter(endpoint, evidence)
+    concrete, reason, _ = resolve_path_parameter(endpoint, evidence, allow_synthetic_mutations=False)
     suite.check("no usable field -> not resolved, never guessed", concrete is None)
     suite.check("a clear reason names the real parent endpoint", "GET /api/users" in reason)
 
@@ -130,14 +134,14 @@ def test_resolve_path_parameter_rejects_boolean_values(suite):
     """
     endpoint = _endpoint(path="/api/users/{user_id}")
     evidence = (_evidence("/api/users", [{"id": True, "name": "Alice"}]),)
-    concrete, _ = resolve_path_parameter(endpoint, evidence)
+    concrete, _, _ = resolve_path_parameter(endpoint, evidence, allow_synthetic_mutations=False)
     suite.check("a boolean is never treated as a real id value", concrete is None)
 
 
 def test_resolve_path_parameter_rejects_multi_param_paths(suite):
     endpoint = _endpoint(path="/api/users/{user_id}/posts/{post_id}")
     evidence = (_evidence("/api/users/{user_id}/posts", [{"id": 1}]),)
-    concrete, reason = resolve_path_parameter(endpoint, evidence)
+    concrete, reason, _ = resolve_path_parameter(endpoint, evidence)
     suite.check("more than one dynamic segment is not attempted", concrete is None)
     suite.check("a clear reason names the real limitation", "one dynamic segment" in reason)
 
@@ -145,7 +149,7 @@ def test_resolve_path_parameter_rejects_multi_param_paths(suite):
 def test_resolve_path_parameter_rejects_non_trailing_param(suite):
     endpoint = _endpoint(path="/api/users/{user_id}/profile", dynamic=True)
     evidence = (_evidence("/api/users", [{"id": 1}]),)
-    concrete, reason = resolve_path_parameter(endpoint, evidence)
+    concrete, reason, _ = resolve_path_parameter(endpoint, evidence)
     suite.check("a non-trailing dynamic segment is not resolved by this strategy", concrete is None)
 
 
@@ -157,9 +161,10 @@ def _openapi_doc(paths=None, schemas=None):
 
 def test_build_request_body_empty_when_no_body_declared(suite):
     schema_doc = _openapi_doc(paths={"/api/reset": {"post": {}}})
-    body, note = build_request_body(schema_doc, "POST", "/api/reset")
+    body, note, synthetic_fields = build_request_body(schema_doc, "POST", "/api/reset")
     suite.check("an empty, valid body is constructed", body == {})
     suite.check("evidence explains why", "no request body" in note)
+    suite.check("nothing synthesized", synthetic_fields == ())
 
 
 def test_build_request_body_uses_schema_defaults(suite):
@@ -172,12 +177,18 @@ def test_build_request_body_uses_schema_defaults(suite):
             "properties": {"name": {"type": "string", "default": "test"}},
         }},
     )
-    body, note = build_request_body(schema_doc, "POST", "/api/users")
+    body, note, synthetic_fields = build_request_body(schema_doc, "POST", "/api/users")
     suite.check("the real schema default is used", body == {"name": "test"})
     suite.check("evidence names the real source", "schema defaults" in note)
+    suite.check("a real default is never marked synthetic", synthetic_fields == ())
 
 
-def test_build_request_body_skipped_when_required_field_has_no_default(suite):
+def test_build_request_body_skipped_when_required_field_has_no_default_and_synthetic_disallowed(suite):
+    """`allow_synthetic_mutations=False` reproduces the original,
+    evidence-only behavior exactly (docs/45's own opt-out guarantee) -
+    the default (`True`) behavior is proven separately in
+    test_api_qa_synthetic_mutations.py.
+    """
     schema_doc = _openapi_doc(
         paths={"/api/users": {"post": {"requestBody": {"content": {"application/json": {
             "schema": {"$ref": "#/components/schemas/UserCreate"},
@@ -187,21 +198,27 @@ def test_build_request_body_skipped_when_required_field_has_no_default(suite):
             "properties": {"name": {"type": "string"}, "email": {"type": "string"}},
         }},
     )
-    body, reason = build_request_body(schema_doc, "POST", "/api/users")
+    body, reason, synthetic_fields = build_request_body(
+        schema_doc, "POST", "/api/users", allow_synthetic_mutations=False,
+    )
     suite.check("no body is invented when a required field has no default", body is None)
     suite.check("the real missing fields are named", "'name'" in reason and "'email'" in reason)
+    suite.check("nothing synthesized on the skip path", synthetic_fields == ())
 
 
 def test_build_request_body_skipped_when_no_schema_available(suite):
-    body, reason = build_request_body(None, "POST", "/api/users")
-    suite.check("no schema at all -> skipped", body is None)
+    body, reason, synthetic_fields = build_request_body(None, "POST", "/api/users")
+    suite.check("no schema at all, and no endpoint to fall back on -> skipped", body is None)
     suite.check("a clear reason is given", "no OpenAPI schema" in reason)
+    suite.check("nothing synthesized on the skip path", synthetic_fields == ())
 
 
 def test_build_request_body_skipped_when_operation_not_in_schema(suite):
     schema_doc = _openapi_doc(paths={})
-    body, reason = build_request_body(schema_doc, "POST", "/api/users")
-    suite.check("an operation absent from the real schema is not attempted", body is None)
+    body, reason, synthetic_fields = build_request_body(schema_doc, "POST", "/api/users")
+    suite.check("an operation absent from the real schema, with no endpoint to fall back on, "
+                "is not attempted", body is None)
+    suite.check("nothing synthesized on the skip path", synthetic_fields == ())
 
 
 # --- http_client extensions ---------------------------------------------
@@ -406,16 +423,28 @@ def test_dynamic_get_resolved_from_prior_evidence_end_to_end(suite):
                 "GET /api/users" in by_path["/api/users/{user_id}"].resolution_evidence)
 
 
-def test_dynamic_get_skipped_without_evidence(suite):
+def test_dynamic_get_skipped_without_evidence_when_synthetic_disallowed(suite):
+    """`allow_synthetic_mutations=False` reproduces the original
+    evidence-only skip exactly - the default (`True`) behavior (a
+    synthetic id is used instead of skipping) is proven separately in
+    test_api_qa_synthetic_mutations.py.
+    """
     detail_endpoint = ApiEndpoint(method="GET", path="/api/users/{user_id}", source_file="x", dynamic=True)
     calls = _with_fake_urlopen(
-        _sequenced_urlopen(), lambda: resolve_and_execute((detail_endpoint,), "http://x", timeout=5),
+        _sequenced_urlopen(),
+        lambda: resolve_and_execute((detail_endpoint,), "http://x", timeout=5, allow_synthetic_mutations=False),
     )
     suite.check("skipped, never guessed", calls[0].status == CALL_SKIPPED)
     suite.check("a clear reason is given", "no evidence-based value" in calls[0].reason)
+    suite.check("not marked synthetic", calls[0].synthetic is False)
 
 
-def test_post_skipped_when_no_safe_body_exists(suite):
+def test_post_skipped_when_no_safe_body_exists_and_synthetic_disallowed(suite):
+    """`allow_synthetic_mutations=False` reproduces the original
+    evidence-only skip exactly - the default (`True`) behavior (the
+    missing fields are synthesized instead of skipping) is proven
+    separately in test_api_qa_synthetic_mutations.py.
+    """
     post_endpoint = ApiEndpoint(method="POST", path="/api/users", source_file="x", dynamic=False)
 
     def openapi_fake(request):
@@ -429,10 +458,12 @@ def test_post_skipped_when_no_safe_body_exists(suite):
         return _FakeResponse(200, json.dumps(doc).encode("utf-8"), {"Content-Type": "application/json"})
 
     calls = _with_fake_urlopen(
-        _sequenced_urlopen(openapi_fake), lambda: resolve_and_execute((post_endpoint,), "http://x", timeout=5),
+        _sequenced_urlopen(openapi_fake),
+        lambda: resolve_and_execute((post_endpoint,), "http://x", timeout=5, allow_synthetic_mutations=False),
     )
     suite.check("skipped, never given an invented body", calls[0].status == CALL_SKIPPED)
     suite.check("a clear, specific reason is given", "no deterministic request body" in calls[0].reason)
+    suite.check("not marked synthetic", calls[0].synthetic is False)
 
 
 def test_mutation_executed_when_safe_deterministic_input_available(suite):
@@ -523,8 +554,9 @@ def test_nextjs_dynamic_segment_is_never_resolved_by_this_module(suite):
     """
     nextjs_endpoint = ApiEndpoint(method="GET", path="/api/users/[id]", source_file="x", dynamic=True)
     evidence = (_evidence("/api/users", [{"id": 1}]),)
-    concrete, reason = resolve_path_parameter(nextjs_endpoint, evidence)
+    concrete, reason, synthetic_field = resolve_path_parameter(nextjs_endpoint, evidence)
     suite.check("a [id]-style segment is never resolved (curly-brace syntax only)", concrete is None)
+    suite.check("never marked synthetic either - not attempted at all", synthetic_field is None)
 
 
 def test_run_api_qa_end_to_end_still_works_for_nextjs(suite):
@@ -656,7 +688,7 @@ if __name__ == "__main__":
         test_resolve_path_parameter_rejects_non_trailing_param,
         test_build_request_body_empty_when_no_body_declared,
         test_build_request_body_uses_schema_defaults,
-        test_build_request_body_skipped_when_required_field_has_no_default,
+        test_build_request_body_skipped_when_required_field_has_no_default_and_synthetic_disallowed,
         test_build_request_body_skipped_when_no_schema_available,
         test_build_request_body_skipped_when_operation_not_in_schema,
         test_call_endpoint_populates_response_json_on_pass,
@@ -669,8 +701,8 @@ if __name__ == "__main__":
         test_connection_failure_classified_as_fail,
         test_404_is_not_automatically_treated_as_unexpected,
         test_dynamic_get_resolved_from_prior_evidence_end_to_end,
-        test_dynamic_get_skipped_without_evidence,
-        test_post_skipped_when_no_safe_body_exists,
+        test_dynamic_get_skipped_without_evidence_when_synthetic_disallowed,
+        test_post_skipped_when_no_safe_body_exists_and_synthetic_disallowed,
         test_mutation_executed_when_safe_deterministic_input_available,
         test_execution_order_resolves_dynamic_get_before_mutation_consumes_the_same_evidence,
         test_results_returned_in_same_order_as_input_endpoints,

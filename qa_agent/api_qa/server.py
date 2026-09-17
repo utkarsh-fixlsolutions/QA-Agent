@@ -548,8 +548,23 @@ def start_and_wait_ready(command, cwd, timeout, env=None, ready_patterns=DEFAULT
             lines.append(line)
             if not line.lstrip().startswith(">"):
                 lowered = line.lower()
-                if any(p in lowered for p in ready_patterns):
+                if matched_line is None and any(p in lowered for p in ready_patterns):
                     matched_line = line.strip()
+                # docs/46-ready-signal-false-positive-fix.md: a bare
+                # keyword match (above) is remembered, never trusted by
+                # itself to stop watching - a wrapper tool (nodemon,
+                # ts-node-dev, ...) commonly prints its own ready-shaped
+                # line well before the real child process it spawns has
+                # actually bound a port, and stopping right there means
+                # the real app's own, authoritative URL/port line - often
+                # printed moments later - is never even seen, leaving
+                # nothing but a guessed port for every real call to fail
+                # against. Only a real, observed URL/port (the strongest
+                # evidence this loop can get) is allowed to end the wait
+                # early; a keyword-only match still lets the loop keep
+                # reading, right up to the same overall `timeout`, in case
+                # the real line is still coming.
+                if _observed_base_url("".join(lines)):
                     break
         if proc.poll() is not None:
             crashed = True

@@ -1,6 +1,6 @@
 """API QA v1's one public entry point (docs/30-api-qa-v1.md;
 docs/33-api-qa-deterministic-verification.md): `run_api_qa(context, root,
-config=None)`.
+config=None, on_progress=None)`.
 
 Composition, nothing more: `discovery.py` finds real endpoints, `server.py`
 starts (and always stops) a real dev server, `resolution.py` decides which
@@ -28,13 +28,14 @@ from typing import Optional
 from . import server as _server
 from .discovery import discover_api_endpoints
 from .http_client import DEFAULT_TIMEOUT_SECONDS as _DEFAULT_REQUEST_TIMEOUT
-from .resolution import resolve_and_execute
+from .resolution import generate_and_execute_negative_cases, resolve_and_execute, validate_response_schemas
 from .models import (
     CALL_SKIPPED,
     SERVER_CRASHED,
     SERVER_SKIPPED,
     SERVER_STARTED,
     SERVER_START_FAILED,
+    SERVER_UNREACHABLE,
     ApiCallResult,
     ApiTestResult,
 )
@@ -61,6 +62,14 @@ class ApiQaConfig:
     # calls against; see `server.wait_until_connectable`'s own docstring
     # for the real race this closes.
     connect_probe_timeout: float = _server.DEFAULT_CONNECT_PROBE_TIMEOUT
+    # docs/45-synthetic-mutation-testing.md: whether a mutating call or a
+    # dynamic path parameter may fall back to a clearly-labeled synthetic
+    # value (see resolution.py's own `DEFAULT_ALLOW_SYNTHETIC_MUTATIONS`)
+    # when no real evidence/schema default exists, rather than honestly
+    # skipping. `True` by default so POST/PUT/PATCH/DELETE testing actually
+    # exercises the target out of the box; set `False` to reproduce the
+    # original strict evidence-only behavior exactly.
+    allow_synthetic_mutations: bool = True
 
 
 DEFAULT_CONFIG = ApiQaConfig()
@@ -76,22 +85,67 @@ def _skip_all(endpoints, reason):
     )
 
 
+def _combine_progress(on_progress):
+    """Three phase-scoped callbacks (`resolve_and_execute`'s primary calls,
+    then negative cases, then schema validation) combined into one overall
+    `(done, total, label)` stream for a single caller-facing `on_progress`
+    (docs/44-live-progress.md). Each phase's own `total` only becomes known
+    to the caller once that phase actually starts reporting (negative/
+    schema totals are not knowable before the primary calls they depend on
+    have finished) - so the overall `total` only ever grows, in step with
+    real, newly-known work, never shrinks and never estimates ahead of what
+    is actually known. `(None, None, None)` when `on_progress` itself is
+    `None` - every phase then gets a real `None` too, its own already-
+    documented no-op default.
+    """
+    if on_progress is None:
+        return None, None, None
+
+    state = {"primary_total": 0, "primary_done": 0,
+              "negative_total": 0, "negative_done": 0,
+              "schema_total": 0, "schema_done": 0}
+
+    def _emit(label):
+        done = state["primary_done"] + state["negative_done"] + state["schema_done"]
+        total = state["primary_total"] + state["negative_total"] + state["schema_total"]
+        on_progress(done, total, label)
+
+    def primary_cb(done, total, label):
+        state["primary_total"], state["primary_done"] = total, done
+        _emit(label)
+
+    def negative_cb(done, total, label):
+        state["negative_total"], state["negative_done"] = total, done
+        _emit(label)
+
+    def schema_cb(done, total, label):
+        state["schema_total"], state["schema_done"] = total, done
+        _emit(label)
+
+    return primary_cb, negative_cb, schema_cb
+
+
 def _resolve_base_url(handle, warnings):
     """Prefer a real URL, or a real "port NNNN" log line, actually observed
     in the server's own startup output (`server._observed_base_url`); only
     fall back to the single most common default port when neither was ever
     observed, and say so explicitly in `warnings` - never silently assume.
+
+    Returns `(base_url, was_guessed)` - `was_guessed` (docs/46) lets a
+    later, real connection failure against this URL say plainly whether it
+    was really observed evidence or an unconfirmed guess, rather than
+    leaving that distinction buried in an earlier, separate warning.
     """
     if handle.base_url:
-        return handle.base_url
+        return handle.base_url, False
     warnings.append(
         "server startup logs did not include a recognizable URL or 'port <number>' line; "
         "assuming the common default {}".format(_DEFAULT_FALLBACK_URL)
     )
-    return _DEFAULT_FALLBACK_URL
+    return _DEFAULT_FALLBACK_URL, True
 
 
-def run_api_qa(context, root, config=None):
+def run_api_qa(context, root, config=None, on_progress=None):
     config = config or DEFAULT_CONFIG
     root = Path(root)
     started_at = _now()
@@ -147,18 +201,57 @@ def run_api_qa(context, root, config=None):
                 server_log_tail="".join(handle.logs)[-_server.MAX_LOG_TAIL_CHARS:],
             )
 
-        base_url = _resolve_base_url(handle, warnings)
+        base_url, base_url_was_guessed = _resolve_base_url(handle, warnings)
         if not _server.wait_until_connectable(base_url, timeout=config.connect_probe_timeout):
-            warnings.append(
-                "server matched a ready signal but never accepted a real TCP connection on {} "
-                "within {:.0f}s - the calls below may still fail for that reason".format(
-                    base_url, config.connect_probe_timeout)
+            # docs/48-fail-fast-and-classification.md: stop the whole run
+            # here, honestly, rather than proceeding to call every endpoint
+            # against a server that was never confirmed reachable (the
+            # earlier docs/39/docs/46 behavior - warn, then proceed anyway -
+            # is deliberately replaced: it produced a wall of real but
+            # uninformative "connection refused" failures that read exactly
+            # like a broken API, when the real problem was upstream, in the
+            # environment itself). State plainly, from the real facts
+            # already known, both *what* the server actually did (matched a
+            # real ready-shaped log line vs. merely stayed alive with none
+            # recognized) and *whether the URL being probed was real
+            # evidence or a guess* - never a fixed sentence regardless of
+            # either fact.
+            signal_desc = (
+                "matched a ready signal" if handle.status == _server.STATUS_READY
+                else "stayed running without a recognized ready signal"
             )
-        calls = resolve_and_execute(endpoints, base_url, config.request_timeout)
+            url_desc = (
+                "an unconfirmed guess - no real port was ever observed in its startup output"
+                if base_url_was_guessed else "a real port actually observed in its startup output"
+            )
+            reason = (
+                "Server is not reachable. Stopping the run. The process {} but never accepted "
+                "a real TCP connection on {} ({}) within {:.0f}s.".format(
+                    signal_desc, base_url, url_desc, config.connect_probe_timeout)
+            )
+            return _finish(
+                endpoints=endpoints,
+                calls=_skip_all(endpoints, reason),
+                server_status=SERVER_UNREACHABLE, server_detail=reason, base_url=base_url,
+                server_log_tail=_server.drain_log_tail(handle),
+            )
+        primary_cb, negative_cb, schema_cb = _combine_progress(on_progress)
+        calls = resolve_and_execute(
+            endpoints, base_url, config.request_timeout, on_progress=primary_cb,
+            allow_synthetic_mutations=config.allow_synthetic_mutations,
+        )
+        negative_calls = generate_and_execute_negative_cases(
+            endpoints, calls, base_url, config.request_timeout, on_progress=negative_cb,
+            allow_synthetic_mutations=config.allow_synthetic_mutations,
+        )
+        schema_validations = validate_response_schemas(
+            endpoints, calls, base_url, config.request_timeout, on_progress=schema_cb,
+        )
         return _finish(
             endpoints=endpoints, calls=calls, server_status=SERVER_STARTED,
             server_detail=handle.reason, base_url=base_url,
             server_log_tail=_server.drain_log_tail(handle),
+            negative_calls=negative_calls, schema_validations=schema_validations,
         )
     finally:
         handle.stop()

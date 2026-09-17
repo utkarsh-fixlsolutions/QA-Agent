@@ -89,6 +89,118 @@ def test_fastapi_discovery_finds_post_route(suite):
         proj.__exit__(None, None, None)
 
 
+# --- request-body-read evidence for endpoints with no live OpenAPI ---------
+# (docs/47-fastapi-body-read-evidence.md): a real, security-conscious
+# FastAPI project (found via a real user report) disables `/openapi.json`
+# entirely, leaving every POST/PUT/PATCH/DELETE endpoint with no fallback
+# at all under docs/45's original "FastAPI already serves live OpenAPI"
+# assumption - this closes that gap the same way the JS/TS strategies
+# already do, minus field-name extraction (a real, named scope boundary;
+# see `_reads_request_body_python`'s own docstring).
+
+MAIN_PY_PYDANTIC_BODY = (
+    '"""demo"""\n'
+    "from fastapi import FastAPI\n"
+    "from .models import UserCreate\n"
+    "app = FastAPI()\n\n"
+    '@app.get("/health")\n'
+    "def health():\n"
+    '    return {"status": "ok"}\n\n'
+    '@app.post("/api/users")\n'
+    "def create_user(payload: UserCreate):\n"
+    "    return payload\n"
+)
+
+MAIN_PY_REQUEST_JSON_BODY = (
+    '"""demo"""\n'
+    "from fastapi import FastAPI, Request\n"
+    "app = FastAPI()\n\n"
+    '@app.post("/api/users")\n'
+    "async def create_user(request: Request):\n"
+    "    body = await request.json()\n"
+    "    return body\n"
+)
+
+MAIN_PY_NO_BODY_EVIDENCE = (
+    '"""demo"""\n'
+    "from fastapi import FastAPI\n"
+    "app = FastAPI()\n\n"
+    '@app.delete("/api/users/{user_id}")\n'
+    "def delete_user(user_id: int):\n"
+    "    return {}\n"
+)
+
+
+def test_fastapi_discovery_detects_pydantic_model_body_parameter(suite):
+    context, proj = _context_for({"requirements.txt": _fastapi_requirements(), "app/main.py": MAIN_PY_PYDANTIC_BODY})
+    try:
+        endpoints, _ = discover_api_endpoints(context, proj.path)
+        post_users = next(e for e in endpoints if e.method == "POST" and e.path == "/api/users")
+        suite.check("a real Pydantic-model-shaped parameter is recognized as body-reading evidence",
+                     post_users.reads_request_body is True)
+        suite.check("no field names are extracted - a named scope boundary, not a guess",
+                     post_users.body_field_hints == ())
+        health = next(e for e in endpoints if e.method == "GET" and e.path == "/health")
+        suite.check("GET is never marked as reading a body", health.reads_request_body is False)
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_fastapi_discovery_detects_bare_request_json_body(suite):
+    context, proj = _context_for({
+        "requirements.txt": _fastapi_requirements(), "app/main.py": MAIN_PY_REQUEST_JSON_BODY,
+    })
+    try:
+        endpoints, _ = discover_api_endpoints(context, proj.path)
+        post_users = next(e for e in endpoints if e.method == "POST" and e.path == "/api/users")
+        suite.check("a bare 'await request.json()' read is recognized",
+                     post_users.reads_request_body is True)
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_fastapi_discovery_no_body_evidence_when_none_exists(suite):
+    context, proj = _context_for({
+        "requirements.txt": _fastapi_requirements(), "app/main.py": MAIN_PY_NO_BODY_EVIDENCE,
+    })
+    try:
+        endpoints, _ = discover_api_endpoints(context, proj.path)
+        delete_user = next(e for e in endpoints if e.method == "DELETE" and e.path == "/api/users/{user_id}")
+        suite.check("a plain int path parameter is never mistaken for a body",
+                     delete_user.reads_request_body is False)
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_fastapi_discovery_body_evidence_scoped_per_route_not_whole_file(suite):
+    """Two routes in one file - the Pydantic-model evidence for one must
+    never leak onto the other, the same per-route windowing guarantee
+    the Express strategy's own equivalent test already proves.
+    """
+    main_py = (
+        '"""demo"""\n'
+        "from fastapi import FastAPI\n"
+        "from .models import UserCreate\n"
+        "app = FastAPI()\n\n"
+        '@app.post("/api/users")\n'
+        "def create_user(payload: UserCreate):\n"
+        "    return payload\n\n"
+        '@app.delete("/api/users/{user_id}")\n'
+        "def delete_user(user_id: int):\n"
+        "    return {}\n"
+    )
+    context, proj = _context_for({"requirements.txt": _fastapi_requirements(), "app/main.py": main_py})
+    try:
+        endpoints, _ = discover_api_endpoints(context, proj.path)
+        post_users = next(e for e in endpoints if e.method == "POST" and e.path == "/api/users")
+        delete_user = next(e for e in endpoints if e.method == "DELETE" and e.path == "/api/users/{user_id}")
+        suite.check("the POST route's own real evidence is recognized", post_users.reads_request_body is True)
+        suite.check("the DELETE route below it never inherits the POST route's own evidence",
+                     delete_user.reads_request_body is False)
+    finally:
+        proj.__exit__(None, None, None)
+
+
 ROUTER_PY = (
     "from fastapi import APIRouter\n"
     "router = APIRouter()\n\n"
@@ -541,11 +653,83 @@ def test_real_end_to_end_fastapi_server_via_discovered_command(suite):
         proj.__exit__(None, None, None)
 
 
+REAL_NO_OPENAPI_APP_PY = (
+    "from fastapi import FastAPI\n"
+    "from pydantic import BaseModel\n\n"
+    "app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)\n\n"
+    "class UserCreate(BaseModel):\n"
+    "    name: str\n"
+    "    email: str\n\n"
+    '@app.get("/health")\n'
+    "def health():\n"
+    '    return {"status": "ok"}\n\n'
+    '@app.post("/api/users")\n'
+    "def create_user(payload: UserCreate):\n"
+    '    return {"id": 1, "name": payload.name}\n'
+)
+
+REAL_NO_OPENAPI_RUN_PY = (
+    "import uvicorn\n\n"
+    'if __name__ == "__main__":\n'
+    '    uvicorn.run("app:app", host="127.0.0.1", port=8124)\n'
+)
+
+
+def test_real_end_to_end_post_actually_fires_with_openapi_disabled(suite):
+    """docs/47-fastapi-body-read-evidence.md: the exact real-world scenario
+    a user report surfaced - a FastAPI app with `/openapi.json` deliberately
+    disabled (a real, common security practice), so `build_request_body`'s
+    original schema-only path finds nothing at all. Before this fix, this
+    POST endpoint's call was always `SKIPPED: no OpenAPI schema is
+    available to construct a request body`, for every such project, no
+    matter how many endpoints it had. Now it actually fires with a
+    synthesized minimal body - since this module deliberately does not
+    parse the Pydantic model's own required fields (a named scope
+    boundary), the server's own real validation correctly rejects the
+    incomplete body with a real 422 - genuine, useful signal (the call was
+    really attempted and really exercised the target's own validation)
+    that a silent skip could never produce.
+    """
+    if not _fastapi_stack_available():
+        suite.check("(skipped: fastapi/uvicorn not importable via this environment's own interpreter)", True)
+        return
+
+    from qa_agent.api_qa import ApiQaConfig, run_api_qa
+    from qa_agent.api_qa.models import CALL_FAIL, CALL_SKIPPED
+
+    context, proj = _context_for({
+        "requirements.txt": _fastapi_requirements(),
+        "run.py": REAL_NO_OPENAPI_RUN_PY,
+        "app.py": REAL_NO_OPENAPI_APP_PY,
+    })
+    try:
+        api_result = run_api_qa(context, proj.path, config=ApiQaConfig(server_startup_timeout=20))
+        suite.check("the real server started", api_result.server_status == "started",
+                    " (was {}: {})".format(api_result.server_status, api_result.server_detail))
+        post_call = next((c for c in api_result.calls if c.endpoint.method == "POST"), None)
+        suite.check("the POST endpoint was discovered", post_call is not None)
+        if post_call is not None:
+            suite.check("it was really executed, not skipped despite no live OpenAPI",
+                        post_call.status != CALL_SKIPPED, " (was {}: {})".format(post_call.status, post_call.reason))
+            suite.check("clearly labeled synthetic - never presented as real evidence", post_call.synthetic is True)
+            suite.check(
+                "the real server's own Pydantic validation genuinely rejected the incomplete body",
+                post_call.status == CALL_FAIL and post_call.status_code == 422,
+                " (was {}: {})".format(post_call.status, post_call.status_code),
+            )
+    finally:
+        proj.__exit__(None, None, None)
+
+
 if __name__ == "__main__":
     suite = Suite("API QA: Python/FastAPI discovery and server startup")
     sys.exit(suite.run([
         test_fastapi_discovery_finds_get_route,
         test_fastapi_discovery_finds_post_route,
+        test_fastapi_discovery_detects_pydantic_model_body_parameter,
+        test_fastapi_discovery_detects_bare_request_json_body,
+        test_fastapi_discovery_no_body_evidence_when_none_exists,
+        test_fastapi_discovery_body_evidence_scoped_per_route_not_whole_file,
         test_fastapi_discovery_finds_router_route,
         test_fastapi_discovery_preserves_dynamic_path_parameter,
         test_fastapi_discovery_never_invents_a_parameter_value,
@@ -570,4 +754,5 @@ if __name__ == "__main__":
         test_check_python_dependencies_handles_a_nonexistent_interpreter,
         test_python_start_command_reports_missing_dependency_deterministically,
         test_real_end_to_end_fastapi_server_via_discovered_command,
+        test_real_end_to_end_post_actually_fires_with_openapi_disabled,
     ]))

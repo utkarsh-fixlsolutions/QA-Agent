@@ -663,6 +663,39 @@ def test_start_and_wait_ready_detects_a_ready_signal(suite):
         proj.__exit__(None, None, None)
 
 
+def test_start_and_wait_ready_does_not_stop_on_a_keyword_only_line(suite):
+    """docs/46-ready-signal-false-positive-fix.md: the exact bug found
+    dogfooding a real project through the web frontend - a wrapper tool
+    (nodemon, ts-node-dev, ...) prints its own ready-shaped line (matching
+    one of the generic keyword patterns, but with no real URL/port in it)
+    well before the real child process it spawns has actually bound
+    anything. Reproduced directly: a first line matches a keyword with no
+    URL, then - after a short, real delay - a second line carries the real
+    URL. Before this fix, the loop broke on the first line and the real
+    port was never observed at all (falling back to a wrong guess); after
+    it, the loop keeps watching and correctly captures the real one.
+    """
+    proj = TempProject()
+    try:
+        handle = server_module.start_and_wait_ready(
+            [sys.executable, "-c",
+             "import sys, time; print('Compiled successfully'); sys.stdout.flush(); "
+             "time.sleep(0.5); print('Server ready on http://localhost:4559'); sys.stdout.flush(); "
+             "time.sleep(30)"],
+            cwd=proj.path, timeout=10,
+        )
+        try:
+            suite.check("status is ready", handle.status == server_module.STATUS_READY)
+            suite.check(
+                "the real URL from the SECOND line is observed, not left empty by an early exit",
+                handle.base_url == "http://localhost:4559", " (got: {!r})".format(handle.base_url),
+            )
+        finally:
+            handle.stop()
+    finally:
+        proj.__exit__(None, None, None)
+
+
 def test_start_and_wait_ready_detects_a_crash(suite):
     proj = TempProject()
     try:
@@ -720,21 +753,35 @@ def test_run_api_qa_reports_a_crashed_server(suite):
 
 
 def test_run_api_qa_dynamic_routes_are_never_called(suite):
-    context, proj = _context_for({
-        "package.json": json.dumps({
-            "name": "x",
-            "scripts": {"dev": "python -c \"import time; time.sleep(30)\""},
-        }),
-        "package-lock.json": "{}",
-        "app/api/companions/[id]/route.ts": "export async function GET() { return Response.json({}); }\n",
-    })
+    """The real server must actually become reachable (docs/48's fail-fast
+    now stops the whole run otherwise) - only once that's confirmed does
+    this prove the real point: a dynamic route with no real evidence to
+    resolve it from is honestly skipped, never guessed.
+    """
+    if not _npm_available():
+        suite.check("(skipped: npm not on PATH)", True)
+        return
+    proj = TempProject()
     try:
-        result = run_api_qa(context, proj.path, config=ApiQaConfig(server_startup_timeout=5))
-        suite.check("dynamic endpoint present", len(result.endpoints) == 1 and result.endpoints[0].dynamic)
+        proj.write("package.json", json.dumps({
+            "name": "x", "scripts": {"dev": "node server.js"}, "dependencies": {"next": "15.0.0"},
+        }))
+        proj.write("package-lock.json", "{}")
+        proj.write("server.js", """
+const http = require('http');
+http.createServer((req, res) => { res.writeHead(404); res.end(); })
+  .listen(4561, () => console.log('ready - Local:        http://localhost:4561'));
+""")
+        proj.write("app/api/companions/[id]/route.ts", "export async function GET() { return Response.json({}); }\n")
+
+        result = discover_project(proj.path)
+        context = build_repository_context(result.project)
+        api_result = run_api_qa(context, proj.path, config=ApiQaConfig(server_startup_timeout=10))
+        suite.check("dynamic endpoint present", len(api_result.endpoints) == 1 and api_result.endpoints[0].dynamic)
         suite.check("server reached a startable state so the skip is really about the target",
-                     result.server_status == SERVER_STARTED, " (was {})".format(result.server_status))
+                     api_result.server_status == SERVER_STARTED, " (was {})".format(api_result.server_status))
         suite.check("its call reason explains why, without inventing a value",
-                     "path parameter" in result.calls[0].reason)
+                     "path parameter" in api_result.calls[0].reason)
     finally:
         proj.__exit__(None, None, None)
 
@@ -949,7 +996,66 @@ setTimeout(() => {
         proj.__exit__(None, None, None)
 
 
-def test_run_api_qa_warns_honestly_when_the_port_never_binds(suite):
+def test_run_api_qa_observes_the_real_port_past_a_wrapper_false_ready_line(suite):
+    """docs/46: the full, real, end-to-end proof of the same fix
+    `test_start_and_wait_ready_does_not_stop_on_a_keyword_only_line`
+    already proves at the lower level - here through the real public
+    entry point, confirming calls actually reach the real, later-observed
+    port rather than a wrong guessed one.
+    """
+    if not _npm_available():
+        suite.check("(skipped: npm not on PATH)", True)
+        return
+    proj = TempProject()
+    try:
+        proj.write("package.json", json.dumps({
+            "name": "x", "scripts": {"dev": "node server.js"}, "dependencies": {"next": "15.0.0"},
+        }))
+        proj.write("package-lock.json", "{}")
+        # A fake wrapper-style line first (keyword match, no URL/port at
+        # all), then a real delay, then the real app's own URL-bearing
+        # ready line, only after which the real listener actually binds.
+        proj.write("server.js", """
+console.log('watching for file changes');
+setTimeout(() => {
+  console.log('ready - Local:        http://localhost:4560');
+  const http = require('http');
+  http.createServer((req, res) => {
+    res.writeHead(200, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({ok: true}));
+  }).listen(4560);
+}, 500);
+""")
+        proj.write("app/api/health/route.ts", "export async function GET() { return Response.json({ok:true}); }\n")
+
+        result = discover_project(proj.path)
+        context = build_repository_context(result.project)
+        api_result = run_api_qa(
+            context, proj.path,
+            config=ApiQaConfig(server_startup_timeout=10, connect_probe_timeout=5),
+        )
+        suite.check("server really started", api_result.server_status == SERVER_STARTED)
+        suite.check("the real, later-observed port was used - never a wrong guess",
+                     api_result.base_url == "http://localhost:4560", " (got: {!r})".format(api_result.base_url))
+        suite.check(
+            "the real call succeeds against the real port, no connection-refused wall",
+            len(api_result.calls) == 1 and api_result.calls[0].status == CALL_PASS,
+            " (got: {})".format([(c.status, c.error or c.reason) for c in api_result.calls]),
+        )
+        suite.check("no 'assuming the common default' warning - a real port really was observed",
+                     not any("assuming the common default" in w for w in api_result.warnings))
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_run_api_qa_stops_fast_when_the_port_never_binds(suite):
+    """docs/48-fail-fast-and-classification.md: replaces the old "warn,
+    then proceed anyway" behavior. When the real connect probe never
+    succeeds, the whole run stops immediately, honestly, with a single
+    clear reason - never a wall of per-endpoint connection-refused
+    failures that read exactly like a broken API when the real problem is
+    upstream, in the environment itself.
+    """
     if not _npm_available():
         suite.check("(skipped: npm not on PATH)", True)
         return
@@ -969,13 +1075,20 @@ def test_run_api_qa_warns_honestly_when_the_port_never_binds(suite):
             context, proj.path,
             config=ApiQaConfig(server_startup_timeout=5, connect_probe_timeout=1),
         )
+        suite.check("server_status honestly reports unreachable, not started",
+                     api_result.server_status == "unreachable", " (was {})".format(api_result.server_status))
         suite.check(
-            "an honest warning names the real gap, rather than silently proceeding",
-            any("never accepted a real TCP connection" in w for w in api_result.warnings),
-            " (warnings: {})".format(api_result.warnings),
+            "the exact, clear stop message is shown",
+            api_result.server_detail.startswith("Server is not reachable. Stopping the run."),
+            " (was: {!r})".format(api_result.server_detail),
         )
-        suite.check("the subsequent call still honestly fails (never fabricated a pass)",
-                     len(api_result.calls) == 1 and api_result.calls[0].status == CALL_FAIL)
+        suite.check(
+            "the run stopped immediately - no real HTTP call was ever attempted",
+            len(api_result.calls) == 1 and api_result.calls[0].status == CALL_SKIPPED,
+            " (got: {})".format([(c.status, c.reason) for c in api_result.calls]),
+        )
+        suite.check("the skip reason on the call itself names the same real gap",
+                     "not reachable" in api_result.calls[0].reason)
     finally:
         proj.__exit__(None, None, None)
 
@@ -993,7 +1106,7 @@ def test_render_shows_endpoint_method_path_status_and_timing(suite):
     suite.check("shows the method and path", "GET /api/health" in text)
     suite.check("shows the status code", "200" in text)
     suite.check("shows the timing", "42ms" in text)
-    suite.check("shows PASS", "PASS" in text)
+    suite.check("shows the Working classification (docs/48)", "Working" in text)
 
 
 def test_render_shows_evidence_on_failure(suite):
@@ -1004,7 +1117,7 @@ def test_render_shows_evidence_on_failure(suite):
     )
     result = ApiTestResult(root_path="/x", endpoints=(endpoint,), calls=(call,), server_status=SERVER_STARTED)
     text = render(result)
-    suite.check("shows FAIL", "FAIL" in text)
+    suite.check("shows the Not Working classification (docs/48, a real 5xx)", "Not Working" in text)
     suite.check("shows the real evidence (reason)", "HTTP 500 response" in text)
     suite.check("shows a body sample", "boom" in text)
 
@@ -1033,7 +1146,7 @@ def test_to_csv_has_one_row_per_call_with_real_fields(suite):
     result = ApiTestResult(root_path="/x", endpoints=(ok, bad), calls=calls, server_status=SERVER_STARTED)
     text = to_csv(result)
     rows = text.strip().splitlines()
-    suite.check("header row present", rows[0].startswith("method,path,status,status_code"))
+    suite.check("header row present", rows[0].startswith("method,path,classification,status,status_code"))
     suite.check("2 data rows (one per call)", len(rows) == 3)
     suite.check("passing call's real status code present", "200" in rows[1])
     suite.check("failing call's real reason present", "HTTP 500 response" in rows[2])
@@ -1129,7 +1242,7 @@ http.createServer((req, res) => {
         completed = run_agent(["discover", str(proj.path), "--api-test"])
         suite.check("exits cleanly", completed.returncode == 0, " (rc={}, stderr={})".format(
             completed.returncode, completed.stderr[-500:]))
-        suite.check("real pass reported in CLI output", "GET /api/health" in completed.stdout and "PASS" in completed.stdout)
+        suite.check("real pass reported in CLI output", "GET /api/health" in completed.stdout and "Working" in completed.stdout)
     finally:
         proj.__exit__(None, None, None)
 
@@ -1159,7 +1272,7 @@ def test_cli_api_report_writes_csv_for_csv_extension(suite):
         completed = run_agent(["discover", str(proj.path), "--api-report", str(report_path)])
         suite.check("exits cleanly", completed.returncode == 0)
         text = report_path.read_text(encoding="utf-8")
-        suite.check("it's the CSV report", text.startswith("method,path,status,status_code"))
+        suite.check("it's the CSV report", text.startswith("method,path,classification,status,status_code"))
     finally:
         proj.__exit__(None, None, None)
 
@@ -1206,6 +1319,7 @@ if __name__ == "__main__":
         test_discover_server_start_command_ambiguous_monorepo_is_never_guessed,
         test_start_and_wait_ready_reports_not_found_for_a_missing_binary,
         test_start_and_wait_ready_detects_a_ready_signal,
+        test_start_and_wait_ready_does_not_stop_on_a_keyword_only_line,
         test_start_and_wait_ready_detects_a_crash,
         test_run_api_qa_skips_when_no_endpoints_discovered,
         test_run_api_qa_skips_when_no_start_command,
@@ -1216,7 +1330,8 @@ if __name__ == "__main__":
         test_wait_until_connectable_true_once_a_real_listener_binds,
         test_wait_until_connectable_false_when_nothing_ever_binds,
         test_run_api_qa_waits_out_a_delayed_port_bind_before_calling,
-        test_run_api_qa_warns_honestly_when_the_port_never_binds,
+        test_run_api_qa_observes_the_real_port_past_a_wrapper_false_ready_line,
+        test_run_api_qa_stops_fast_when_the_port_never_binds,
         test_render_shows_endpoint_method_path_status_and_timing,
         test_render_shows_evidence_on_failure,
         test_render_handles_no_calls_gracefully,
