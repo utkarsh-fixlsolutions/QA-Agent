@@ -81,6 +81,17 @@ def _looks_like_id_param(param_name: str) -> bool:
     lowered = param_name.lower()
     return lowered == "id" or lowered.endswith("_id") or lowered.endswith("id")
 
+
+def synthesize_path_parameter_value(param_name: str):
+    """The exact same numeric-sentinel-first-for-id-shaped-names rule
+    `resolve_path_parameter`'s own synthetic fallback already uses
+    internally - exposed publicly (Phase 3, docs/54) so `planning.py`'s
+    dependency-sourced id resolution (e.g. a "verify deletion" test whose
+    own prerequisite produced no usable id) can reuse the identical rule
+    rather than a second, silently-divergent copy of it.
+    """
+    return 1 if _looks_like_id_param(param_name) else "qa-agent-test-id"
+
 # --- path-parameter extraction -------------------------------------------
 
 # Two real path-parameter syntaxes, both matched (docs/41-express-path

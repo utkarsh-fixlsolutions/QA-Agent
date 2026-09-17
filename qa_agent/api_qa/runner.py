@@ -28,6 +28,7 @@ from typing import Optional
 from . import server as _server
 from .discovery import discover_api_endpoints
 from .http_client import DEFAULT_TIMEOUT_SECONDS as _DEFAULT_REQUEST_TIMEOUT
+from .planning import build_test_plan, execute_test_plan
 from .resolution import (
     find_static_openapi_schema,
     generate_and_execute_negative_cases,
@@ -97,28 +98,28 @@ def _skip_all(endpoints, reason):
 
 
 def _combine_progress(on_progress):
-    """Three phase-scoped callbacks (`resolve_and_execute`'s primary calls,
-    then negative cases, then schema validation) combined into one overall
-    `(done, total, label)` stream for a single caller-facing `on_progress`
-    (docs/44-live-progress.md). Each phase's own `total` only becomes known
-    to the caller once that phase actually starts reporting (negative/
-    schema totals are not knowable before the primary calls they depend on
-    have finished) - so the overall `total` only ever grows, in step with
-    real, newly-known work, never shrinks and never estimates ahead of what
-    is actually known. `(None, None, None)` when `on_progress` itself is
-    `None` - every phase then gets a real `None` too, its own already-
-    documented no-op default.
+    """Four phase-scoped callbacks (`resolve_and_execute`'s primary calls,
+    negative cases, schema validation, then Phase 3's own functional test
+    plan) combined into one overall `(done, total, label)` stream for a
+    single caller-facing `on_progress` (docs/44-live-progress.md). Each
+    phase's own `total` only becomes known to the caller once that phase
+    actually starts reporting - so the overall `total` only ever grows, in
+    step with real, newly-known work, never shrinks and never estimates
+    ahead of what is actually known. `(None, None, None, None)` when
+    `on_progress` itself is `None` - every phase then gets a real `None`
+    too, its own already-documented no-op default.
     """
     if on_progress is None:
-        return None, None, None
+        return None, None, None, None
 
     state = {"primary_total": 0, "primary_done": 0,
               "negative_total": 0, "negative_done": 0,
-              "schema_total": 0, "schema_done": 0}
+              "schema_total": 0, "schema_done": 0,
+              "plan_total": 0, "plan_done": 0}
 
     def _emit(label):
-        done = state["primary_done"] + state["negative_done"] + state["schema_done"]
-        total = state["primary_total"] + state["negative_total"] + state["schema_total"]
+        done = state["primary_done"] + state["negative_done"] + state["schema_done"] + state["plan_done"]
+        total = state["primary_total"] + state["negative_total"] + state["schema_total"] + state["plan_total"]
         on_progress(done, total, label)
 
     def primary_cb(done, total, label):
@@ -133,7 +134,11 @@ def _combine_progress(on_progress):
         state["schema_total"], state["schema_done"] = total, done
         _emit(label)
 
-    return primary_cb, negative_cb, schema_cb
+    def plan_cb(done, total, label):
+        state["plan_total"], state["plan_done"] = total, done
+        _emit(label)
+
+    return primary_cb, negative_cb, schema_cb, plan_cb
 
 
 def _resolve_base_url(handle, warnings):
@@ -278,7 +283,7 @@ def run_api_qa(context, root, config=None, on_progress=None):
         # docstring for the exact precedence).
         static_schema_doc = find_static_openapi_schema(root)
 
-        primary_cb, negative_cb, schema_cb = _combine_progress(on_progress)
+        primary_cb, negative_cb, schema_cb, plan_cb = _combine_progress(on_progress)
         calls = resolve_and_execute(
             endpoints, base_url, config.request_timeout, on_progress=primary_cb,
             allow_synthetic_mutations=config.allow_synthetic_mutations,
@@ -293,12 +298,29 @@ def run_api_qa(context, root, config=None, on_progress=None):
             endpoints, calls, base_url, config.request_timeout, on_progress=schema_cb,
             static_schema_doc=static_schema_doc,
         )
+        # Phase 3 (functional API test planning, docs/54): a second,
+        # additive, dependency-aware pass - reuses the same real base_url/
+        # OpenAPI evidence the verification pass above already established,
+        # never a parallel HTTP mechanism. Deliberately run after (not
+        # instead of) `resolve_and_execute` above: that pass remains the
+        # existing, unchanged, per-endpoint verification contract every
+        # prior phase's report/render/regression tests already rely on;
+        # this one is a distinct, workflow-shaped view of the same real
+        # server, allowed to call an endpoint more than once when a real
+        # workflow (create -> ... -> verify deletion) genuinely requires it.
+        test_plan = build_test_plan(endpoints)
+        functional_results = execute_test_plan(
+            test_plan, base_url, config.request_timeout,
+            static_schema_doc=static_schema_doc, on_progress=plan_cb,
+            allow_synthetic_mutations=config.allow_synthetic_mutations,
+        )
         return _finish(
             endpoints=endpoints, calls=calls, server_status=SERVER_STARTED,
             server_detail=handle.reason, base_url=base_url,
             server_log_tail=_server.drain_log_tail(handle),
             negative_calls=negative_calls, schema_validations=schema_validations,
             http_readiness_detail=readiness.detail,
+            test_plan=test_plan, functional_results=functional_results,
         )
     finally:
         handle.stop()

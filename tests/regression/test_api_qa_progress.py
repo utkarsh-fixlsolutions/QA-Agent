@@ -1,12 +1,13 @@
 """Live progress reporting (docs/44-live-progress.md): the optional
 `on_progress` callback threaded through `resolve_and_execute`,
 `generate_and_execute_negative_cases`, `validate_response_schemas`, and
-`run_api_qa`'s own three-phase combiner (`_combine_progress`). Purely
-additive - `on_progress=None` (the default) must leave every existing
-behavior completely unaffected, already proven by the full, unmodified
-regression suite in `test_api_qa_resolution.py`/`test_api_qa_negative_and
-_schema.py` still passing; this file only proves the new callback itself
-behaves honestly.
+(Phase 3, docs/54) `execute_test_plan`, all combined by `run_api_qa`'s own
+four-phase combiner (`_combine_progress`). Purely additive -
+`on_progress=None` (the default) must leave every existing behavior
+completely unaffected, already proven by the full, unmodified regression
+suite in `test_api_qa_resolution.py`/`test_api_qa_negative_and_schema.py`
+still passing; this file only proves the new callback itself behaves
+honestly.
 """
 
 from __future__ import annotations
@@ -103,15 +104,20 @@ def test_resolve_and_execute_on_progress_none_is_a_true_no_op(suite):
 
 # --- _combine_progress (pure) -----------------------------------------------
 
-def test_combine_progress_returns_three_none_callbacks_when_on_progress_is_none(suite):
-    primary, negative, schema = _combine_progress(None)
-    suite.check("all three are None - no-op, matching each phase's own default",
-                primary is None and negative is None and schema is None)
+def test_combine_progress_returns_four_none_callbacks_when_on_progress_is_none(suite):
+    # Phase 3 (functional API test planning, docs/54) added a fourth,
+    # additive phase (the functional test plan's own execution) alongside
+    # the original three - `_combine_progress` now returns one callback per
+    # real phase `run_api_qa` actually runs, still all `None` (no-op) when
+    # the caller passed no `on_progress` at all.
+    primary, negative, schema, plan = _combine_progress(None)
+    suite.check("all four are None - no-op, matching each phase's own default",
+                primary is None and negative is None and schema is None and plan is None)
 
 
 def test_combine_progress_total_only_grows_as_each_phase_starts_reporting(suite):
     events = []
-    primary, negative, schema = _combine_progress(lambda d, t, l: events.append((d, t, l)))
+    primary, negative, schema, plan = _combine_progress(lambda d, t, l: events.append((d, t, l)))
 
     primary(1, 2, "GET /a")
     primary(2, 2, "GET /b")
@@ -127,6 +133,11 @@ def test_combine_progress_total_only_grows_as_each_phase_starts_reporting(suite)
     schema(1, 1, "schema: GET /a")
     suite.check("total grows again for phase 3", events[-1][1] == 4)
     suite.check("done reaches the final combined total", events[-1][0] == 4)
+
+    plan(1, 1, "T1: GET /a")
+    suite.check("total grows once more for the functional test plan phase (docs/54)",
+                events[-1][1] == 5)
+    suite.check("done reaches the new, final combined total", events[-1][0] == 5)
 
 
 # --- one real, guarded, end-to-end proof (real Node server) -----------------
@@ -201,7 +212,7 @@ if __name__ == "__main__":
     sys.exit(suite.run([
         test_resolve_and_execute_on_progress_reports_every_endpoint_once,
         test_resolve_and_execute_on_progress_none_is_a_true_no_op,
-        test_combine_progress_returns_three_none_callbacks_when_on_progress_is_none,
+        test_combine_progress_returns_four_none_callbacks_when_on_progress_is_none,
         test_combine_progress_total_only_grows_as_each_phase_starts_reporting,
         test_real_end_to_end_progress_stream_is_honest_and_reaches_completion,
     ]))

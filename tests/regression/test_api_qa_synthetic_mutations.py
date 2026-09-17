@@ -404,6 +404,7 @@ class _FakeResult:
         self.server_log_tail = ""
         self.negative_calls = ()
         self.schema_validations = ()
+        self.functional_results = ()
 
 
 def test_to_dict_summary_separates_real_and_synthetic_counts(suite):

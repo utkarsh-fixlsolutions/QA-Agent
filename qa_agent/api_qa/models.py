@@ -84,6 +84,31 @@ BODY_EVIDENCE_SOURCES = (
     EVIDENCE_SOURCE_HINT, EVIDENCE_SYNTHETIC, EVIDENCE_UNKNOWN,
 )
 
+# Phase 3 (functional API test planning, docs/54): a closed, small taxonomy
+# for what a `PlannedTest` is actually for - deliberately not a large
+# category tree (docs/54's own scope section names this explicitly).
+TEST_CATEGORY_SMOKE = "smoke"
+TEST_CATEGORY_FUNCTIONAL_POSITIVE = "functional_positive"
+TEST_CATEGORY_FUNCTIONAL_WORKFLOW = "functional_workflow"
+TEST_CATEGORY_EXPECTED_NEGATIVE = "expected_negative"
+
+TEST_CATEGORIES = (
+    TEST_CATEGORY_SMOKE, TEST_CATEGORY_FUNCTIONAL_POSITIVE,
+    TEST_CATEGORY_FUNCTIONAL_WORKFLOW, TEST_CATEGORY_EXPECTED_NEGATIVE,
+)
+
+# Phase 3: what "correct" means for one planned test's real HTTP outcome -
+# `EXPECTED_SUCCESS` is the same 2xx-and-valid-JSON rule `http_client.
+# call_endpoint` already applies; `EXPECTED_NOT_FOUND` is the one, explicit,
+# named exception (docs/54, section 9 of the phase spec: a 404 after a
+# verified deletion is the *correct* outcome, not a failure) - a closed set,
+# never an arbitrary caller-supplied status code, so this can never be
+# (ab)used to declare an unrelated unexpected status "acceptable".
+EXPECTED_SUCCESS = "success"
+EXPECTED_NOT_FOUND = "not_found"
+
+EXPECTED_STATUS_KINDS = (EXPECTED_SUCCESS, EXPECTED_NOT_FOUND)
+
 
 @dataclass(frozen=True)
 class ApiEndpoint:
@@ -317,6 +342,99 @@ class SchemaValidationResult:
 
 
 @dataclass(frozen=True)
+class PlannedTest:
+    """One entry in a functional test plan (Phase 3, docs/54) -
+    deterministic, built from the real discovered API inventory alone
+    (`planning.build_test_plan`), never from AI. `test_id` is a real,
+    stable, human-readable label (`"T1"`, `"T2"`, ...) assigned in the
+    exact order tests are planned - the same order `planning.
+    execute_test_plan` executes them in, so a dependency is always already
+    finished by the time a dependent test runs (docs/54's own "the plan is
+    built in dependency order, execution just walks it" simplification -
+    no separate topological sort is needed or built).
+
+    `depends_on` names the real, human-facing prerequisite test id(s) for
+    reporting - `id_source_test_id` is the one, specific prior test whose
+    own real response a dynamic path parameter's value should be resolved
+    from at execution time (`None` means "resolve from the general pool of
+    already-executed non-dynamic GET evidence instead", the same mechanism
+    `resolution.resolve_path_parameter` already uses - not a second,
+    competing resolution strategy).
+
+    `expected_status_kind` is one of `EXPECTED_STATUS_KINDS` - almost always
+    `EXPECTED_SUCCESS`; `EXPECTED_NOT_FOUND` only for a test explicitly
+    planned to verify a resource no longer exists after a real deletion
+    (docs/54, section 9's own "a 404 can be the correct answer" rule).
+    """
+
+    test_id: str
+    endpoint: ApiEndpoint
+    purpose: str
+    category: str
+    depends_on: Tuple[str, ...] = ()
+    expected_status_kind: str = EXPECTED_SUCCESS
+    request_source: str = ""
+    id_source_test_id: Optional[str] = None
+
+    def __post_init__(self):
+        if self.category not in TEST_CATEGORIES:
+            raise ValueError(
+                "PlannedTest({!r}: {!r} {!r}) has an unrecognized category {!r}".format(
+                    self.test_id, self.endpoint.method, self.endpoint.path, self.category
+                )
+            )
+        if self.expected_status_kind not in EXPECTED_STATUS_KINDS:
+            raise ValueError(
+                "PlannedTest({!r}: {!r} {!r}) has an unrecognized expected_status_kind {!r}".format(
+                    self.test_id, self.endpoint.method, self.endpoint.path, self.expected_status_kind
+                )
+            )
+
+
+@dataclass(frozen=True)
+class PlannedTestResult:
+    """One `PlannedTest`'s real, executed outcome (Phase 3, docs/54).
+    `call` is the real, underlying `ApiCallResult` this test's own HTTP
+    call actually produced (full detail - response_sample, error,
+    resolution_evidence, synthetic flags - is always available there rather
+    than duplicated onto this shape), or `None` when the test could not be
+    attempted at all (no real/synthetic id was available and synthetic
+    fallback was disabled, or no request body could be constructed) - the
+    same "a real skip, never a guessed pass or fail" discipline
+    `resolution.py`'s own `_skip` already established.
+
+    `status` is this *test's* own verdict (`CALL_PASS`/`CALL_FAIL`/
+    `CALL_SKIPPED`) - deliberately separate from `call.status`, because for
+    an `EXPECTED_NOT_FOUND` test a real HTTP 404 makes `call.status ==
+    CALL_FAIL` (the target's own, correct, unrelated 2xx-only pass rule)
+    while the *test* itself correctly PASSes (docs/54, section 9). Never
+    flips or reinterprets `call.status` itself - that remains exactly what
+    `http_client.call_endpoint` actually observed.
+
+    `resolved_param_value` is the real (or, when synthesized, clearly-
+    labeled-elsewhere-via-`call.synthetic`) value substituted for this
+    test's own dynamic path parameter, when it has one - kept here
+    (a plain string, not re-derived from `call.resolved_path` each time)
+    specifically so a *later* dependent test in the same workflow
+    (e.g. "verify deletion" reusing "delete"'s own id) can reuse the exact
+    same value without re-extracting it from a response a second time.
+    """
+
+    test_id: str
+    test: PlannedTest
+    call: Optional[ApiCallResult]
+    resolved_param_value: Optional[str]
+    status: str
+    verdict_reason: str = ""
+
+    def __post_init__(self):
+        if self.status not in CALL_STATUSES:
+            raise ValueError(
+                "PlannedTestResult({!r}) has an unrecognized status {!r}".format(self.test_id, self.status)
+            )
+
+
+@dataclass(frozen=True)
 class ApiTestResult:
     """The whole-session outcome of one `run_api_qa()` call. `endpoints` is
     every endpoint discovered, whether or not it was ever called (a dynamic
@@ -352,6 +470,21 @@ class ApiTestResult:
     # connectivity is confirmed - "" only when the server was never reached
     # at all (no readiness probe was ever attempted).
     http_readiness_detail: str = ""
+    # Phase 3 (functional API test planning, docs/54): the real, structured
+    # test plan `planning.build_test_plan` produced from `endpoints` (empty
+    # only when no endpoints were discovered at all - the server-blocked
+    # cases above never reach this far) and its own real execution outcome,
+    # one `PlannedTestResult` per `PlannedTest` in `test_plan`, same order.
+    # Deliberately additive and separate from `calls`: `calls` remains the
+    # existing "one real (or skipped) call per discovered endpoint"
+    # verification pass (docs/33) unchanged; `test_plan`/`functional_results`
+    # is a distinct, dependency-aware pass that may call the same endpoint
+    # more than once when a real workflow requires it (e.g. the same
+    # `GET /items/{id}` endpoint verified once with a real id and once,
+    # separately, to confirm it is gone after a real deletion) - something
+    # `calls`' own "exactly one entry per endpoint" contract cannot express.
+    test_plan: Tuple["PlannedTest", ...] = ()
+    functional_results: Tuple["PlannedTestResult", ...] = ()
 
     def __post_init__(self):
         if self.server_status not in SERVER_STATUSES:
