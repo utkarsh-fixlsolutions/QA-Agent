@@ -1,0 +1,996 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QA Agent</title>
+<style>
+  :root {
+    --bg: #f1f5f9; --panel: #ffffff; --border: #e2e8f0; --text: #0f172a; --muted: #64748b;
+    --accent: #4f46e5; --accent-dark: #4338ca;
+    --green-fg: #15803d; --green-bg: #dcfce7; --green-bd: #86efac;
+    --blue-fg: #1d4ed8; --blue-bg: #dbeafe; --blue-bd: #93c5fd;
+    --amber-fg: #b45309; --amber-bg: #fef3c7; --amber-bd: #fcd34d;
+    --red-fg: #b91c1c; --red-bg: #fee2e2; --red-bd: #fca5a5;
+    --darkred-fg: #ffffff; --darkred-bg: #7f1d1d;
+    --gray-fg: #475569; --gray-bg: #e2e8f0;
+    --sidebar-bg: #0f172a; --sidebar-fg: #cbd5e1; --sidebar-muted: #64748b;
+    --sidebar-active-bg: #1e293b;
+    --term-bg: #0b1120;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", -apple-system, Arial, sans-serif;
+    display: flex; min-height: 100vh;
+  }
+
+  /* --- sidebar --- */
+  #sidebar {
+    width: 230px; flex-shrink: 0; background: var(--sidebar-bg); color: var(--sidebar-fg);
+    display: flex; flex-direction: column; padding: 1.25rem 0.9rem;
+  }
+  .brand { display: flex; gap: 0.6rem; align-items: center; padding: 0 0.4rem 1.25rem; }
+  .brand .logo {
+    width: 34px; height: 34px; border-radius: 9px; background: linear-gradient(135deg, var(--accent), #818cf8);
+    display: flex; align-items: center; justify-content: center; font-size: 1.1rem; flex-shrink: 0;
+  }
+  .brand .name { font-weight: 700; color: #fff; font-size: 0.9375rem; line-height: 1.2; }
+  .brand .tagline { font-size: 0.6875rem; color: var(--sidebar-muted); }
+  nav { display: flex; flex-direction: column; gap: 0.15rem; margin-top: 0.5rem; }
+  nav a {
+    display: flex; align-items: center; gap: 0.65rem; padding: 0.55rem 0.7rem; border-radius: 8px;
+    color: var(--sidebar-fg); text-decoration: none; font-size: 0.8125rem; font-weight: 500;
+    cursor: pointer; user-select: none;
+  }
+  nav a .ic { width: 1.1rem; text-align: center; opacity: 0.85; }
+  nav a:hover { background: #1e293b; color: #fff; }
+  nav a.active { background: var(--sidebar-active-bg); color: #fff; box-shadow: inset 2px 0 0 var(--accent); }
+  #sidebar .spacer { flex: 1; }
+  .agent-status { padding: 0.7rem; border-top: 1px solid #1e293b; font-size: 0.75rem; color: var(--sidebar-muted); }
+  .agent-status .dot { width: 0.5rem; height: 0.5rem; border-radius: 999px; background: #22c55e; display: inline-block; margin-right: 0.4rem; }
+
+  /* --- main --- */
+  #main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  #topbar {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    padding: 1.5rem 2rem 1rem;
+  }
+  #topbar h1 { margin: 0 0 0.2rem; font-size: 1.375rem; }
+  #topbar p { margin: 0; color: var(--muted); font-size: 0.875rem; }
+  #topbar .right { display: flex; align-items: center; gap: 0.75rem; }
+  .engine-badge {
+    display: flex; align-items: center; gap: 0.4rem; border: 1px solid var(--border); background: var(--panel);
+    border-radius: 8px; padding: 0.45rem 0.8rem; font-size: 0.8125rem; font-weight: 600; color: var(--text);
+  }
+  #content { padding: 0 2rem 2.5rem; display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 1.25rem; align-items: start; }
+  @media (max-width: 900px) { #content { grid-template-columns: minmax(0, 1fr); } }
+  #leftCol, #rightCol { min-width: 0; }
+  body { overflow-x: hidden; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 1.5rem 1.75rem; margin-bottom: 1.25rem; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+  }
+  .panel h2 { margin: 0 0 0.9rem; font-size: 1rem; }
+
+  /* project path row */
+  .path-row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+  .path-field {
+    flex: 1; min-width: 220px; display: flex; align-items: center; gap: 0.55rem;
+    border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem 0.85rem; font-size: 0.8125rem;
+    color: var(--muted); background: #fafbfc; font-family: ui-monospace, Consolas, monospace;
+  }
+  input[type=file] { display: none; }
+  .btn {
+    border: none; border-radius: 8px; padding: 0.6rem 1.1rem; font-size: 0.8125rem; font-weight: 600;
+    cursor: pointer; white-space: nowrap;
+  }
+  .btn-outline { background: #eef2ff; color: var(--accent); }
+  .btn-primary { background: var(--accent); color: #fff; display: flex; align-items: center; gap: 0.4rem; }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-dark); }
+  .btn-primary:disabled { background: #c7d2fe; cursor: not-allowed; }
+  .path-hint { margin-top: 0.6rem; font-size: 0.8125rem; color: var(--muted); }
+  label.opt {
+    display: flex; gap: 0.5rem; align-items: flex-start; margin-top: 0.9rem; font-size: 0.8125rem;
+    color: var(--muted);
+  }
+  label.opt input { margin-top: 0.2rem; flex-shrink: 0; }
+
+  /* tabs */
+  .tabs { display: flex; gap: 0.3rem; border-bottom: 1px solid var(--border); margin-bottom: 1.1rem; }
+  .tab {
+    padding: 0.65rem 0.9rem; font-size: 0.8125rem; font-weight: 600; color: var(--muted);
+    cursor: pointer; border-bottom: 2px solid transparent; display: flex; align-items: center; gap: 0.4rem;
+  }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  /* pipeline */
+  .run-head { display: flex; align-items: center; gap: 0.9rem; margin-bottom: 1.25rem; }
+  .spinner {
+    width: 2.1rem; height: 2.1rem; border-radius: 999px; border: 3px solid #e0e7ff; border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite; flex-shrink: 0;
+  }
+  .spinner.done { border: none; background: var(--green-bg); color: var(--green-fg); display: flex; align-items: center;
+    justify-content: center; font-weight: 700; animation: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .run-head .title { font-weight: 700; font-size: 0.9375rem; }
+  .run-head .sub { font-size: 0.8125rem; color: var(--muted); }
+  .run-stats { margin-left: auto; display: flex; gap: 1.75rem; }
+  .run-stats div { text-align: left; }
+  .run-stats .label { font-size: 0.6875rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+  .run-stats .value { font-size: 0.875rem; font-weight: 700; }
+
+  .progress-wrap { margin-bottom: 1.25rem; }
+  .progress-wrap.hidden { display: none; }
+  .progress-head { display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--muted); margin-bottom: 0.3rem; }
+  .progress-head .count { font-weight: 700; color: var(--text); }
+  .progress-track { height: 0.5rem; border-radius: 999px; background: var(--gray-bg); overflow: hidden; }
+  .progress-fill { height: 100%; background: var(--accent); border-radius: 999px; transition: width 0.3s ease; width: 0%; }
+  .progress-label { margin-top: 0.3rem; font-size: 0.75rem; color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
+
+  .pipeline { display: flex; align-items: flex-start; margin-bottom: 1.5rem; }
+  .step { display: flex; flex-direction: column; align-items: center; flex: 1; position: relative; }
+  .step .node {
+    width: 1.9rem; height: 1.9rem; border-radius: 999px; background: var(--gray-bg); color: var(--muted);
+    display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.8125rem;
+    border: 2px solid var(--gray-bg); z-index: 1;
+  }
+  .step .line {
+    position: absolute; top: 0.95rem; left: -50%; width: 100%; height: 2px; background: var(--border); z-index: 0;
+  }
+  .step:first-child .line { display: none; }
+  .pipeline { overflow: hidden; }
+  .step .name { margin-top: 0.5rem; font-size: 0.75rem; font-weight: 600; text-align: center; }
+  .step .state { font-size: 0.6875rem; color: var(--muted); }
+  .step.complete .node { background: var(--green-fg); color: #fff; border-color: var(--green-fg); }
+  .step.complete .line { background: var(--green-fg); }
+  .step.active .node { background: #fff; border-color: var(--accent); color: var(--accent); box-shadow: 0 0 0 4px #eef2ff; }
+  .step.failed .node { background: var(--red-fg); color: #fff; border-color: var(--red-fg); }
+
+  pre#terminal {
+    background: var(--term-bg); color: #cbd5e1; padding: 1rem 1.1rem; border-radius: 10px; font-size: 0.8125rem;
+    line-height: 1.65; height: 340px; overflow-y: auto; overflow-x: hidden; margin: 0;
+    font-family: ui-monospace, Consolas, monospace;
+    white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+  }
+  #terminal .t { color: #64748b; }
+  #terminal .ok { color: #4ade80; }
+  #terminal .fail { color: #f87171; }
+  #terminal .warn { color: #fbbf24; }
+  #terminal .hd { color: #93c5fd; font-weight: 700; }
+  #terminal .dim { color: #94a3b8; }
+
+  /* right column */
+  .result-card { border: 1px solid var(--border); border-radius: 10px; padding: 0.7rem 0.85rem; margin-bottom: 0.6rem; }
+  .result-card .row1 { display: flex; align-items: center; gap: 0.5rem; }
+  .result-card .method {
+    font-weight: 700; font-size: 0.6875rem; padding: 0.15rem 0.4rem; border-radius: 5px; background: var(--gray-bg);
+    color: var(--gray-fg); min-width: 3.2rem; text-align: center;
+  }
+  .result-card .path { font-family: ui-monospace, Consolas, monospace; font-size: 0.8125rem; flex: 1; word-break: break-all; }
+  .result-card .code { font-weight: 700; font-size: 0.8125rem; color: var(--muted); }
+  .badge {
+    display: inline-block; padding: 0.15rem 0.55rem; border-radius: 999px; font-weight: 700;
+    font-size: 0.625rem; white-space: nowrap; letter-spacing: 0.02em; text-transform: uppercase;
+  }
+  .badge.b-2xx, .badge.pass { color: var(--green-fg); background: var(--green-bg); }
+  .badge.b-3xx { color: var(--blue-fg); background: var(--blue-bg); }
+  .badge.b-4xx, .badge.warning { color: var(--amber-fg); background: var(--amber-bg); }
+  .badge.b-5xx, .badge.error { color: var(--red-fg); background: var(--red-bg); }
+  .badge.b-noresponse { color: var(--darkred-fg); background: var(--darkred-bg); }
+  .badge.b-skipped, .badge.info, .badge.style, .badge.note { color: var(--gray-fg); background: var(--gray-bg); }
+  .badge.b-synthetic { color: var(--amber-fg); background: var(--amber-bg); }
+  .result-card .detail { margin-top: 0.35rem; font-size: 0.75rem; color: var(--muted); }
+  .result-card .timing { font-size: 0.75rem; color: var(--muted); margin-left: auto; }
+
+  .summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.9rem 1rem; }
+  .summary-grid .item { display: flex; align-items: center; gap: 0.5rem; }
+  .summary-grid .ic { width: 1.6rem; height: 1.6rem; border-radius: 7px; display: flex; align-items: center; justify-content: center; font-size: 0.8125rem; flex-shrink: 0; }
+  .summary-grid .ic.blue { background: var(--blue-bg); color: var(--blue-fg); }
+  .summary-grid .ic.green { background: var(--green-bg); color: var(--green-fg); }
+  .summary-grid .ic.red { background: var(--red-bg); color: var(--red-fg); }
+  .summary-grid .ic.gray { background: var(--gray-bg); color: var(--gray-fg); }
+  .summary-grid .ic.amber { background: var(--amber-bg); color: var(--amber-fg); }
+  .summary-grid .lbl { font-size: 0.75rem; color: var(--muted); display: block; }
+  .summary-grid .num { font-size: 1.05rem; font-weight: 700; }
+
+  .next-steps {
+    background: #f5f3ff; border: 1px solid #ddd6fe; border-radius: 10px; padding: 0.85rem 1rem; font-size: 0.8125rem;
+  }
+  .next-steps .hd { font-weight: 700; color: #5b21b6; display: flex; gap: 0.4rem; align-items: center; margin-bottom: 0.3rem; }
+  .next-steps .body { color: #4c1d95; }
+
+  .pill-row { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.3rem; }
+  .pill { background: var(--gray-bg); color: var(--text); border-radius: 6px; padding: 0.25rem 0.65rem; font-size: 0.75rem; font-weight: 500; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; font-size: 0.875rem; margin-bottom: 1rem; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
+  th, td { text-align: left; padding: 0.55rem 0.65rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  .mono { font-family: ui-monospace, Consolas, monospace; }
+  .empty { color: var(--muted); font-size: 0.8125rem; font-style: italic; padding: 0.5rem 0; }
+  .warn-box {
+    margin-bottom: 0.8rem; padding: 0.6rem 0.85rem; background: var(--amber-bg); border: 1px solid var(--amber-bd);
+    border-radius: 8px; font-size: 0.8125rem; color: var(--amber-fg);
+  }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+  <div class="brand">
+    <div class="logo">&#129302;</div>
+    <div>
+      <div class="name">QA Agent</div>
+      <div class="tagline">Test &middot; Diagnose &middot; Repair &middot; Verify</div>
+    </div>
+  </div>
+  <nav>
+    <a class="active"><span class="ic">&#9654;</span> Run QA</a>
+    <a><span class="ic">&#128193;</span> Projects</a>
+    <a><span class="ic">&#128337;</span> History</a>
+    <a><span class="ic">&#128203;</span> Reports</a>
+    <a><span class="ic">&#9881;</span> Settings</a>
+  </nav>
+  <div class="spacer"></div>
+  <div class="agent-status"><span class="dot"></span><span id="agentStatusText">Agent Ready</span></div>
+</div>
+
+<div id="main">
+  <div id="topbar">
+    <div>
+      <h1>Run QA Agent</h1>
+      <p>Upload a project folder and run real, evidence-based static + API checks against it.</p>
+    </div>
+    <div class="right">
+      <div class="engine-badge">&#9881;&#65039; Local Engine</div>
+    </div>
+  </div>
+
+  <div id="content">
+    <div id="leftCol">
+
+      <div class="panel">
+        <h2>Project Path</h2>
+        <div class="path-row">
+          <div class="path-field" id="pathField">&#128193; No folder selected yet</div>
+          <button class="btn btn-outline" id="pickBtn" type="button">Browse</button>
+          <input type="file" id="fileInput" webkitdirectory directory multiple>
+          <button class="btn btn-primary" id="runBtn" disabled>&#9654; Run QA Agent</button>
+        </div>
+        <div class="path-hint">Select your project folder. The agent will detect the framework, run static
+          checks, and (optionally) start the server and test its real API endpoints.</div>
+        <label class="opt">
+          <input type="checkbox" id="runApiTest" checked>
+          <span>Also run live API tests. This starts and executes the uploaded project's own dev/start
+            script on this server. Only enable this for projects you trust.</span>
+        </label>
+        <label class="opt">
+          <input type="checkbox" id="diagnoseFailures">
+          <span>Diagnose failures with AI (Groq). Sends only the real evidence for endpoints that
+            actually failed - method, path, status, error - to Groq for a root-cause explanation.
+            Requires GROQ_API_KEY set on this server.</span>
+        </label>
+      </div>
+
+      <div class="panel hidden" id="planPanel">
+        <h2>Test Plan <span style="float:right;font-weight:400;color:var(--muted);font-size:0.8125rem" id="planCount"></span></h2>
+        <div id="planWarnings"></div>
+        <table id="planTable">
+          <thead><tr><th>Method</th><th>Path</th><th>Description</th><th>Result</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="panel hidden" id="runPanel">
+        <div class="tabs">
+          <div class="tab active" data-tab="live">&#9889; Live Run</div>
+          <div class="tab" data-tab="info">&#128196; Project Info</div>
+          <div class="tab" data-tab="logs">&#128220; Static Analysis</div>
+        </div>
+
+        <div class="tab-panel active" data-panel="live">
+          <div class="run-head">
+            <div class="spinner" id="runSpinner"></div>
+            <div>
+              <div class="title" id="runTitle">Running QA Agent&hellip;</div>
+              <div class="sub" id="runSub">Starting up</div>
+            </div>
+            <div class="run-stats">
+              <div><span class="label">Elapsed</span><br><span class="value" id="elapsedVal">00:00</span></div>
+              <div><span class="label">Current Step</span><br><span class="value" id="currentStepVal">&mdash;</span></div>
+            </div>
+          </div>
+          <div class="progress-wrap hidden" id="progressWrap">
+            <div class="progress-head">
+              <span>Testing endpoints&hellip;</span>
+              <span class="count" id="progressCount">0 / 0</span>
+            </div>
+            <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+            <div class="progress-label" id="progressLabel">&nbsp;</div>
+          </div>
+          <div class="pipeline" id="pipeline"></div>
+          <pre id="terminal"></pre>
+        </div>
+
+        <div class="tab-panel" data-panel="info">
+          <div id="discoveryBody"></div>
+        </div>
+
+        <div class="tab-panel" data-panel="logs">
+          <div id="staticCount" class="path-hint" style="margin-top:0"></div>
+          <table id="staticTable">
+            <thead><tr><th>Severity</th><th>File</th><th>Line</th><th>Message</th><th>Tool</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+
+    <div id="rightCol">
+      <div class="panel hidden" id="resultsPanel">
+        <h2>API Test Results <span style="float:right;font-weight:400;color:var(--muted);font-size:0.8125rem" id="resultsCount"></span></h2>
+        <div id="apiWarnings"></div>
+        <div id="resultCards"></div>
+      </div>
+
+      <div class="panel hidden" id="negativeTestsPanel">
+        <h2>Negative Tests <span style="float:right;font-weight:400;color:var(--muted);font-size:0.8125rem" id="negativeTestsCount"></span></h2>
+        <table id="negativeTestsTable">
+          <thead><tr><th>Method</th><th>Path</th><th>Case</th><th>Expected</th><th>Actual</th><th>Result</th><th>Severity</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="panel hidden" id="summaryPanel">
+        <h2>Summary</h2>
+        <div class="summary-grid" id="summaryGrid"></div>
+      </div>
+
+      <div class="panel hidden" id="nextStepsPanel">
+        <div class="next-steps">
+          <div class="hd">&#10024; Notes</div>
+          <div class="body" id="nextStepsBody"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const IGNORED = new Set([".git", ".venv", "venv", "__pycache__", ".mypy_cache", ".ruff_cache",
+                          "node_modules", ".next", ".turbo", "dist", "build", "coverage"]);
+
+const fileInput = document.getElementById("fileInput");
+const pickBtn = document.getElementById("pickBtn");
+const runBtn = document.getElementById("runBtn");
+const pathField = document.getElementById("pathField");
+const runApiTest = document.getElementById("runApiTest");
+const diagnoseFailures = document.getElementById("diagnoseFailures");
+
+// selectedFiles is [{file: File, path: "relative/path/name.ext"}, ...].
+let selectedFiles = [];
+
+const MAX_FILES_CLIENT = 4000; // mirrors server.py's own MAX_FILES - fail fast client-side too
+
+// Chromium's File System Access API lets us walk the tree ourselves and
+// skip node_modules/.git/etc entirely, without ever reading their entries.
+// The old <input webkitdirectory> approach can't do this: the browser has
+// to natively recurse the WHOLE folder (node_modules included, which on a
+// real frontend project can be 50k-300k+ files) to build input.files
+// *before* our change handler ever runs - our own filter only runs after
+// that native scan has already happened, so it never prevented the freeze/
+// crash it looked like it was preventing. This is the actual fix for that.
+const supportsDirectoryPicker = typeof window.showDirectoryPicker === "function";
+
+async function walkDirectory(dirHandle, prefix, out) {
+  for await (const [name, handle] of dirHandle.entries()) {
+    if (IGNORED.has(name)) continue; // skip whole subtree - never opened, never read
+    const path = prefix ? prefix + "/" + name : name;
+    if (handle.kind === "directory") {
+      await walkDirectory(handle, path, out);
+    } else {
+      out.push({ file: await handle.getFile(), path });
+      if (out.length > MAX_FILES_CLIENT) {
+        throw new Error("too many files (" + out.length + "+, max " + MAX_FILES_CLIENT + "). " +
+          "Check for a stray node_modules/build folder not caught by the usual ignore list.");
+      }
+    }
+  }
+}
+
+function describeSelection(name, files) {
+  const totalBytes = files.reduce((sum, f) => sum + f.file.size, 0);
+  pathField.textContent = "\u{1F4C1} " + name + "  —  " + files.length + " file(s), " +
+    (totalBytes / 1024 / 1024).toFixed(1) + " MB";
+}
+
+pickBtn.addEventListener("click", async () => {
+  if (!supportsDirectoryPicker) {
+    fileInput.click();
+    return;
+  }
+  let dirHandle;
+  try {
+    dirHandle = await window.showDirectoryPicker();
+  } catch (err) {
+    return; // user cancelled the picker
+  }
+  runBtn.disabled = true;
+  pathField.textContent = "\u{1F4C1} Scanning " + dirHandle.name + "… (skipping node_modules/.git/build/etc)";
+  const collected = [];
+  try {
+    await walkDirectory(dirHandle, "", collected);
+  } catch (err) {
+    pathField.textContent = "⚠️ " + err.message;
+    selectedFiles = [];
+    return;
+  }
+  if (collected.length === 0) {
+    pathField.textContent = "\u{1F4C1} No usable files found in that folder";
+    return;
+  }
+  selectedFiles = collected;
+  describeSelection(dirHandle.name, selectedFiles);
+  runBtn.disabled = false;
+});
+
+// Fallback for browsers without the File System Access API (Firefox,
+// Safari): the old behavior, still filtered post-hoc - not crash-proof on
+// a huge node_modules, but the best available without that API.
+fileInput.addEventListener("change", () => {
+  const all = Array.from(fileInput.files);
+  const filtered = all.filter(f => {
+    const parts = (f.webkitRelativePath || f.name).split("/");
+    return !parts.some(p => IGNORED.has(p));
+  }).map(f => ({ file: f, path: f.webkitRelativePath || f.name }));
+  if (filtered.length === 0) {
+    pathField.textContent = "\u{1F4C1} No usable files found in that folder";
+    runBtn.disabled = true;
+    return;
+  }
+  selectedFiles = filtered;
+  const folderName = selectedFiles[0].path.split("/")[0] || selectedFiles[0].path;
+  describeSelection(folderName, selectedFiles);
+  runBtn.disabled = false;
+});
+
+// --- tabs ---
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
+    tab.classList.add("active");
+    document.querySelector('.tab-panel[data-panel="' + tab.dataset.tab + '"]').classList.add("active");
+  });
+});
+
+function esc(s) {
+  const div = document.createElement("div");
+  div.textContent = s === undefined || s === null ? "" : String(s);
+  return div.innerHTML;
+}
+
+// --- pipeline steps: honest to what this backend actually runs ---
+const STEPS = [
+  { key: "discovery", label: "Discovery" },
+  { key: "static", label: "Static Analysis" },
+  { key: "server", label: "Start Server" },
+  { key: "api", label: "API Testing" },
+  { key: "complete", label: "Complete" },
+];
+
+function renderPipeline(activeIndex, failedIndex) {
+  const el = document.getElementById("pipeline");
+  el.innerHTML = STEPS.map((s, i) => {
+    let cls = "";
+    if (failedIndex !== null && i === failedIndex) cls = "failed";
+    else if (i < activeIndex) cls = "complete";
+    else if (i === activeIndex) cls = "active";
+    const stateText = cls === "complete" ? "Complete" : cls === "active" ? "In Progress" : cls === "failed" ? "Failed" : "Pending";
+    const node = cls === "complete" ? "✓" : cls === "failed" ? "✕" : (i + 1);
+    return '<div class="step ' + cls + '"><div class="line"></div><div class="node">' + node + '</div>' +
+      '<div class="name">' + s.label + '</div><div class="state">' + stateText + '</div></div>';
+  }).join("");
+}
+
+let termLines = [];
+function term(html) {
+  termLines.push(html);
+  const el = document.getElementById("terminal");
+  el.innerHTML = termLines.join("\n");
+  el.scrollTop = el.scrollHeight;
+}
+function ts() {
+  const d = new Date();
+  return "[" + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0") + ":" +
+    String(d.getSeconds()).padStart(2, "0") + "]";
+}
+function termLine(text, cls) {
+  term('<span class="t">' + ts() + '</span> <span class="' + (cls || "") + '">' + text + '</span>');
+}
+
+let elapsedTimer = null, startedAt = 0;
+function startElapsed() {
+  startedAt = Date.now();
+  elapsedTimer = setInterval(() => {
+    const s = Math.floor((Date.now() - startedAt) / 1000);
+    document.getElementById("elapsedVal").textContent =
+      String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+  }, 250);
+}
+function stopElapsed() { if (elapsedTimer) clearInterval(elapsedTimer); }
+
+function setStep(i, label) {
+  document.getElementById("currentStepVal").textContent = STEPS[i] ? STEPS[i].label : label;
+  renderPipeline(i, null);
+}
+
+function resultBucket(call) {
+  if (call.status === "skipped") return { cls: "b-skipped", label: "SKIP" };
+  const code = call.status_code;
+  if (code == null) return { cls: "b-noresponse", label: "FAIL" };
+  if (code >= 200 && code < 300) return { cls: "b-2xx", label: "PASS" };
+  if (code >= 300 && code < 400) return { cls: "b-3xx", label: String(code) };
+  if (code >= 400 && code < 500) return { cls: "b-4xx", label: "FAIL" };
+  return { cls: "b-5xx", label: "FAIL" };
+}
+
+function severityBadgeClass(sev) {
+  const s = (sev || "").toLowerCase();
+  if (s === "error") return "error";
+  if (s === "warning") return "warning";
+  return "info";
+}
+
+// Distinct from severityBadgeClass above (static-analysis error/warning/info)
+// - this is the API engine's own critical/high/medium/low scale
+// (qa_agent/api_qa/analysis.py), reusing the same badge color buckets
+// resultBucket already established rather than inventing a new palette.
+function apiSeverityBadgeClass(sev) {
+  if (sev === "critical") return "b-5xx";
+  if (sev === "high") return "b-4xx";
+  if (sev === "medium") return "b-3xx";
+  return "b-skipped";
+}
+
+function renderDiscovery(discovery) {
+  const body = document.getElementById("discoveryBody");
+  const project = discovery.project;
+  if (!project) {
+    body.innerHTML = '<div class="empty">Discovery status: ' + esc(discovery.status) +
+      (discovery.errors.length ? " &mdash; " + esc(discovery.errors.join("; ")) : "") + '</div>';
+    return;
+  }
+  const pillRow = (items) => items.length
+    ? '<div class="pill-row">' + items.map(i => '<span class="pill">' + esc(i.name) + '</span>').join("") + '</div>'
+    : '<div class="empty">none detected</div>';
+  body.innerHTML =
+    '<div class="kv"><dt>Type</dt><dd>' + esc(project.application_type) + ' / ' + esc(project.repository_type) + '</dd></div>' +
+    '<p style="margin:0 0 0.3rem;font-size:0.8125rem;color:var(--muted)">Languages</p>' + pillRow(project.languages) +
+    '<p style="margin:0.9rem 0 0.3rem;font-size:0.8125rem;color:var(--muted)">Frameworks</p>' + pillRow(project.frameworks) +
+    '<p style="margin:0.9rem 0 0.3rem;font-size:0.8125rem;color:var(--muted)">Package managers</p>' + pillRow(project.package_managers);
+}
+
+function renderStaticTable(result) {
+  const countEl = document.getElementById("staticCount");
+  const tbody = document.querySelector("#staticTable tbody");
+  tbody.innerHTML = "";
+  const counts = {};
+  for (const f of result.findings) counts[f.severity] = (counts[f.severity] || 0) + 1;
+  const countText = Object.keys(counts).length
+    ? Object.entries(counts).map(([k, v]) => v + " " + k).join(", ") : "no findings";
+  countEl.textContent = result.checked + " file(s) checked (" + result.tools_used.join(", ") + ") · " + countText +
+    (result.tool_errors.length ? " · " + result.tool_errors.length + " tool error(s)" : "");
+  if (result.findings.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No findings.</td></tr>';
+    return;
+  }
+  for (const f of result.findings) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      '<td><span class="badge ' + severityBadgeClass(f.severity) + '">' + esc(f.severity) + '</span></td>' +
+      '<td class="mono">' + esc(f.file) + '</td><td>' + esc(f.line) + '</td>' +
+      '<td>' + esc(f.message) + '</td><td>' + esc(f.tool) + '</td>';
+    tbody.appendChild(tr);
+  }
+}
+
+let planResultCells = {};  // "METHOD /path" -> the row's Result <td> element
+
+function renderPlan(testPlan) {
+  document.getElementById("planPanel").classList.remove("hidden");
+  document.getElementById("planCount").textContent = testPlan.cases.length + " planned test case(s)";
+  document.getElementById("planWarnings").innerHTML =
+    (testPlan.warnings || []).map(w => '<div class="warn-box">' + esc(w) + '</div>').join("");
+  const tbody = document.querySelector("#planTable tbody");
+  tbody.innerHTML = "";
+  planResultCells = {};
+  if (testPlan.cases.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty">No API endpoints discovered.</td></tr>';
+    return;
+  }
+  for (const c of testPlan.cases) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      '<td><span class="method">' + esc(c.method) + '</span></td>' +
+      '<td class="mono">' + esc(c.path) + (c.dynamic ? ' <span class="badge b-skipped">DYNAMIC</span>' : '') + '</td>' +
+      '<td>' + esc(c.description) + '</td>' +
+      '<td><span class="badge b-skipped">PENDING</span></td>';
+    tbody.appendChild(tr);
+    planResultCells[c.method + " " + c.path] = tr.lastElementChild;
+  }
+}
+
+function applyPlanResults(api) {
+  const byKey = {};
+  if (api) for (const c of api.calls) byKey[c.method + " " + c.path] = c;
+  for (const key in planResultCells) {
+    const cell = planResultCells[key];
+    const c = byKey[key];
+    if (!c) { cell.innerHTML = '<span class="badge b-skipped">NOT TESTED</span>'; continue; }
+    const b = resultBucket(c);
+    cell.innerHTML = '<span class="badge ' + b.cls + '">' + esc(c.classification || b.label) + '</span>';
+  }
+}
+
+function renderResultCards(api, diagnoses) {
+  document.getElementById("resultsPanel").classList.remove("hidden");
+  document.getElementById("resultsCount").textContent = api.calls.length + " endpoint(s)";
+  const wrap = document.getElementById("resultCards");
+  wrap.innerHTML = "";
+  const warnEl = document.getElementById("apiWarnings");
+  warnEl.innerHTML = (api.warnings || []).map(w => '<div class="warn-box">' + esc(w) + '</div>').join("");
+  if (api.install_error) {
+    const ie = api.install_error;
+    warnEl.innerHTML += '<div class="warn-box"><strong>npm install failed in ' + esc(ie.dir) + '/</strong></div>';
+  }
+  if (api.calls.length === 0) {
+    wrap.innerHTML = '<div class="empty">No endpoint calls were made.</div>';
+    return;
+  }
+  const diagByKey = {};
+  for (const d of (diagnoses || [])) diagByKey[d.method + " " + d.path] = d;
+  const svByKey = {};
+  for (const sv of (api.schema_validations || [])) svByKey[sv.method + " " + sv.path] = sv;
+
+  for (const c of api.calls) {
+    const b = resultBucket(c);
+    const detail = c.error || c.reason || "";
+    const evidence = c.resolution_evidence ? "Used: " + c.resolution_evidence : "";
+    const diag = diagByKey[c.method + " " + c.path];
+    const sv = svByKey[c.method + " " + c.path];
+    const card = document.createElement("div");
+    card.className = "result-card";
+    card.innerHTML =
+      '<div class="row1">' +
+        '<span class="method">' + esc(c.method) + '</span>' +
+        '<span class="path">' + esc(c.path) + '</span>' +
+        '<span class="code">' + esc(c.status_code == null ? "–" : c.status_code) + '</span>' +
+        '<span class="badge ' + b.cls + '">' + esc(c.classification || b.label) + '</span>' +
+        (c.severity ? '<span class="badge ' + apiSeverityBadgeClass(c.severity) + '" title="Severity">' + esc(c.severity.toUpperCase()) + '</span>' : '') +
+        (sv && sv.status !== "skipped" ? '<span class="badge ' + (sv.status === "pass" ? "b-2xx" : "b-4xx") + '" title="Response schema validation">SCHEMA ' + (sv.status === "pass" ? "OK" : "MISMATCH") + '</span>' : '') +
+        (c.synthetic ? '<span class="badge b-synthetic" title="Built from invented placeholder data, not real evidence: ' + esc((c.synthetic_fields || []).join(", ")) + '">SYNTHETIC DATA</span>' : '') +
+      '</div>' +
+      (c.response_time_ms ? '<div class="timing" style="margin-top:0.25rem">' + Math.round(c.response_time_ms) + 'ms</div>' : '') +
+      (detail ? '<div class="detail">' + esc(detail) + '</div>' : '') +
+      (evidence ? '<div class="detail">' + esc(evidence) + '</div>' : '') +
+      (c.status === "fail" && c.expected ? _expectedActualBlock(c) : '') +
+      (sv && sv.status === "fail" ? _schemaMismatchBlock(sv) : '') +
+      (diag ? _diagnosisBlock(diag, c) : '');
+    wrap.appendChild(card);
+  }
+}
+
+function _expectedActualBlock(c) {
+  return '<div class="detail" style="margin-top:0.4rem">' +
+    '<strong>Expected:</strong> ' + esc(c.expected) + '<br>' +
+    '<strong>Actual:</strong> ' + esc(c.actual) +
+    '</div>';
+}
+
+function _schemaMismatchBlock(sv) {
+  const parts = [];
+  if (sv.missing_fields && sv.missing_fields.length) parts.push('missing field(s): ' + sv.missing_fields.join(", "));
+  if (sv.type_mismatches && sv.type_mismatches.length) parts.push(sv.type_mismatches.join("; "));
+  return '<div class="detail" style="margin-top:0.4rem;color:var(--amber-fg)">' +
+    '&#9888; Response does not match its declared schema' + (parts.length ? " - " + esc(parts.join(" · ")) : "") +
+    '</div>';
+}
+
+function renderProgress(done, total, label) {
+  const wrap = document.getElementById("progressWrap");
+  wrap.classList.remove("hidden");
+  document.getElementById("progressCount").textContent = done + " / " + total;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  document.getElementById("progressFill").style.width = pct + "%";
+  document.getElementById("progressLabel").textContent = label || " ";
+}
+
+function hideProgress() {
+  document.getElementById("progressWrap").classList.add("hidden");
+  document.getElementById("progressFill").style.width = "0%";
+  document.getElementById("progressCount").textContent = "0 / 0";
+  document.getElementById("progressLabel").textContent = " ";
+}
+
+// Live progress (docs/44-live-progress.md): /api/analyze/start returns a
+// job id immediately; this polls /api/analyze/status/<id> until the real
+// background run finishes, updating the progress bar from each real,
+// already-known (done, total, label) the server reports - never a guessed
+// or animated percentage. Returns the same {ok, data} shape the old direct
+// `fetch("/api/analyze")` call produced, so everything downstream in run()
+// that already reads resp.ok/data is completely unaffected.
+async function runAnalyzeJob(form) {
+  const startResp = await fetch("/api/analyze/start", { method: "POST", body: form });
+  const startData = await startResp.json();
+  if (!startResp.ok) return { ok: false, data: startData };
+  const jobId = startData.job_id;
+
+  while (true) {
+    await new Promise(r => setTimeout(r, 800));
+    let statusResp, statusData;
+    try {
+      statusResp = await fetch("/api/analyze/status/" + jobId);
+      statusData = await statusResp.json();
+    } catch (err) {
+      return { ok: false, data: { error: "lost connection while polling for progress: " + String(err) } };
+    }
+    if (!statusResp.ok) return { ok: false, data: statusData };
+    renderProgress(statusData.done, statusData.total, statusData.label);
+    if (statusData.status === "running") continue;
+    if (statusData.status === "done") return { ok: true, data: statusData.result };
+    return { ok: false, data: { error: statusData.error || "analysis failed", timed_out: !!statusData.timed_out } };
+  }
+}
+
+function renderNegativeTests(api) {
+  const panel = document.getElementById("negativeTestsPanel");
+  const cases = (api && api.negative_calls) || [];
+  if (cases.length === 0) {
+    panel.classList.add("hidden");
+    return;
+  }
+  panel.classList.remove("hidden");
+  document.getElementById("negativeTestsCount").textContent = cases.length + " case(s)";
+  const tbody = document.querySelector("#negativeTestsTable tbody");
+  tbody.innerHTML = "";
+  for (const nc of cases) {
+    const tr = document.createElement("tr");
+    const b = nc.status === "pass" ? { cls: "b-2xx", label: "PASS" } : { cls: "b-4xx", label: "FAIL" };
+    tr.innerHTML =
+      '<td><span class="method">' + esc(nc.method) + '</span></td>' +
+      '<td class="mono">' + esc(nc.path) + '</td>' +
+      '<td>' + esc(nc.case_name) + '</td>' +
+      '<td>' + esc(nc.expected) + '</td>' +
+      '<td>' + esc(nc.actual_summary || "") + '</td>' +
+      '<td><span class="badge ' + b.cls + '">' + b.label + '</span></td>' +
+      '<td>' + (nc.severity ? '<span class="badge ' + apiSeverityBadgeClass(nc.severity) + '">' + esc(nc.severity.toUpperCase()) + '</span>' : '') +
+        (nc.synthetic ? ' <span class="badge b-synthetic" title="Derived from a positive call that used synthetic data">SYNTHETIC</span>' : '') + '</td>';
+    tbody.appendChild(tr);
+  }
+}
+
+function _diagnosisBlock(diag, call) {
+  // docs/45-synthetic-mutation-testing.md: a FAIL built from synthetic
+  // (invented) data must never be diagnosed with the same confidence as
+  // one built from real evidence - the AI write-up says so explicitly,
+  // right alongside the diagnosis itself, never left to the SYNTHETIC DATA
+  // badge on the card above to carry that context alone.
+  const syntheticNote = (call && call.synthetic)
+    ? '<div class="detail" style="color:var(--amber-fg)">&#9888; This call used synthetic (invented) data for: ' +
+      esc((call.synthetic_fields || []).join(", ")) + ' - treat this diagnosis as lower-confidence than one against real evidence.</div>'
+    : '';
+  if (diag.diagnosis_status !== "diagnosed") {
+    return '<div class="detail" style="margin-top:0.5rem;color:var(--amber-fg)">' +
+      '&#129302; AI diagnosis: ' + esc(diag.summary || diag.diagnosis_status) + '</div>' + syntheticNote;
+  }
+  return '<div style="margin-top:0.6rem;padding-top:0.6rem;border-top:1px dashed var(--border)">' +
+    '<div style="font-size:0.75rem;font-weight:700;color:var(--accent)">&#129302; AI diagnosis (' + esc(diag.model) + ')</div>' +
+    syntheticNote +
+    '<div class="detail" style="margin-top:0.25rem"><strong>Root cause:</strong> ' + esc(diag.likely_root_cause || diag.summary) + '</div>' +
+    (diag.recommended_action ? '<div class="detail"><strong>Suggested fix:</strong> ' + esc(diag.recommended_action) + '</div>' : '') +
+    '</div>';
+}
+
+function renderSummary(api) {
+  // docs/45-synthetic-mutation-testing.md: real-evidence and synthetic
+  // outcomes are two separate tallies computed once, server-side, by
+  // render.py's own `_summary_counts` (`api.summary`) - never recomputed
+  // or re-blended here, so the web view can't silently drift from the
+  // CLI/CSV/HTML reports' own real-vs-synthetic split.
+  const summary = api.summary || { real_evidence: { pass: 0, fail: 0, skipped: 0 }, synthetic: { pass: 0, fail: 0 } };
+  const real = summary.real_evidence, synth = summary.synthetic;
+  const hasSynthetic = (synth.pass || 0) + (synth.fail || 0) > 0;
+  document.getElementById("summaryPanel").classList.remove("hidden");
+  document.getElementById("summaryGrid").innerHTML =
+    '<div class="item"><div class="ic blue">&#128203;</div><div><span class="lbl">Total Endpoints</span><span class="num">' + api.calls.length + '</span></div></div>' +
+    '<div class="item"><div class="ic green">&#10003;</div><div><span class="lbl">Passed (real evidence)</span><span class="num">' + real.pass + '</span></div></div>' +
+    '<div class="item"><div class="ic red">&#10007;</div><div><span class="lbl">Failed (real evidence)</span><span class="num">' + real.fail + '</span></div></div>' +
+    '<div class="item"><div class="ic gray">&#8856;</div><div><span class="lbl">Skipped</span><span class="num">' + real.skipped + '</span></div></div>' +
+    (hasSynthetic
+      ? '<div class="item"><div class="ic amber">&#9888;</div><div><span class="lbl">Passed (synthetic data)</span><span class="num">' + synth.pass + '</span></div></div>' +
+        '<div class="item"><div class="ic amber">&#9888;</div><div><span class="lbl">Failed (synthetic data)</span><span class="num">' + synth.fail + '</span></div></div>'
+      : '') +
+    '<div class="item" style="grid-column:1/-1"><div class="ic gray">&#9201;</div><div><span class="lbl">Total Time</span><span class="num">' + api.total_duration.toFixed(2) + 's</span></div></div>';
+}
+
+function renderNextSteps(data) {
+  const panel = document.getElementById("nextStepsPanel");
+  const api = data.api_qa;
+  let msg;
+  if (!api) {
+    msg = "Live API testing was not run. Enable “Also run live API tests” and re-run to exercise the real endpoints.";
+  } else {
+    const failing = api.calls.filter(c => c.status === "fail").length;
+    if (api.server_status !== "started") {
+      msg = "The server did not start (" + esc(api.server_status) + "). Check the server log tab in the terminal above, or your project's own start script, then re-run.";
+    } else if (failing > 0) {
+      msg = failing + " endpoint(s) failed. Review the response detail in each card - diagnosis/repair via an AI provider is not wired into this web view yet.";
+    } else {
+      msg = "All attempted endpoints passed. Skipped ones need either a request body this tool can't safely invent, or a dynamic path parameter it couldn't resolve from real evidence.";
+    }
+  }
+  document.getElementById("nextStepsBody").textContent = msg;
+  panel.classList.remove("hidden");
+}
+
+async function run() {
+  if (selectedFiles.length === 0) return;
+  runBtn.disabled = true;
+  document.getElementById("planPanel").classList.add("hidden");
+  document.getElementById("runPanel").classList.remove("hidden");
+  document.getElementById("resultsPanel").classList.add("hidden");
+  document.getElementById("negativeTestsPanel").classList.add("hidden");
+  document.getElementById("summaryPanel").classList.add("hidden");
+  hideProgress();
+  document.getElementById("nextStepsPanel").classList.add("hidden");
+  document.getElementById("agentStatusText").textContent = "Running…";
+  termLines = [];
+  document.getElementById("terminal").innerHTML = "";
+  document.getElementById("runTitle").textContent = "Running QA Agent…";
+  document.getElementById("runSub").textContent = "Uploading project and starting checks";
+  document.getElementById("runSpinner").className = "spinner";
+  startElapsed();
+
+  const folderName = selectedFiles[0].path.split("/")[0] || selectedFiles[0].path;
+  termLine('<span class="hd">Starting QA Agent for: ' + esc(folderName) + '</span>');
+  setStep(0, "Discovery");
+  termLine("Discovering project structure…");
+
+  // A real "QA engineer" workflow names its test cases before running
+  // anything slow - a fast, discovery-only round trip, separate from the
+  // slow /api/analyze call below (which still proceeds exactly as before).
+  try {
+    const planForm = new FormData();
+    for (const f of selectedFiles) planForm.append("files", f.file, f.path);
+    const planResp = await fetch("/api/plan", { method: "POST", body: planForm });
+    const planData = await planResp.json();
+    if (planResp.ok) {
+      termLine('<span class="ok">✓ Test plan: ' + planData.test_plan.cases.length + ' case(s) generated</span>');
+      renderPlan(planData.test_plan);
+    } else {
+      termLine('<span class="warn">⚠ Test plan generation failed: ' + esc(planData.error || planResp.statusText) + '</span>');
+    }
+  } catch (err) {
+    termLine('<span class="warn">⚠ Test plan request failed: ' + esc(String(err)) + '</span>');
+  }
+
+  const form = new FormData();
+  for (const f of selectedFiles) form.append("files", f.file, f.path);
+  form.append("run_api_test", runApiTest.checked ? "true" : "false");
+  form.append("diagnose", diagnoseFailures.checked ? "true" : "false");
+
+  // Cosmetic pacing only - the real result below always overrides this.
+  const stepTimer = setTimeout(() => { setStep(1, "Static Analysis"); termLine("Running static analysis…"); }, 900);
+  const stepTimer2 = setTimeout(() => { setStep(2, "Start Server"); termLine("Starting development server…"); }, 1800);
+  const stepTimer3 = setTimeout(() => { setStep(3, "API Testing"); termLine("Running API tests…"); }, 2600);
+
+  try {
+    const { ok, data } = await runAnalyzeJob(form);
+    clearTimeout(stepTimer); clearTimeout(stepTimer2); clearTimeout(stepTimer3);
+    stopElapsed();
+    hideProgress();
+    if (!ok) {
+      renderPipeline(0, 0);
+      termLine("Error: " + esc(data.error || "unknown error"), "fail");
+      document.getElementById("runTitle").textContent = "Run failed";
+      document.getElementById("runSpinner").outerHTML = '<div class="spinner done" style="background:var(--red-bg);color:var(--red-fg)" id="runSpinner">&#10007;</div>';
+      document.getElementById("agentStatusText").textContent = "Agent Ready";
+      runBtn.disabled = false;
+      return;
+    }
+
+    // --- discovery ---
+    const project = data.discovery.project;
+    if (project) {
+      termLine("<span class=\"ok\">✓ Project type: " + esc(project.frameworks.map(f=>f.name).join(", ") || project.application_type) + "</span>");
+    }
+    renderDiscovery(data.discovery);
+
+    // --- static analysis ---
+    const sr = data.static_analysis;
+    termLine("<span class=\"ok\">✓ Static analysis: " + sr.checked + " file(s), " + sr.findings.length + " finding(s)</span>");
+    renderStaticTable(sr);
+
+    // --- api qa ---
+    const api = data.api_qa;
+    if (api) {
+      termLine("<span class=\"dim\">✓ Found " + api.calls.length + " API endpoint(s)</span>");
+      if (api.server_status === "started") {
+        termLine('<span class="ok">✓ Server started (' + esc(api.base_url || "") + ')</span>');
+      } else {
+        termLine('<span class="fail">✕ Server ' + esc(api.server_status) + ': ' + esc(api.server_detail || "") + '</span>');
+      }
+      for (const w of (api.warnings || [])) termLine('<span class="warn">⚠ ' + esc(w) + '</span>');
+      termLine("Running API tests…");
+      for (const c of api.calls) {
+        termLine("&rarr; " + esc(c.method) + " " + esc(c.path));
+        if (c.status === "skipped") {
+          termLine('<span class="warn">&larr; SKIPPED (' + esc(c.reason) + ')</span>');
+        } else if (c.status === "pass") {
+          termLine('<span class="ok">&larr; ' + esc(c.status_code) + ' OK (' + Math.round(c.response_time_ms || 0) + 'ms)</span>');
+        } else {
+          termLine('<span class="fail">&larr; ' + esc(c.status_code == null ? "NO RESPONSE" : c.status_code) +
+            ' (' + esc(c.error || c.reason || "") + ')</span>');
+        }
+      }
+      if (api.server_log_tail) {
+        termLine('<span class="dim">--- server log ---</span>');
+        api.server_log_tail.split("\n").slice(-15).forEach(l => termLine('<span class="dim">' + esc(l) + '</span>'));
+      }
+      const passN = api.calls.filter(c => c.status === "pass").length;
+      const failN = api.calls.filter(c => c.status === "fail").length;
+      const skipN = api.calls.filter(c => c.status === "skipped").length;
+      termLine('<span class="hd">API testing complete: ' + failN + ' fail, ' + passN + ' pass, ' + skipN + ' skipped</span>');
+      if (data.diagnoses) {
+        termLine('<span class="dim">&#129302; AI diagnosis (Groq): ' + data.diagnoses.length + ' failure(s) diagnosed</span>');
+        for (const d of data.diagnoses) {
+          if (d.diagnosis_status === "diagnosed") {
+            termLine('<span class="warn">  ' + esc(d.method) + ' ' + esc(d.path) + ': ' + esc(d.likely_root_cause || d.summary) + '</span>');
+          } else {
+            termLine('<span class="dim">  ' + esc(d.method) + ' ' + esc(d.path) + ': ' + esc(d.summary || d.diagnosis_status) + '</span>');
+          }
+        }
+      }
+      renderResultCards(api, data.diagnoses);
+      renderNegativeTests(api);
+      renderSummary(api);
+      applyPlanResults(api);
+      renderPipeline(5, null);
+    } else {
+      termLine('<span class="dim">Live API testing was not requested.</span>');
+      renderNegativeTests(null);
+      applyPlanResults(null);
+      renderPipeline(4, null);
+      document.getElementById("pipeline").querySelectorAll(".step")[2].classList.add("hidden");
+      document.getElementById("pipeline").querySelectorAll(".step")[3].classList.add("hidden");
+    }
+    renderNextSteps(data);
+
+    document.getElementById("runTitle").textContent = "Run complete";
+    document.getElementById("runSub").textContent = "QA Agent finished";
+    document.getElementById("currentStepVal").textContent = "Complete";
+    document.getElementById("runSpinner").outerHTML = '<div class="spinner done" id="runSpinner">&#10003;</div>';
+    document.getElementById("agentStatusText").textContent = "Agent Ready";
+  } catch (err) {
+    clearTimeout(stepTimer); clearTimeout(stepTimer2); clearTimeout(stepTimer3);
+    stopElapsed();
+    hideProgress();
+    termLine("Request failed: " + esc(String(err)), "fail");
+    document.getElementById("agentStatusText").textContent = "Agent Ready";
+  } finally {
+    runBtn.disabled = false;
+  }
+}
+
+runBtn.addEventListener("click", run);
+</script>
+</body>
+</html>

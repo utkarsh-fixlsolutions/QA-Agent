@@ -470,19 +470,31 @@ def test_context_modules_never_import_subprocess_network_or_ai_provider(suite):
 
 
 def test_qa_agent_ai_package_is_completely_untouched_by_this_phase(suite):
-    """docs/20's own hard rule: nothing in qa_agent/ai/ may reference
-    RepositoryContext or context_builder after this phase - the whole point
-    of the "IMPORTANT ARCHITECTURE RULE" section is that Part 2 is purely
-    additive to qa_agent/project/, never wired into the AI layer.
+    """docs/20's own hard rule, scoped to *this phase's own files*
+    (`context.py`/`context_builder.py`, already checked above): Phase F
+    Part 2 itself never reaches into the AI layer.
+
+    This does not - and, per docs/20's own text, was never meant to -
+    forbid a *later* phase from reading `RepositoryContext` as input, the
+    same one-directional exception `validator.py` (Phase E Part 3) already
+    established for `runner.run`'s output. Phase G Part 3 (docs/23) is
+    exactly that later phase: `diagnosis_parser.py`/`diagnosis_prompts.py`
+    deliberately read `RepositoryContext` as real evidence for diagnosing a
+    runtime failure - a documented, explicit decision, not a regression.
+    Checking the whole `qa_agent/ai/` directory here (as an earlier version
+    of this test did) stopped being precise the moment that legitimate,
+    later integration existed - the same category of over-broad-glob
+    staleness already fixed once before in `test_runtime_planner.py`
+    (Phase G Part 2).
     """
     ai_dir = Path(__file__).resolve().parent.parent.parent / "qa_agent" / "ai"
     offending = []
-    for path in ai_dir.glob("*.py"):
-        text = path.read_text(encoding="utf-8")
+    for name in ("explainer.py", "fixer.py", "summarizer.py", "repair.py", "repair_loop.py", "decision.py", "apply.py", "workspace.py", "validator.py"):
+        text = (ai_dir / name).read_text(encoding="utf-8")
         if "RepositoryContext" in text or "build_repository_context" in text or "context_builder" in text:
-            offending.append(path.name)
+            offending.append(name)
     suite.check(
-        "no file in qa_agent/ai/ references RepositoryContext/build_repository_context/context_builder",
+        "no pre-existing (Phase D/E) AI module references RepositoryContext/build_repository_context/context_builder",
         offending == [],
         " ({})".format(offending),
     )

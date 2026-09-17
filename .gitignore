@@ -5,3 +5,6 @@ __pycache__/
 *.py[cod]
 node_modules/
 tests/fixtures/shellcheck/shellcheck.exe
+benchmark_results/
+.env
+web/logs/
