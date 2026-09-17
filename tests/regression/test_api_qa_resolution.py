@@ -146,11 +146,25 @@ def test_resolve_path_parameter_rejects_multi_param_paths(suite):
     suite.check("a clear reason names the real limitation", "one dynamic segment" in reason)
 
 
-def test_resolve_path_parameter_rejects_non_trailing_param(suite):
+def test_resolve_path_parameter_resolves_a_non_trailing_param(suite):
+    """Phase 2 (docs/53): intentionally changed behavior, not a regression -
+    a dynamic segment followed by real, literal segments (`/forms/{formId}
+    /responses`-shaped nested resources) is now resolved exactly like a
+    trailing one, using the same real parent-collection evidence; the
+    literal suffix (`/profile` here) is preserved in the substituted path.
+    Previously this shape was refused outright (`test_resolve_path_
+    parameter_rejects_non_trailing_param`, before this change) - a real,
+    named scope boundary this phase deliberately lifts, since the
+    substitution logic itself never actually depended on trailing position.
+    """
     endpoint = _endpoint(path="/api/users/{user_id}/profile", dynamic=True)
     evidence = (_evidence("/api/users", [{"id": 1}]),)
-    concrete, reason, _ = resolve_path_parameter(endpoint, evidence)
-    suite.check("a non-trailing dynamic segment is not resolved by this strategy", concrete is None)
+    concrete, reason, synthetic_field = resolve_path_parameter(endpoint, evidence)
+    suite.check("a non-trailing dynamic segment is now resolved from real evidence",
+                 concrete == "/api/users/1/profile", " (got: {!r})".format(concrete))
+    suite.check("never marked synthetic - this came from a real prior response",
+                 synthetic_field is None)
+    suite.check("the evidence trail names the real source", "real response" in reason)
 
 
 # --- build_request_body (pure logic) ------------------------------------
@@ -161,7 +175,7 @@ def _openapi_doc(paths=None, schemas=None):
 
 def test_build_request_body_empty_when_no_body_declared(suite):
     schema_doc = _openapi_doc(paths={"/api/reset": {"post": {}}})
-    body, note, synthetic_fields = build_request_body(schema_doc, "POST", "/api/reset")
+    body, note, synthetic_fields, _evidence_source = build_request_body(schema_doc, "POST", "/api/reset")
     suite.check("an empty, valid body is constructed", body == {})
     suite.check("evidence explains why", "no request body" in note)
     suite.check("nothing synthesized", synthetic_fields == ())
@@ -177,7 +191,7 @@ def test_build_request_body_uses_schema_defaults(suite):
             "properties": {"name": {"type": "string", "default": "test"}},
         }},
     )
-    body, note, synthetic_fields = build_request_body(schema_doc, "POST", "/api/users")
+    body, note, synthetic_fields, _evidence_source = build_request_body(schema_doc, "POST", "/api/users")
     suite.check("the real schema default is used", body == {"name": "test"})
     suite.check("evidence names the real source", "schema defaults" in note)
     suite.check("a real default is never marked synthetic", synthetic_fields == ())
@@ -198,7 +212,7 @@ def test_build_request_body_skipped_when_required_field_has_no_default_and_synth
             "properties": {"name": {"type": "string"}, "email": {"type": "string"}},
         }},
     )
-    body, reason, synthetic_fields = build_request_body(
+    body, reason, synthetic_fields, _evidence_source = build_request_body(
         schema_doc, "POST", "/api/users", allow_synthetic_mutations=False,
     )
     suite.check("no body is invented when a required field has no default", body is None)
@@ -207,7 +221,7 @@ def test_build_request_body_skipped_when_required_field_has_no_default_and_synth
 
 
 def test_build_request_body_skipped_when_no_schema_available(suite):
-    body, reason, synthetic_fields = build_request_body(None, "POST", "/api/users")
+    body, reason, synthetic_fields, _evidence_source = build_request_body(None, "POST", "/api/users")
     suite.check("no schema at all, and no endpoint to fall back on -> skipped", body is None)
     suite.check("a clear reason is given", "no OpenAPI schema" in reason)
     suite.check("nothing synthesized on the skip path", synthetic_fields == ())
@@ -215,7 +229,7 @@ def test_build_request_body_skipped_when_no_schema_available(suite):
 
 def test_build_request_body_skipped_when_operation_not_in_schema(suite):
     schema_doc = _openapi_doc(paths={})
-    body, reason, synthetic_fields = build_request_body(schema_doc, "POST", "/api/users")
+    body, reason, synthetic_fields, _evidence_source = build_request_body(schema_doc, "POST", "/api/users")
     suite.check("an operation absent from the real schema, with no endpoint to fall back on, "
                 "is not attempted", body is None)
     suite.check("nothing synthesized on the skip path", synthetic_fields == ())
@@ -685,7 +699,7 @@ if __name__ == "__main__":
         test_resolve_path_parameter_skips_when_parent_response_has_no_usable_field,
         test_resolve_path_parameter_rejects_boolean_values,
         test_resolve_path_parameter_rejects_multi_param_paths,
-        test_resolve_path_parameter_rejects_non_trailing_param,
+        test_resolve_path_parameter_resolves_a_non_trailing_param,
         test_build_request_body_empty_when_no_body_declared,
         test_build_request_body_uses_schema_defaults,
         test_build_request_body_skipped_when_required_field_has_no_default_and_synthetic_disallowed,

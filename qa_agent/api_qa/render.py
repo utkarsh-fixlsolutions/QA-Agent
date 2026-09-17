@@ -13,6 +13,7 @@ import io
 import json
 
 from .analysis import CLASSIFICATIONS, classify_call_outcome, classify_call_severity, expected_actual
+from .models import EXPECTED_NOT_FOUND
 
 _STATUS_SYMBOLS = {"pass": "PASS", "fail": "FAIL", "skipped": "SKIP"}
 
@@ -78,7 +79,10 @@ def render(result):
             if call.response_sample:
                 lines.append("        body: {}".format(call.response_sample[:200]))
         if call.resolution_evidence:
-            lines.append("        evidence: {}".format(call.resolution_evidence))
+            evidence_line = "        evidence: {}".format(call.resolution_evidence)
+            if call.body_evidence_source:
+                evidence_line += "  [source: {}]".format(call.body_evidence_source)
+            lines.append(evidence_line)
 
     lines.append("")
     # docs/45: real-evidence and synthetic outcomes are always reported as
@@ -111,6 +115,48 @@ def render(result):
         lines.append("  Server log (during this run):")
         tail_lines = result.server_log_tail.splitlines()[-_MAX_LOG_TAIL_LINES_SHOWN:]
         lines.extend("    | {}".format(line) for line in tail_lines)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_test_plan(result):
+    """The Phase 3 functional test plan + its real execution outcome
+    (docs/54) - a distinct block from `render()`'s own existing per-endpoint
+    verification output, shown separately so the two passes are never
+    visually blended (they can legitimately disagree in shape: the same
+    endpoint may appear once in `render()`'s table and twice here).
+    """
+    if not result.test_plan:
+        return ""
+    lines = ["Functional Test Plan", "-" * len("Functional Test Plan"), ""]
+    results_by_id = {r.test_id: r for r in result.functional_results}
+    for test in result.test_plan:
+        outcome = results_by_id.get(test.test_id)
+        lines.append("  {}  {} {}".format(test.test_id, test.endpoint.method, test.endpoint.path))
+        lines.append("      Category:    {}".format(test.category))
+        lines.append("      Purpose:     {}".format(test.purpose))
+        lines.append("      Depends on:  {}".format(", ".join(test.depends_on) if test.depends_on else "none"))
+        lines.append("      Source:      {}".format(test.request_source or "none"))
+        if test.expected_status_kind == EXPECTED_NOT_FOUND:
+            lines.append("      Expected:    404 (resource should no longer exist)")
+        else:
+            lines.append("      Expected:    a successful (2xx) response")
+        if outcome is not None:
+            call = outcome.call
+            if call is not None and call.resolved_path:
+                lines.append("      Concrete:    {} {}".format(test.endpoint.method, call.resolved_path))
+            symbol = {"pass": "PASS", "fail": "FAIL", "skipped": "SKIP"}[outcome.status]
+            actual = "{} {}".format(call.status_code, symbol) if call is not None and call.status_code is not None else symbol
+            if call is not None and call.synthetic:
+                actual = "{} [SYNTHETIC: {}]".format(actual, ", ".join(call.synthetic_fields))
+            lines.append("      Actual:      {}".format(actual))
+            lines.append("      Result:      {} - {}".format(symbol, outcome.verdict_reason))
+        lines.append("")
+
+    counts = {"pass": 0, "fail": 0, "skipped": 0}
+    for r in result.functional_results:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    lines.append("  {} test(s) - {} passed, {} failed, {} skipped".format(
+        len(result.functional_results), counts["pass"], counts["fail"], counts["skipped"]))
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -148,6 +194,10 @@ def _call_to_dict(call):
         # layers are expected to show that distinction, never hide it.
         "synthetic": call.synthetic,
         "synthetic_fields": list(call.synthetic_fields),
+        # Phase 2 (API contract understanding, docs/53): which evidence tier
+        # actually justified this call's own request body - `""` for a call
+        # with no body at all. See `models.BODY_EVIDENCE_SOURCES`.
+        "body_evidence_source": call.body_evidence_source,
     }
 
 
@@ -212,6 +262,27 @@ def _classification_counts(calls):
     return counts
 
 
+def _planned_test_result_to_dict(outcome):
+    test = outcome.test
+    call = outcome.call
+    return {
+        "test_id": outcome.test_id,
+        "method": test.endpoint.method,
+        "path": test.endpoint.path,
+        "category": test.category,
+        "purpose": test.purpose,
+        "depends_on": list(test.depends_on),
+        "request_source": test.request_source,
+        "expected_status_kind": test.expected_status_kind,
+        "resolved_path": call.resolved_path if call is not None else "",
+        "status_code": call.status_code if call is not None else None,
+        "status": outcome.status,
+        "verdict_reason": outcome.verdict_reason,
+        "synthetic": bool(call.synthetic) if call is not None else False,
+        "synthetic_fields": list(call.synthetic_fields) if call is not None else [],
+    }
+
+
 def to_dict(result):
     return {
         "root_path": result.root_path,
@@ -227,6 +298,10 @@ def to_dict(result):
         "negative_calls": [_negative_call_to_dict(nc) for nc in result.negative_calls],
         "schema_validations": [_schema_validation_to_dict(sv) for sv in result.schema_validations],
         "summary": dict(_summary_counts(result.calls), classification=_classification_counts(result.calls)),
+        # Phase 3 (functional API test planning, docs/54) - additive, see
+        # `render_test_plan`'s own docstring for why this is kept separate
+        # from `calls` rather than merged into it.
+        "functional_test_plan": [_planned_test_result_to_dict(r) for r in result.functional_results],
     }
 
 
@@ -240,6 +315,7 @@ _CSV_FIELDNAMES = (
     "method", "path", "classification", "status", "status_code", "response_time_ms",
     "reason", "error", "response_sample", "resolved_path", "resolution_evidence",
     "source_file", "severity", "expected", "actual", "synthetic", "synthetic_fields",
+    "body_evidence_source",
 )
 
 
@@ -298,6 +374,8 @@ def _html_row(call):
     code = call.status_code if call.status_code is not None else "-"
     timing = "{:.0f}ms".format(call.response_time_ms) if call.response_time_ms is not None else "-"
     detail = call.error or call.reason or ""
+    if call.body_evidence_source:
+        detail = "{} [Evidence: {}]".format(detail, call.body_evidence_source).strip()
     if call.synthetic:
         # docs/45: a synthetic result is never left visually identical to a
         # real-evidence one - same color bucket (it really is a real HTTP

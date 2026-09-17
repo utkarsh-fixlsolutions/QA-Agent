@@ -31,10 +31,13 @@ here unmodified except for the small, additive `path_override`/`body`/
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Optional, Tuple
 
+from . import test_evidence as _test_evidence
 from . import zod_schema as _zod_schema
 from .analysis import classify_negative_case_severity, classify_schema_validation_severity
 from .http_client import call_endpoint
@@ -42,6 +45,12 @@ from .models import (
     CALL_FAIL,
     CALL_PASS,
     CALL_SKIPPED,
+    EVIDENCE_OPENAPI,
+    EVIDENCE_SCHEMA,
+    EVIDENCE_SOURCE_HINT,
+    EVIDENCE_SYNTHETIC,
+    EVIDENCE_TEST_EXAMPLE,
+    EVIDENCE_UNKNOWN,
     ApiCallResult,
     ApiEndpoint,
     NegativeCallResult,
@@ -71,6 +80,17 @@ def _looks_like_id_param(param_name: str) -> bool:
     """
     lowered = param_name.lower()
     return lowered == "id" or lowered.endswith("_id") or lowered.endswith("id")
+
+
+def synthesize_path_parameter_value(param_name: str):
+    """The exact same numeric-sentinel-first-for-id-shaped-names rule
+    `resolve_path_parameter`'s own synthetic fallback already uses
+    internally - exposed publicly (Phase 3, docs/54) so `planning.py`'s
+    dependency-sourced id resolution (e.g. a "verify deletion" test whose
+    own prerequisite produced no usable id) can reuse the identical rule
+    rather than a second, silently-divergent copy of it.
+    """
+    return 1 if _looks_like_id_param(param_name) else "qa-agent-test-id"
 
 # --- path-parameter extraction -------------------------------------------
 
@@ -107,18 +127,25 @@ def _param_token(path: str, param_name: str) -> str:
 def _parent_collection_path(path: str, param_name: str) -> Optional[str]:
     """The real, structural REST convention this whole strategy rests on,
     named explicitly rather than pretending to handle arbitrary path
-    shapes: the collection endpoint for `/api/users/{user_id}` (or
-    Express's own `/api/users/:user_id`) is its own path with the last
-    dynamic segment (and everything after it) removed - `/api/users`.
-    Returns `None` if that segment is not actually the last segment of
-    `path` (a shape this strategy does not attempt to resolve - never a
-    guess at what the "real" parent might be).
+    shapes: the collection endpoint for a dynamic segment is its own path
+    with that segment (and everything after it) removed - `/api/users` for
+    `/api/users/{user_id}`, and just as validly `/forms` for
+    `/forms/{formId}/responses` (Phase 2, docs/53: the dynamic segment need
+    not be the trailing one - a real, common nested-resource shape). Once a
+    real value is resolved, the caller substitutes it into the *original*
+    full path (`dynamic_endpoint.path.replace(token, value)`), which
+    already preserves whatever real, literal segments follow it - this
+    function only ever needs to name the real parent collection to gather
+    evidence from. Returns `None` if `param_name`'s own token is not
+    actually present in `path` at all (should not happen given the
+    caller's own gating, but never assumed).
     """
     segments = path.strip("/").split("/")
     token = _param_token(path, param_name)
-    if not segments or segments[-1] != token:
+    if token not in segments:
         return None
-    parent = segments[:-1]
+    index = segments.index(token)
+    parent = segments[:index]
     return "/" + "/".join(parent) if parent else "/"
 
 
@@ -210,8 +237,8 @@ def resolve_path_parameter(
     parent_path = _parent_collection_path(dynamic_endpoint.path, param_name)
     if parent_path is None:
         return None, (
-            "'{}' is not the final path segment of '{}' - this strategy only resolves a "
-            "trailing dynamic segment against its own structural parent collection endpoint"
+            "'{}' could not be located as a real path segment of '{}' - no structural parent "
+            "collection endpoint could be determined"
             .format(_param_token(dynamic_endpoint.path, param_name), dynamic_endpoint.path)
         ), None
 
@@ -269,6 +296,46 @@ def fetch_openapi_schema(base_url: str, timeout: float):
     return result.response_json
 
 
+# Real, named, bounded locations only - never an unbounded repository scan
+# (the same "prune, don't wander" discipline every discovery strategy in
+# this project already follows). A `.yaml`/`.yml` spec is a real, common
+# form too (Phase 2's own scope list names it explicitly) but is
+# deliberately not attempted here: this project has no YAML-parsing
+# dependency today, and adding one is real, separate, out-of-scope
+# infrastructure work - named as a known limitation, not silently ignored.
+_STATIC_OPENAPI_CANDIDATES = (
+    "openapi.json", "swagger.json",
+    "spec/openapi.json", "specs/openapi.json", "docs/openapi.json", "api/openapi.json",
+    "spec/swagger.json", "specs/swagger.json", "docs/swagger.json", "api/swagger.json",
+)
+
+_MAX_STATIC_SCHEMA_BYTES = 5_000_000
+
+
+def find_static_openapi_schema(root):
+    """A real, already-checked-out `openapi.json`/`swagger.json` file the
+    target project ships with itself (Phase 2, docs/53) - tried only as a
+    fallback when the live server never served its own `/openapi.json` (see
+    `resolve_and_execute`'s own `_schema()` closure): a running server's own
+    live document reflects the code actually being tested right now, which
+    outranks a possibly-stale file checked into the repository. Returns the
+    real, parsed document, or `None` when nothing usable is found - never
+    fabricated, never treated as fatal.
+    """
+    root = Path(root)
+    for rel in _STATIC_OPENAPI_CANDIDATES:
+        candidate = root / rel
+        try:
+            if not candidate.is_file() or candidate.stat().st_size > _MAX_STATIC_SCHEMA_BYTES:
+                continue
+            doc = json.loads(candidate.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(doc, dict) and "paths" in doc:
+            return doc
+    return None
+
+
 # Sentinel distinguishing "this operation/schema could not be found at
 # all" from the real, valid fact "this operation declares no request body"
 # (which is represented as a real `None`, not this sentinel).
@@ -308,46 +375,53 @@ def build_request_body(
     schema_doc, method: str, path: str, endpoint: Optional[ApiEndpoint] = None,
     allow_synthetic_mutations: bool = DEFAULT_ALLOW_SYNTHETIC_MUTATIONS,
 ):
-    """Returns `(body_dict, evidence_text, synthetic_fields)` on success, or
-    `(None, skip_reason, ())`. `synthetic_fields` is an empty tuple for a
-    body built entirely from real schema defaults (docs/33's original,
-    unchanged behavior) - non-empty names exactly which field(s) were
-    synthesized (docs/45) rather than found as real evidence.
+    """Returns `(body_dict, evidence_text, synthetic_fields, evidence_source)`
+    on success, or `(None, skip_reason, (), evidence_source)`. `synthetic_
+    fields` is an empty tuple for a body built entirely from real schema
+    defaults (docs/33's original, unchanged behavior) - non-empty names
+    exactly which field(s) were synthesized (docs/45) rather than found as
+    real evidence. `evidence_source` (Phase 2, docs/53) is one of
+    `models.BODY_EVIDENCE_SOURCES` - the strongest evidence tier that
+    actually justified this body, a structured fact alongside the existing
+    human-readable `evidence_text`.
 
     Precedence when a live OpenAPI schema describes this operation:
     1. Every required property has its own real, schema-declared `default`
        -> real body, `synthetic_fields=()` (docs/33's original behavior,
-       unchanged).
+       unchanged), `evidence_source=EVIDENCE_OPENAPI`.
     2. Some required properties lack a default, `allow_synthetic_mutations`
        is `True` -> those specific fields are synthesized
        (`synthesize_value`, using the property's own declared `example`/
        `enum`/`type`/`format` when present), everything else stays a real
        default - a body is never invented as a fabricated block when part
-       of it is already known for real.
+       of it is already known for real. Still `evidence_source=EVIDENCE_
+       OPENAPI` - the schema itself is what named these fields as required.
     3. Same, but `allow_synthetic_mutations` is `False` -> unchanged
        original behavior: skip, honest reason.
 
     When no OpenAPI schema describes this operation at all (`schema is
     _MISSING`) and `allow_synthetic_mutations` is `True`, falls back to
-    `endpoint`'s own source-derived evidence (docs/45,
-    `discovery.py`'s `body_field_hints`/`reads_request_body`): named field
-    hints become a fully-synthetic body; a bare "reads a body, shape
-    unknown" fact becomes a minimal one-field synthetic body, rather than
-    an outright skip. No body-reading evidence at all still skips, honestly
-    - this never invents fields from nothing.
+    `endpoint`'s own evidence, in Phase 2's own explicit priority order
+    (docs/53) - see `_fallback_from_source_hints`'s own docstring for the
+    exact tiers. No body-reading evidence at all still skips, honestly -
+    this never invents fields from nothing - and is reported as `CONTRACT
+    UNKNOWN`, `evidence_source=EVIDENCE_UNKNOWN`, never silently presented
+    as if the contract genuinely were known.
     """
     if schema_doc is None:
         return _fallback_from_source_hints(endpoint, allow_synthetic_mutations) or (
-            None, "no OpenAPI schema is available to construct a request body", ()
+            None, "CONTRACT UNKNOWN - no OpenAPI schema is available to construct a request body",
+            (), EVIDENCE_UNKNOWN,
         )
 
     schema = _operation_request_schema(schema_doc, method, path)
     if schema is _MISSING:
         return _fallback_from_source_hints(endpoint, allow_synthetic_mutations) or (
-            None, "the OpenAPI schema does not describe {} {}".format(method, path), ()
+            None, "CONTRACT UNKNOWN - the OpenAPI schema does not describe {} {}".format(method, path),
+            (), EVIDENCE_UNKNOWN,
         )
     if schema is None:
-        return {}, "OpenAPI schema declares no request body for {} {}".format(method, path), ()
+        return {}, "OpenAPI schema declares no request body for {} {}".format(method, path), (), EVIDENCE_OPENAPI
 
     required = schema.get("required") or []
     properties = schema.get("properties") or {}
@@ -364,7 +438,7 @@ def build_request_body(
         return None, (
             "no deterministic request body could be constructed for {} {}: required field(s) {} "
             "have no schema default".format(method, path, ", ".join(repr(m) for m in missing))
-        ), ()
+        ), (), EVIDENCE_OPENAPI
 
     synthetic_fields = list(missing)
     for name in missing:
@@ -378,15 +452,33 @@ def build_request_body(
         evidence = "empty body (OpenAPI schema declares no required fields) for {} {}".format(method, path)
     else:
         evidence = "body {} (OpenAPI schema defaults for required field(s)) for {} {}".format(body, method, path)
-    return body, evidence, tuple(synthetic_fields)
+    return body, evidence, tuple(synthetic_fields), EVIDENCE_OPENAPI
 
 
 def _fallback_from_source_hints(endpoint: Optional[ApiEndpoint], allow_synthetic_mutations: bool):
     """`None` when no fallback applies (caller uses its own honest skip
-    reason); otherwise `(body, evidence, synthetic_fields)` built entirely
-    from `endpoint`'s own source-derived facts (docs/45) - never invoked at
-    all when `allow_synthetic_mutations` is `False`, or when `endpoint`
-    shows no evidence of reading a request body in the first place.
+    reason); otherwise `(body, evidence, synthetic_fields, evidence_source)`
+    built entirely from `endpoint`'s own evidence - never invoked at all
+    when `allow_synthetic_mutations` is `False`, or when `endpoint` shows no
+    evidence of reading a request body in the first place. Checked in
+    Phase 2's own explicit priority order (docs/53, tiers 2-4 of the
+    project's overall evidence hierarchy - tier 1, OpenAPI, is already
+    handled by `build_request_body` itself before this is ever reached):
+
+    1. `endpoint.zod_fields` (docs/50) - a real, explicit validation schema
+       (`EVIDENCE_SCHEMA`) - a real declared type, not just a name.
+    2. `endpoint.test_evidence_fields` (docs/53) - a real example found in
+       the project's own existing tests/collections (`EVIDENCE_TEST_
+       EXAMPLE`) - a real, previously-working value, stronger than a bare
+       name (fed to `synthesize_value` as a real `example`, so the literal
+       value is reused verbatim, the same precedence `synthesize_value`
+       already gives an OpenAPI-declared `example`).
+    3. `endpoint.body_field_hints` (docs/45) - route/controller source
+       evidence (`EVIDENCE_SOURCE_HINT`) - a real field *name*, no type or
+       value evidence.
+    4. `endpoint.reads_request_body` alone (docs/45) - the weakest real
+       evidence (`EVIDENCE_SOURCE_HINT`): the handler reads *a* body, shape
+       unknown - a minimal one-field placeholder.
     """
     if not allow_synthetic_mutations or endpoint is None:
         return None
@@ -405,7 +497,23 @@ def _fallback_from_source_hints(endpoint: Optional[ApiEndpoint], allow_synthetic
             "required fields and types, no live OpenAPI schema available) for {} {}".format(
                 body, endpoint.method, endpoint.path)
         )
-        return body, evidence, field_names
+        return body, evidence, field_names, EVIDENCE_SCHEMA
+    if endpoint.test_evidence_fields:
+        # Phase 2 (docs/53): a real example body found in the project's own
+        # existing test files/Postman collections - each real value is
+        # reused verbatim (via `synthesize_value`'s own "example" tier),
+        # stronger evidence than a bare field name alone since it is a real
+        # value already known to be a plausible request for this endpoint.
+        body = {
+            name: synthesize_value(name, {"example": value})
+            for name, value in endpoint.test_evidence_fields
+        }
+        field_names = tuple(name for name, _value in endpoint.test_evidence_fields)
+        evidence = (
+            "body {} (real example values found in the project's own existing tests/collections, "
+            "no live OpenAPI schema available) for {} {}".format(body, endpoint.method, endpoint.path)
+        )
+        return body, evidence, field_names, EVIDENCE_TEST_EXAMPLE
     if endpoint.body_field_hints:
         body = {name: synthesize_value(name, None) for name in endpoint.body_field_hints}
         evidence = (
@@ -413,7 +521,7 @@ def _fallback_from_source_hints(endpoint: Optional[ApiEndpoint], allow_synthetic
             "OpenAPI schema available) for {} {}".format(
                 body, endpoint.source_file, endpoint.method, endpoint.path)
         )
-        return body, evidence, tuple(endpoint.body_field_hints)
+        return body, evidence, tuple(endpoint.body_field_hints), EVIDENCE_SOURCE_HINT
     if endpoint.reads_request_body:
         body = {_MINIMAL_SYNTHETIC_BODY_FIELD: True}
         evidence = (
@@ -421,7 +529,7 @@ def _fallback_from_source_hints(endpoint: Optional[ApiEndpoint], allow_synthetic
             "could be extracted from its source, no live OpenAPI schema available) for {} {}"
             .format(body, endpoint.source_file, endpoint.method, endpoint.path)
         )
-        return body, evidence, (_MINIMAL_SYNTHETIC_BODY_FIELD,)
+        return body, evidence, (_MINIMAL_SYNTHETIC_BODY_FIELD,), EVIDENCE_SOURCE_HINT
     return None
 
 
@@ -554,6 +662,7 @@ def _skip(endpoint: ApiEndpoint, reason: str) -> ApiCallResult:
 def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeout: float,
                          schema_doc=None, on_progress=None,
                          allow_synthetic_mutations: bool = DEFAULT_ALLOW_SYNTHETIC_MUTATIONS,
+                         static_schema_doc=None,
                          ) -> Tuple[ApiCallResult, ...]:
     """The one public entry point. Executes `endpoints` in a deterministic,
     dependency-aware order - every non-dynamic GET first (real evidence
@@ -588,6 +697,12 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
     this way carries `synthetic=True` and names exactly which field(s) in
     `synthetic_fields` - `False` reproduces the original evidence-only
     behavior exactly.
+
+    `static_schema_doc` (Phase 2, docs/53): a real, already-parsed OpenAPI
+    document found on disk (`find_static_openapi_schema`) - tried only when
+    the live `<base_url>/openapi.json` fetch itself returns nothing, never
+    ahead of it (the running server's own live document is more current
+    evidence than a possibly-stale checked-in file).
     """
     results = {}
     evidence: list = []
@@ -602,8 +717,13 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
         on_progress(progress_state["done"], total, "{} {}".format(endpoint.method, endpoint.path))
 
     def _schema():
+        # Phase 2 (docs/53): a live `/openapi.json` fetch is tried first
+        # (more current evidence, unchanged from before); only when that
+        # returns nothing does a real, already-checked-out static spec file
+        # (`static_schema_doc`, if any) get used instead - never the other
+        # way around.
         if not schema_state["fetched"]:
-            schema_state["doc"] = fetch_openapi_schema(base_url, timeout)
+            schema_state["doc"] = fetch_openapi_schema(base_url, timeout) or static_schema_doc
             schema_state["fetched"] = True
         return schema_state["doc"]
 
@@ -667,8 +787,9 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
         body = None
         body_note = ""
         body_synthetic_fields: Tuple[str, ...] = ()
+        body_evidence_source = ""
         if endpoint.method in ("POST", "PUT", "PATCH"):
-            body, body_note, body_synthetic_fields = build_request_body(
+            body, body_note, body_synthetic_fields, body_evidence_source = build_request_body(
                 _schema(), endpoint.method, endpoint.path,
                 endpoint=endpoint, allow_synthetic_mutations=allow_synthetic_mutations,
             )
@@ -688,6 +809,7 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
                             + [f for f in probed_call.synthetic_fields if f != path_synthetic_field]
                         )
                         probed_call = replace(probed_call, synthetic=True, synthetic_fields=merged_fields)
+                    probed_call = replace(probed_call, body_evidence_source=EVIDENCE_SYNTHETIC)
                     results[id(endpoint)] = probed_call
                     _report(endpoint)
                     continue
@@ -709,6 +831,8 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
         )
         if synthetic_fields:
             call = replace(call, synthetic=True, synthetic_fields=synthetic_fields)
+        if body_evidence_source:
+            call = replace(call, body_evidence_source=body_evidence_source)
         results[id(endpoint)] = call
         _report(endpoint)
 
@@ -776,6 +900,7 @@ def generate_and_execute_negative_cases(
     endpoints: Tuple[ApiEndpoint, ...], calls: Tuple[ApiCallResult, ...],
     base_url: str, timeout: float, schema_doc=None, on_progress=None,
     allow_synthetic_mutations: bool = DEFAULT_ALLOW_SYNTHETIC_MUTATIONS,
+    static_schema_doc=None,
 ) -> Tuple[NegativeCallResult, ...]:
     """One real, evidence-gated negative HTTP call per qualifying endpoint -
     `calls` must be `resolve_and_execute`'s own already-finished output for
@@ -809,8 +934,13 @@ def generate_and_execute_negative_cases(
     schema_state = {"doc": schema_doc, "fetched": schema_doc is not None}
 
     def _schema():
+        # Phase 2 (docs/53): a live `/openapi.json` fetch is tried first
+        # (more current evidence, unchanged from before); only when that
+        # returns nothing does a real, already-checked-out static spec file
+        # (`static_schema_doc`, if any) get used instead - never the other
+        # way around.
         if not schema_state["fetched"]:
-            schema_state["doc"] = fetch_openapi_schema(base_url, timeout)
+            schema_state["doc"] = fetch_openapi_schema(base_url, timeout) or static_schema_doc
             schema_state["fetched"] = True
         return schema_state["doc"]
 
@@ -837,7 +967,7 @@ def generate_and_execute_negative_cases(
 
     for endpoint in mutation_endpoints:
         positive_call = call_by_id[id(endpoint)]
-        body, _, _ = build_request_body(
+        body, _, _, _ = build_request_body(
             _schema(), endpoint.method, endpoint.path,
             endpoint=endpoint, allow_synthetic_mutations=allow_synthetic_mutations,
         )
@@ -954,6 +1084,7 @@ def _check_object_against_schema(schema: dict, obj: dict):
 def validate_response_schemas(
     endpoints: Tuple[ApiEndpoint, ...], calls: Tuple[ApiCallResult, ...],
     base_url: str, timeout: float, schema_doc=None, on_progress=None,
+    static_schema_doc=None,
 ) -> Tuple[SchemaValidationResult, ...]:
     """Never re-calls any endpoint under test - only checks each real,
     already-passing GET call's already-captured `response_json` (from
@@ -976,8 +1107,13 @@ def validate_response_schemas(
     schema_state = {"doc": schema_doc, "fetched": schema_doc is not None}
 
     def _schema():
+        # Phase 2 (docs/53): a live `/openapi.json` fetch is tried first
+        # (more current evidence, unchanged from before); only when that
+        # returns nothing does a real, already-checked-out static spec file
+        # (`static_schema_doc`, if any) get used instead - never the other
+        # way around.
         if not schema_state["fetched"]:
-            schema_state["doc"] = fetch_openapi_schema(base_url, timeout)
+            schema_state["doc"] = fetch_openapi_schema(base_url, timeout) or static_schema_doc
             schema_state["fetched"] = True
         return schema_state["doc"]
 

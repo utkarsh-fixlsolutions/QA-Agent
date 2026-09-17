@@ -28,6 +28,7 @@ from pathlib import Path
 
 from .adapters import ADAPTERS, ToolError
 from .api_qa import render as render_api_qa
+from .api_qa import render_test_plan as render_api_test_plan
 from .api_qa import diagnose_and_repair_api_failures, render_api_diagnosis_repair_entry, run_api_qa
 from .api_qa import to_csv as api_qa_to_csv
 from .api_qa import to_html as api_qa_to_html
@@ -419,6 +420,9 @@ def _discover_main(argv):
     if want_api_test and context is not None:
         api_result = run_api_qa(context, args.project_path)
         print(render_api_qa(api_result))
+        plan_report = render_api_test_plan(api_result)
+        if plan_report:
+            print(plan_report)
         if args.api_report:
             report_text = api_qa_to_csv(api_result) if args.api_report.lower().endswith(".csv") \
                 else api_qa_to_html(api_result)

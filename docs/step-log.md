@@ -1526,3 +1526,51 @@ Confirms Part 5's own measurement: pyright dominates multi-tool wall time, tools
 **Verified:** `test_api_qa_zod_schema.py` - 35/35. Full-suite confirmation in progress at time of writing.
 
 **Deferred, per the user's own explicit priority:** Joi (same shape as Zod, lower priority); nested `z.object()` sub-schemas (recorded as `"object"`, never descended into); ORM/DB models and static OpenAPI/GraphQL spec files (separate, named next steps).
+
+---
+
+## HTTP Readiness Gate - Phase 1 (2026-09-17)
+
+**Goal:** strict, scoped milestone - reliably start the app, determine where it's really listening, verify reachability, only then allow API testing. See docs/52-http-readiness-gate.md.
+
+**Audit finding:** the exact bug the user described (matched ready log → guessed port → failed TCP probe → still executed API calls) was already fixed by docs/46+docs/48, confirmed by reading `runner.py` directly - `wait_until_connectable` failing already stops the whole run before any real call. What was genuinely missing: no HTTP-level readiness check existed at all (only raw TCP), so something that binds a port but never speaks HTTP would have slipped through to real API execution; and `_resolve_base_url`'s precedence had no direct test.
+
+**Fix:** `server.py` gains `check_http_readiness` - one real GET against a health-shaped discovered endpoint if one exists, else `/health`/`/api/health`/`/`, lenient about status code (a real 404 still proves the server is answering) but not about a true connection failure. `runner.py` runs it right after the TCP gate; failure stops the run exactly like a TCP failure, both now naming the real command/cwd/timeout.
+
+**Files changed:** `qa_agent/api_qa/server.py`, `qa_agent/api_qa/runner.py`, `qa_agent/api_qa/models.py` (`http_readiness_detail`, additive), `tests/regression/test_api_qa.py` (+25 checks), `docs/52-http-readiness-gate.md` (new).
+
+**Verified:** `test_api_qa.py` 191/191. Real end-to-end against a tiny controlled demo app (never started manually): success case (real port, both endpoints pass), and two distinct negative cases - ready log with no real listener, and a real TCP listener that never speaks HTTP (the one scenario the old TCP-only gate could not have caught). `python tests/run_all.py --quick`: 43/45 before and after, same 2 pre-existing unrelated flakes, zero regressions.
+
+**Deferred:** no config-declared health endpoint; no live FastAPI-path demo walkthrough (covered by its own existing 66/66 suite instead); everything else (synthetic data, contract discovery, AI diagnosis/repair, UI, memory) explicitly out of scope for this milestone.
+
+---
+
+## API Contract Understanding - Phase 2 (2026-09-17)
+
+**Goal:** the agent must be able to answer "what do I know about this endpoint, what evidence tells me that, and how should I construct a request from that evidence?" as a real, structured, explicit part of the existing lifecycle - not a separate pipeline. See docs/53-api-contract-understanding.md.
+
+**Audit finding:** most of the evidence hierarchy already existed (live OpenAPI, Zod schemas, source-derived body-field hints, probe-based synthesis, dynamic path resolution) - confirmed by reading `discovery.py`/`resolution.py`/`models.py` in full before writing anything. Four real, confirmed gaps: no static `openapi.json`/`swagger.json` file discovery (only live fetch); no "existing test/example evidence" tier; no explicit, structured provenance label (only a free-text trace); dynamic path-parameter resolution required the dynamic segment to be trailing, refusing `/forms/{formId}/responses`-shaped nested resources outright even though the actual substitution logic never depended on that.
+
+**Fix:** new `test_evidence.py` (Supertest/axios/fetch/Python test-call patterns, plus real Postman collection JSON parsing) attached to endpoints the same way Zod schemas already are. `resolution.find_static_openapi_schema` as a fallback tried only once the live fetch returns nothing. `build_request_body` now returns a 4th, structured `evidence_source` (`EVIDENCE_OPENAPI`/`SCHEMA`/`TEST_EXAMPLE`/`SOURCE_HINT`/`SYNTHETIC`/`UNKNOWN`), with the new test-evidence tier inserted between Zod and bare source hints per the required priority order; "no evidence at all" is now explicitly reported as `CONTRACT UNKNOWN`. `_parent_collection_path` generalized to allow a dynamic segment anywhere in the path, not just trailing.
+
+**Files changed:** `qa_agent/api_qa/test_evidence.py` (new), `qa_agent/api_qa/models.py`, `discovery.py`, `resolution.py`, `runner.py`, `render.py`, `__init__.py`, `tests/regression/test_api_qa_contract_evidence.py` (new, 49 checks), plus call-site updates in `test_api_qa_resolution.py`/`test_api_qa_synthetic_mutations.py`/`test_api_qa_zod_schema.py` for the new 4-tuple return (one test intentionally rewritten, not weakened - see docs/53's own note).
+
+**Verified:** new suite 49/49, including one real end-to-end proof: a real server that only accepts `POST /api/users` with real evidence-derived fields - a blind synthetic fallback would fail it, and the real, test-evidence-constructed request passes. All previously-passing `test_api_qa*.py` suites stay green. Real, live end-to-end (`discover --api-test`, never started manually) against a 7-endpoint Express-shaped demo: all 7 Working, static-OpenAPI evidence and test-file evidence both visible and distinct in the report, the nested dynamic route (`/api/users/:id/posts`) correctly resolved live. `python tests/run_all.py --quick`: 44/46 (one new suite), same 2 pre-existing unrelated flakes, zero regressions.
+
+**Deferred:** tier 5 ("model/service evidence" - reading ORM/DB models) - no existing infrastructure, named and left out; YAML OpenAPI/Swagger files - no YAML dependency in this project; query parameters/custom headers still not modeled as request evidence (pre-existing, unchanged).
+
+---
+
+## Functional API Test Planning + Execution - Phase 3 (2026-09-17)
+
+**Goal:** given the discovered APIs and their contracts, plan meaningful, dependency-aware functional tests (not just independent per-endpoint calls) and execute them for real, feeding runtime data (a real created id) forward into later requests. See docs/54-functional-api-test-planning.md.
+
+**Audit finding:** `resolve_and_execute` already calls every endpoint once, tier-ordered and evidence-based, but has no notion of "purpose," dependency, or a create→read→update→delete→verify relationship; its pass/fail rule is a fixed 2xx-only check with no way to say "a 404 here is the *correct* answer"; and no data ever flowed from one mutation's own response into a *later* request (only non-dynamic GETs fed the evidence pool). `ApiTestResult.calls` is a strict one-per-endpoint contract, so it could never express "verify this same endpoint twice, expecting two different real outcomes."
+
+**Fix:** new `planning.py` - `build_test_plan(endpoints)` (pure, deterministic) groups endpoints into real CRUD-shaped resources and plans list→get→create→update→delete→verify as far as the discovered methods actually support, plus a standalone entry for anything else; `execute_test_plan` runs the plan in its own already-dependency-correct order, reusing `resolve_path_parameter`/`build_request_body`/`call_endpoint` unmodified, with one new mechanism for sourcing a runtime id from a specific prior test's own real response. A closed `EXPECTED_SUCCESS`/`EXPECTED_NOT_FOUND` judgment decides each test's own PASS/FAIL, independent of the underlying call's own generic status. Wired into `runner.py` as a second, additive pass alongside the existing, completely unchanged verification pass - never a replacement, never a second HTTP mechanism.
+
+**Files changed:** `qa_agent/api_qa/planning.py` (new), `models.py` (`PlannedTest`/`PlannedTestResult`/category+expected-kind constants, additive `ApiTestResult` fields), `resolution.py` (`synthesize_path_parameter_value`, small reusable export), `runner.py`, `render.py` (`render_test_plan`), `__init__.py`, `qa_agent/__main__.py`, `tests/regression/test_api_qa_functional_plan.py` (new, 57 checks), plus two existing suites updated for the intentional, additive `_combine_progress` fourth callback and the new `ApiTestResult.functional_results` field.
+
+**Verified:** new suite 57/57, including a real, guarded, subprocess-based end-to-end run against a genuine Node server. Real, controlled CLI demonstration (`discover --api-test`, server always self-started) against a hand-built Express-shaped demo: happy path 7/7 functional tests passed (list→get→create→update→delete→verify→health), runtime id correctly flowing from the real `POST` response through every later step. Failure demonstration: one intentional bug (`DELETE` returns 204 but never removes the resource) - re-run unmodified, the plan's "verify deletion" step correctly FAILed with "expected 404 after deletion, got 200 instead," proving real defect detection, not just green output. `python tests/run_all.py --quick`: same 2 pre-existing unrelated flakes, zero new regressions.
+
+**Deferred:** no repair/diagnosis of a functional failure (later phase); no CSV/HTML export rows for the functional plan yet (`to_dict()`'s new key is available for future work); no support for more than one update step or one level of resource nesting per workflow; query parameters/custom headers still out of scope, unchanged.

@@ -39,14 +39,25 @@ dropped and not fabricated into an endpoint that was never really there.
 A FastAPI `APIRouter`'s own `prefix=` composition is a real, common
 pattern this module does not attempt to resolve, deliberately, rather than
 half-supporting it unreliably - named here, not silently gapped.
+
+Phase 2 (API contract understanding, docs/53) adds one more, additive
+whole-project pass after the four strategies above merge their results:
+`test_evidence.build_test_evidence_registry` finds real example request
+bodies in the project's own existing test files/Postman collections and
+attaches them to every mutating endpoint they structurally match
+(`ApiEndpoint.test_evidence_fields`) - the same "registry built once,
+attached to the endpoints that reference it" shape the Zod registry below
+already established for schema evidence.
 """
 
 from __future__ import annotations
 
 import os
 import re
+from dataclasses import replace
 from pathlib import Path
 
+from . import test_evidence as _test_evidence
 from . import zod_schema as _zod_schema
 from .models import METHODS, ApiEndpoint
 
@@ -724,6 +735,25 @@ def discover_api_endpoints(context, root):
             continue
         seen.add(key)
         endpoints.append(endpoint)
+
+    # Phase 2 (API contract understanding, docs/53): one whole-project pass
+    # over the project's own existing test files/Postman collections,
+    # attached to every mutating endpoint it structurally matches - the same
+    # "build a registry once, attach real matched evidence after the merge"
+    # shape the Zod registry above already establishes, done as a single
+    # post-merge pass here (rather than inside each of the four strategies)
+    # since it needs the already-deduplicated endpoint list, not each
+    # strategy's own partial one.
+    test_registry = _test_evidence.build_test_evidence_registry(root)
+    if test_registry:
+        attached = []
+        for e in endpoints:
+            fields = (
+                _test_evidence.find_test_evidence_for_endpoint(e.method, e.path, test_registry)
+                if e.method in MUTATION_METHODS else None
+            )
+            attached.append(replace(e, test_evidence_fields=tuple(fields.items())) if fields else e)
+        endpoints = attached
 
     endpoints.sort(key=lambda e: (e.path, e.method))
     warnings = tuple(nextjs_warnings) + tuple(pages_warnings) + tuple(fastapi_warnings) + tuple(express_warnings)
