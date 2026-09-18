@@ -31,6 +31,13 @@ from typing import Optional
 _BOOLEAN_NAME_RE = re.compile(r"^(is|has)([A-Z_]|$)")
 
 _FIXED_DATETIME = "2025-01-01T00:00:00Z"
+# The canonical example ObjectId from MongoDB's own documentation - a real,
+# valid 24-hex-character shape (so a Mongoose `required: true` ObjectId
+# field's own cast validation actually accepts it, unlike the bare integer
+# `1` used elsewhere for a generic id-shaped name), and instantly
+# recognizable as a placeholder to anyone who has ever used MongoDB, rather
+# than an arbitrary-looking invented hex string.
+_TEST_OBJECT_ID = "507f1f77bcf86cd799439011"
 _TEST_EMAIL = "qa-agent-test@example.com"
 _TEST_PASSWORD = "QaAgentTest123!"
 _TEST_URL = "https://qa-agent-test.example.com"
@@ -55,6 +62,8 @@ def _by_format(json_type: Optional[str], json_format: Optional[str], field_name:
     fmt = (json_format or "").lower()
     if fmt == "email":
         return _TEST_EMAIL
+    if fmt == "objectid":
+        return _TEST_OBJECT_ID
     if fmt in ("date", "date-time"):
         return _FIXED_DATETIME
     if fmt in ("password",) or "password" in field_name.lower():

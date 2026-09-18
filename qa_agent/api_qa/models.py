@@ -73,7 +73,7 @@ CALL_STATUSES = (CALL_PASS, CALL_FAIL, CALL_SKIPPED)
 # existing human-readable `resolution_evidence` trace - never a replacement
 # for it.
 EVIDENCE_OPENAPI = "openapi"          # a live or static OpenAPI/Swagger schema
-EVIDENCE_SCHEMA = "schema"            # an explicit validation schema (Zod, ...)
+EVIDENCE_SCHEMA = "schema"            # an explicit validation/ORM schema (Zod, Mongoose, ...)
 EVIDENCE_TEST_EXAMPLE = "test_example"  # a real example found in the project's own tests/collections
 EVIDENCE_SOURCE_HINT = "source"       # route/controller source-code evidence
 EVIDENCE_SYNTHETIC = "synthetic"      # no real evidence at all - an invented placeholder
@@ -164,6 +164,15 @@ class ApiEndpoint:
     # `body_field_hints` (a real name *and* a real type, not just a name)
     # - checked first in resolution.py's fallback chain when present.
     zod_fields: Tuple[Tuple[str, str], ...] = ()
+    # Real (field_name, type_token) pairs found in a real Mongoose model
+    # (`model_schema.py`) this endpoint's own real handler actually uses -
+    # required fields only, resolved through the project's own real
+    # require/import graph (never a guess at which model "probably"
+    # applies). The same real-type, same-tier evidence `zod_fields` already
+    # provides, just sourced from the ORM/DB layer instead of an
+    # application-level validation schema - checked in resolution.py's
+    # fallback chain alongside it, never a separate, weaker tier.
+    model_fields: Tuple[Tuple[str, str], ...] = ()
     # Real (field_name, real_value) pairs (Phase 2, docs/53) found in the
     # project's own existing test files or Postman-style collections
     # (`test_evidence.py`) for a real HTTP call this endpoint's own

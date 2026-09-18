@@ -95,6 +95,7 @@ import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import model_schema as _model_schema
 from . import route_composition as _route_composition
 from . import test_evidence as _test_evidence
 from . import zod_schema as _zod_schema
@@ -725,6 +726,45 @@ _EXPRESS_CHAIN_VERB_RE = re.compile(
 
 _EXPRESS_DYNAMIC_SEGMENT_RE = re.compile(r":[A-Za-z0-9_]+")
 
+# `adminAuth.login` inside a handler expression (`.post(adminAuth.login)`,
+# `.post(catchErrors(adminAuth.login))`) - the first `alias.member`-shaped
+# reference found is taken as the module this route's real handler comes
+# from; resolved against the route file's own real import map, never
+# guessed. A bounded heuristic (the same class of accepted limitation as
+# every other regex in this module) - an inline handler with no such
+# reference at all simply resolves to nothing here, which is correct.
+_HANDLER_ALIAS_RE = re.compile(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\.[A-Za-z_$][A-Za-z0-9_$]*\b")
+
+
+def _resolve_cross_file_handler_text(file_abs, import_map, handler_ref_text):
+    """The real, already-on-disk source text of whichever file a route's
+    own handler reference resolves to via `file_abs`'s own real require/
+    import map (`route_composition._local_import_map`, reused unmodified -
+    never a second, guessing copy of that graph) - `(None, None)` when
+    `handler_ref_text` names no real `alias.member` reference, the alias
+    resolves to no real import, or the resolved file can't be read.
+
+    This is how a route file that only does `router.post('/login',
+    adminAuth.login)` (or `.post(catchErrors(adminAuth.login))`) gets real
+    body evidence at all: the real `req.body` access almost always lives in
+    the imported controller file, not the route file itself.
+    """
+    if handler_ref_text is None:
+        return None, None
+    match = _HANDLER_ALIAS_RE.search(handler_ref_text)
+    if match is None:
+        return None, None
+    spec = import_map.get(match.group(1))
+    if spec is None:
+        return None, None
+    target = _route_composition._resolve_js_module_path_any(file_abs, spec)
+    if target is None:
+        return None, None
+    target_text = _read_text_capped(target)
+    if target_text is None:
+        return None, None
+    return target, target_text
+
 _JS_TS_FILE_RE = re.compile(r"\.(ts|js)$")
 
 
@@ -760,8 +800,14 @@ def _classify_route_path_arg(raw):
     return "variable", raw
 
 
-def _discover_express_endpoints(context, root, zod_registry=None):
+def _discover_express_endpoints(context, root, zod_registry=None, mongoose_registry=None):
     """`zod_registry`: see `_discover_nextjs_endpoints`'s own docstring.
+    `mongoose_registry`: an optional `(by_model_name, file_to_model_name)`
+    pair from `model_schema.build_mongoose_schema_registry` - when a
+    route's own real handler (in this file, or resolved across a real
+    require/import reference to another file - see `_resolve_cross_file_
+    handler_text`) uses a real, registered Mongoose model, that model's own
+    real required fields are attached as `ApiEndpoint.model_fields`.
 
     Returns `(endpoints, warnings, unresolved_routes, files_text)`. Never
     attempted at all unless `project.frameworks` already, really contains
@@ -801,6 +847,7 @@ def _discover_express_endpoints(context, root, zod_registry=None):
     unresolved = []
     seen = set()
     files_text = {}
+    mongoose_by_model, mongoose_file_to_model = mongoose_registry if mongoose_registry else ({}, {})
 
     for js_file in _find_js_files(root):
         text = _read_text_capped(js_file)
@@ -809,21 +856,47 @@ def _discover_express_endpoints(context, root, zod_registry=None):
             warnings.append("could not read JS/TS file: {}".format(source_file))
             continue
         files_text[js_file.resolve()] = text
+        local_import_map = _route_composition._local_import_map_any(text)
 
-        def _add_endpoint(method, path, line, window_text):
+        def _add_endpoint(method, path, line, window_text, handler_ref_text=None):
             key = (method, path)
             if key in seen:
                 return
             seen.add(key)
             dynamic = bool(_EXPRESS_DYNAMIC_SEGMENT_RE.search(path))
-            hints, reads_body, zod_fields = (), False, ()
-            if method in MUTATION_METHODS and window_text is not None:
-                hints, reads_body = _extract_body_field_hints(window_text)
-                if zod_registry:
-                    zod_fields = _zod_schema.find_referenced_schema_fields(window_text, zod_registry)
+            hints, reads_body, zod_fields, model_fields = (), False, (), ()
+            if method in MUTATION_METHODS:
+                if window_text is not None:
+                    hints, reads_body = _extract_body_field_hints(window_text)
+                    if zod_registry:
+                        zod_fields = _zod_schema.find_referenced_schema_fields(window_text, zod_registry)
+                    if mongoose_by_model:
+                        model_fields = _model_schema.find_referenced_model_fields(
+                            js_file.resolve(), window_text, mongoose_by_model, mongoose_file_to_model,
+                        )
+                # The real handler logic commonly lives in a separate,
+                # imported controller file the route file only references
+                # by name (e.g. `.post(adminAuth.login)`) - resolved via
+                # this route file's own real import map, and used only to
+                # fill in whichever same-file evidence above came up empty
+                # (never overwrites real same-file evidence that already
+                # exists).
+                target_file, target_text = _resolve_cross_file_handler_text(
+                    js_file.resolve(), local_import_map, handler_ref_text,
+                )
+                if target_text is not None:
+                    if not hints and not reads_body:
+                        hints, reads_body = _extract_body_field_hints(target_text)
+                    if not zod_fields and zod_registry:
+                        zod_fields = _zod_schema.find_referenced_schema_fields(target_text, zod_registry)
+                    if not model_fields and mongoose_by_model:
+                        model_fields = _model_schema.find_referenced_model_fields(
+                            target_file, target_text, mongoose_by_model, mongoose_file_to_model,
+                        )
             endpoints.append(ApiEndpoint(
                 method=method, path=path, source_file=source_file, dynamic=dynamic, line=line,
                 body_field_hints=hints, reads_request_body=reads_body, zod_fields=zod_fields,
+                model_fields=model_fields,
                 discovered_by=("express-source",),
             ))
 
@@ -843,7 +916,8 @@ def _discover_express_endpoints(context, root, zod_registry=None):
                     # dual-use form) - never fabricated into a route.
                     continue
                 window_end = direct_matches[i + 1].start() if i + 1 < len(direct_matches) else len(text)
-                _add_endpoint(method, value, line, text[match.end():window_end])
+                window_text = text[match.end():window_end]
+                _add_endpoint(method, value, line, window_text, window_text)
             else:
                 reason = (
                     "path segment(s) inside the template literal cannot be established statically"
@@ -875,7 +949,7 @@ def _discover_express_endpoints(context, root, zod_registry=None):
                 method = verb_match.group(1).upper()
                 if kind == "literal":
                     if value.startswith("/"):
-                        _add_endpoint(method, value, chain_line, None)
+                        _add_endpoint(method, value, chain_line, None, verb_match.group(2))
                 else:
                     reason = (
                         "path segment(s) inside the template literal cannot be established statically"
@@ -1044,13 +1118,18 @@ def discover_api_endpoints_detailed(context, root):
         if (_is_nextjs_project(project) or _is_express_project(project))
         else {}
     )
+    mongoose_registry = (
+        _model_schema.build_mongoose_schema_registry(root)
+        if _is_express_project(project)
+        else ({}, {})
+    )
     nextjs_endpoints, nextjs_warnings = _discover_nextjs_endpoints(context, root, zod_registry)
     pages_endpoints, pages_warnings = _discover_nextjs_pages_endpoints(context, root, zod_registry)
     fastapi_endpoints, fastapi_warnings, fastapi_unresolved, fastapi_files_text = (
         _discover_fastapi_endpoints(context, root)
     )
     express_endpoints, express_warnings, express_unresolved, express_files_text = (
-        _discover_express_endpoints(context, root, zod_registry)
+        _discover_express_endpoints(context, root, zod_registry, mongoose_registry)
     )
     openapi_endpoints, openapi_warnings = _discover_openapi_endpoints(root)
 

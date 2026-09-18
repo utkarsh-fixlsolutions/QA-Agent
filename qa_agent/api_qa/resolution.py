@@ -37,6 +37,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Tuple
 
+from . import model_schema as _model_schema
 from . import test_evidence as _test_evidence
 from . import zod_schema as _zod_schema
 from .analysis import classify_negative_case_severity, classify_schema_validation_severity
@@ -545,6 +546,25 @@ def _fallback_from_source_hints(endpoint: Optional[ApiEndpoint], allow_synthetic
         field_names = tuple(name for name, _type_token in endpoint.zod_fields)
         evidence = (
             "body {} (synthesized from the endpoint's own referenced Zod schema's real "
+            "required fields and types, no live OpenAPI schema available) for {} {}".format(
+                body, endpoint.method, endpoint.path)
+        )
+        return body, evidence, field_names, EVIDENCE_SCHEMA
+    if endpoint.model_fields:
+        # model_schema.py: real (name, type) evidence from a Mongoose model
+        # this endpoint's own real handler actually uses - the same
+        # real-type, same-tier strength `zod_fields` already gets above,
+        # sourced from the ORM/DB layer instead of an application-level
+        # validation schema. Checked only when no Zod schema already
+        # answered this - not a guess at which one "wins" when a project
+        # genuinely has both, just the existing, unmodified precedence.
+        body = {
+            name: synthesize_value(name, _model_schema.mongoose_field_to_prop(type_token))
+            for name, type_token in endpoint.model_fields
+        }
+        field_names = tuple(name for name, _type_token in endpoint.model_fields)
+        evidence = (
+            "body {} (synthesized from the endpoint's own referenced Mongoose model's real "
             "required fields and types, no live OpenAPI schema available) for {} {}".format(
                 body, endpoint.method, endpoint.path)
         )

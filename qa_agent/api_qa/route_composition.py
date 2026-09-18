@@ -42,10 +42,11 @@ never worse than not running this module at all.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import replace
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 _MAX_COMPOSITION_DEPTH = 6
 
@@ -114,6 +115,16 @@ def _local_import_map(text: str) -> Dict[str, str]:
 
 
 def _resolve_js_module_path(importing_file_abs: Path, spec: str):
+    """Returns a real, fully `.resolve()`d path - never one that still
+    carries a literal `..` segment from `spec` (e.g. `require('../models/
+    X')`, a common `controllers/` + `models/` sibling-directory layout).
+    `Path.is_file()` itself would happily follow such a segment via the OS,
+    but the *unresolved* `Path` object returned would then silently fail
+    every dict lookup against the `.resolve()`d keys this whole module (and
+    `model_schema.py`, which reuses this function) key every file map by -
+    a real bug found via model_schema.py's own upward-traversal fixture,
+    not specific to it.
+    """
     base = importing_file_abs.parent / spec
     if base.suffix in _JS_TS_RESOLVE_EXTENSIONS:
         candidates = [base]
@@ -122,7 +133,103 @@ def _resolve_js_module_path(importing_file_abs: Path, spec: str):
         candidates += [(base / "index").with_suffix(ext) for ext in _JS_TS_RESOLVE_EXTENSIONS]
     for candidate in candidates:
         if candidate.is_file():
-            return candidate
+            return candidate.resolve()
+    return None
+
+
+_ALIAS_CACHE: Dict[Path, Dict[str, Path]] = {}
+
+
+def _find_module_alias_map(start_file_abs: Path) -> Dict[str, Path]:
+    """Real Node path aliases declared via the `module-alias` package's own,
+    standard `package.json` `_moduleAliases` field (https://www.npmjs.com/
+    package/module-alias) - a common, general Node.js convention (found via
+    idurar-erp-crm's own real `backend/package.json`: `{"@": "src"}`), not
+    specific to any one project. The nearest `package.json` walking upward
+    from `start_file_abs` that declares one is used, each alias resolved to
+    its own real, absolute directory; `{}` when no such declaration exists
+    anywhere above this file - never guessed, never a default invented.
+    Cached per that `package.json`'s own real path.
+    """
+    current = start_file_abs.parent
+    for _ in range(24):
+        candidate = current / "package.json"
+        if candidate.is_file():
+            cached = _ALIAS_CACHE.get(candidate)
+            if cached is not None:
+                return cached
+            aliases: Dict[str, Path] = {}
+            try:
+                data = json.loads(candidate.read_text(encoding="utf-8", errors="replace"))
+                raw = data.get("_moduleAliases")
+                if isinstance(raw, dict):
+                    for prefix, target in raw.items():
+                        if isinstance(prefix, str) and isinstance(target, str):
+                            aliases[prefix] = (current / target).resolve()
+            except (OSError, ValueError):
+                pass
+            _ALIAS_CACHE[candidate] = aliases
+            return aliases
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return {}
+
+
+def _local_import_map_any(text: str) -> Dict[str, str]:
+    """The same real local-identifier -> module-specifier extraction
+    `_local_import_map` already performs, without that function's own
+    relative-path-only filter - every real `require`/`import` spec is kept,
+    including a bare package name or a path alias (`@/models/Product`).
+    Used only by callers that go on to try alias resolution
+    (`_resolve_js_module_path_any`) themselves; a real npm package name
+    simply resolves to nothing there, exactly as if it had been filtered
+    out here - never treated as a real composition/model target either way.
+    """
+    mapping: Dict[str, str] = {}
+    for match in _REQUIRE_DEFAULT_RE.finditer(text):
+        mapping[match.group(1)] = match.group(2)
+    for match in _IMPORT_DEFAULT_RE.finditer(text):
+        mapping[match.group(1)] = match.group(2)
+    for regex in (_REQUIRE_DESTRUCTURE_RE, _IMPORT_DESTRUCTURE_RE):
+        for match in regex.finditer(text):
+            names_text, spec = match.group(1), match.group(2)
+            for part in names_text.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                name = part.split(" as ")[-1].strip() if " as " in part else part
+                if _SIMPLE_IDENT_RE.match(name):
+                    mapping[name] = spec
+    return mapping
+
+
+def _resolve_js_module_path_any(importing_file_abs: Path, spec: str) -> Optional[Path]:
+    """`_resolve_js_module_path`, extended with one additional, real
+    fallback: when `spec` is not a relative path, try resolving it as a
+    real, declared path alias (`_find_module_alias_map`) instead of giving
+    up - a bare npm package name matches no alias either and still
+    correctly resolves to nothing.
+    """
+    if spec.startswith("./") or spec.startswith("../"):
+        return _resolve_js_module_path(importing_file_abs, spec)
+    for prefix, base_dir in _find_module_alias_map(importing_file_abs).items():
+        if spec == prefix:
+            rest = ""
+        elif spec.startswith(prefix + "/"):
+            rest = spec[len(prefix) + 1:]
+        else:
+            continue
+        base = (base_dir / rest) if rest else base_dir
+        if base.suffix in _JS_TS_RESOLVE_EXTENSIONS:
+            candidates = [base]
+        else:
+            candidates = [base.with_suffix(ext) for ext in _JS_TS_RESOLVE_EXTENSIONS]
+            candidates += [(base / "index").with_suffix(ext) for ext in _JS_TS_RESOLVE_EXTENSIONS]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.resolve()
     return None
 
 
