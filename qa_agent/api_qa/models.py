@@ -312,6 +312,19 @@ class ApiCallResult:
     # `body_evidence_source` records *why* the value was chosen, `synthetic`
     # records whether it is safe to treat as a verified default.
     body_evidence_source: str = ""
+    # Auth/session propagation (`auth_context.py`): every real, raw
+    # `Set-Cookie` header value this call's own real response actually sent
+    # - `()` for a call with none. Read by `AuthContext.observe` to forward
+    # a real session cookie into later calls; never parsed or acted on
+    # anywhere else.
+    response_cookies: Tuple[str, ...] = ()
+    # A short, human-readable trace of a real credential (`Authorization`/
+    # `Cookie`) this call carried, captured from an earlier call's own real
+    # response in this same run (`auth_context.AuthContext`) - `""` when
+    # this call carried no such credential, the same "empty when there is
+    # none" convention `resolution_evidence` already follows. Never
+    # invented; only ever describes a header that was actually attached.
+    auth_evidence: str = ""
 
     def __post_init__(self):
         if self.status not in CALL_STATUSES:

@@ -40,6 +40,7 @@ from typing import Optional, Tuple
 from . import model_schema as _model_schema
 from . import test_evidence as _test_evidence
 from . import zod_schema as _zod_schema
+from .auth_context import AuthContext
 from .analysis import classify_negative_case_severity, classify_schema_validation_severity
 from .http_client import call_endpoint
 from .models import (
@@ -676,7 +677,7 @@ def _extract_missing_fields_from_error_response(response_json):
     return tuple(names)
 
 
-def _probe_and_synthesize_body(base_url, endpoint, path_override, timeout):
+def _probe_and_synthesize_body(base_url, endpoint, path_override, timeout, auth_context=None):
     """One real, evidence-gated last resort (docs/49), tried only when
     `build_request_body` already found nothing to work with: send a real
     `{}` body, and act on the target's own real response.
@@ -696,10 +697,13 @@ def _probe_and_synthesize_body(base_url, endpoint, path_override, timeout):
       existing, honest skip reason; nothing here ever guesses a field name
       that wasn't actually named in a real response.
     """
+    auth_context = auth_context if auth_context is not None else AuthContext()
     probe = call_endpoint(
         base_url, endpoint, timeout=timeout, path_override=path_override,
         body={}, resolution_evidence="probe: sent an empty body to discover the target's own required fields",
+        extra_headers=auth_context.headers(),
     )
+    auth_context.observe(endpoint, probe)
     if probe.status == CALL_PASS:
         return probe
 
@@ -715,8 +719,9 @@ def _probe_and_synthesize_body(base_url, endpoint, path_override, timeout):
     )
     retry = call_endpoint(
         base_url, endpoint, timeout=timeout, path_override=path_override,
-        body=synthetic_body, resolution_evidence=evidence,
+        body=synthetic_body, resolution_evidence=evidence, extra_headers=auth_context.headers(),
     )
+    auth_context.observe(endpoint, retry)
     return replace(retry, synthetic=True, synthetic_fields=missing_fields)
 
 
@@ -733,7 +738,7 @@ def _skip(endpoint: ApiEndpoint, reason: str) -> ApiCallResult:
 def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeout: float,
                          schema_doc=None, on_progress=None,
                          allow_synthetic_mutations: bool = DEFAULT_ALLOW_SYNTHETIC_MUTATIONS,
-                         static_schema_doc=None,
+                         static_schema_doc=None, auth_context=None,
                          ) -> Tuple[ApiCallResult, ...]:
     """The one public entry point. Executes `endpoints` in a deterministic,
     dependency-aware order - every non-dynamic GET first (real evidence
@@ -774,12 +779,37 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
     the live `<base_url>/openapi.json` fetch itself returns nothing, never
     ahead of it (the running server's own live document is more current
     evidence than a possibly-stale checked-in file).
+
+    `auth_context` (`auth_context.AuthContext`, optional): a real, shared
+    credential state - if any endpoint's own real, passing response in this
+    run carries a real bearer token or session cookie, it is captured and
+    attached to every subsequent call automatically (never targeted at a
+    specific "/login"-shaped path - any endpoint's real response can be the
+    source). Pass the same instance used elsewhere in this run (`runner.py`)
+    so a credential captured here is also available to `generate_and_
+    execute_negative_cases`/`planning.execute_test_plan`; a fresh, empty one
+    is created when omitted, reproducing today's uncredentialed behavior.
     """
     results = {}
     evidence: list = []
     schema_state = {"doc": schema_doc, "fetched": schema_doc is not None}
     progress_state = {"done": 0}
     total = len(endpoints)
+    auth_context = auth_context if auth_context is not None else AuthContext()
+
+    def _call(endpoint, **kwargs):
+        # The headers state is read *before* this call is made, not after -
+        # a call that itself is the one producing a new credential (e.g.
+        # the real login call) must never be reported as having carried
+        # one; only a *later* call that genuinely received it should be.
+        request_headers = auth_context.headers()
+        result = call_endpoint(
+            base_url, endpoint, timeout=timeout, extra_headers=request_headers, **kwargs,
+        )
+        auth_context.observe(endpoint, result)
+        if request_headers:
+            result = replace(result, auth_evidence=auth_context.evidence_for_attached_call())
+        return result
 
     def _report(endpoint):
         if on_progress is None:
@@ -805,7 +835,7 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
         key=lambda e: e.path,
     )
     for endpoint in tier1:
-        result = call_endpoint(base_url, endpoint, timeout=timeout)
+        result = _call(endpoint)
         results[id(endpoint)] = result
         if result.status == CALL_PASS and result.response_json is not None:
             evidence.append(_Evidence(endpoint=endpoint, response_json=result.response_json))
@@ -825,9 +855,7 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
             results[id(endpoint)] = _skip(endpoint, note)
             _report(endpoint)
             continue
-        call = call_endpoint(
-            base_url, endpoint, timeout=timeout, path_override=concrete_path, resolution_evidence=note,
-        )
+        call = _call(endpoint, path_override=concrete_path, resolution_evidence=note)
         if synthetic_field is not None:
             call = replace(call, synthetic=True, synthetic_fields=(synthetic_field,))
         results[id(endpoint)] = call
@@ -872,6 +900,7 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
                 # response actually names real required fields.
                 probed_call = _probe_and_synthesize_body(
                     base_url, endpoint, concrete_path if endpoint.dynamic else None, timeout,
+                    auth_context=auth_context,
                 )
                 if probed_call is not None:
                     if path_synthetic_field is not None:
@@ -892,8 +921,8 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
                 continue
 
         combined_evidence = " ; ".join(part for part in (path_note, body_note) if part)
-        call = call_endpoint(
-            base_url, endpoint, timeout=timeout,
+        call = _call(
+            endpoint,
             path_override=(concrete_path if endpoint.dynamic else None),
             body=body, resolution_evidence=combined_evidence,
         )
@@ -971,7 +1000,7 @@ def generate_and_execute_negative_cases(
     endpoints: Tuple[ApiEndpoint, ...], calls: Tuple[ApiCallResult, ...],
     base_url: str, timeout: float, schema_doc=None, on_progress=None,
     allow_synthetic_mutations: bool = DEFAULT_ALLOW_SYNTHETIC_MUTATIONS,
-    static_schema_doc=None,
+    static_schema_doc=None, auth_context=None,
 ) -> Tuple[NegativeCallResult, ...]:
     """One real, evidence-gated negative HTTP call per qualifying endpoint -
     `calls` must be `resolve_and_execute`'s own already-finished output for
@@ -1003,6 +1032,7 @@ def generate_and_execute_negative_cases(
     """
     call_by_id = {id(e): c for e, c in zip(endpoints, calls)}
     schema_state = {"doc": schema_doc, "fetched": schema_doc is not None}
+    auth_context = auth_context if auth_context is not None else AuthContext()
 
     def _schema():
         # Phase 2 (docs/53): a live `/openapi.json` fetch is tried first
@@ -1053,6 +1083,7 @@ def generate_and_execute_negative_cases(
             base_url, endpoint, timeout=timeout,
             path_override=positive_call.resolved_path or None,
             body=mutated_body, resolution_evidence="negative case: {}".format(case_name),
+            extra_headers=auth_context.headers(),
         )
         status, actual_summary = _judge_negative_call(raw)
         results.append(NegativeCallResult(
@@ -1075,6 +1106,7 @@ def generate_and_execute_negative_cases(
         raw = call_endpoint(
             base_url, endpoint, timeout=timeout, path_override=nonexistent_path,
             resolution_evidence="negative case: {}".format(case_name),
+            extra_headers=auth_context.headers(),
         )
         status, actual_summary = _judge_negative_call(raw)
         results.append(NegativeCallResult(

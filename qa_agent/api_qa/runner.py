@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import server as _server
+from .auth_context import AuthContext
 from .discovery import discover_api_endpoints_detailed
 from .http_client import DEFAULT_TIMEOUT_SECONDS as _DEFAULT_REQUEST_TIMEOUT
 from .planning import build_test_plan, execute_test_plan
@@ -338,16 +339,23 @@ def run_api_qa(context, root, config=None, on_progress=None, precondition_failur
         # docstring for the exact precedence).
         static_schema_doc = find_static_openapi_schema(root)
 
+        # Auth/session propagation (auth_context.py): one real, shared
+        # credential state for this whole run - if any endpoint's own real
+        # response carries a real bearer token or session cookie, every
+        # later real call across all three passes below automatically
+        # carries it, never re-derived or reset between them.
+        auth_context = AuthContext()
+
         primary_cb, negative_cb, schema_cb, plan_cb = _combine_progress(on_progress)
         calls = resolve_and_execute(
             endpoints, base_url, config.request_timeout, on_progress=primary_cb,
             allow_synthetic_mutations=config.allow_synthetic_mutations,
-            static_schema_doc=static_schema_doc,
+            static_schema_doc=static_schema_doc, auth_context=auth_context,
         )
         negative_calls = generate_and_execute_negative_cases(
             endpoints, calls, base_url, config.request_timeout, on_progress=negative_cb,
             allow_synthetic_mutations=config.allow_synthetic_mutations,
-            static_schema_doc=static_schema_doc,
+            static_schema_doc=static_schema_doc, auth_context=auth_context,
         )
         schema_validations = validate_response_schemas(
             endpoints, calls, base_url, config.request_timeout, on_progress=schema_cb,
@@ -368,6 +376,7 @@ def run_api_qa(context, root, config=None, on_progress=None, precondition_failur
             test_plan, base_url, config.request_timeout,
             static_schema_doc=static_schema_doc, on_progress=plan_cb,
             allow_synthetic_mutations=config.allow_synthetic_mutations,
+            auth_context=auth_context,
         )
         return _finish(
             endpoints=endpoints, calls=calls, server_status=SERVER_STARTED,
