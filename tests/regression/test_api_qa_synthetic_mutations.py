@@ -405,6 +405,9 @@ class _FakeResult:
         self.negative_calls = ()
         self.schema_validations = ()
         self.functional_results = ()
+        self.unresolved_routes = ()
+        self.discovery_strategy_counts = ()
+        self.unsupported_frameworks = ()
 
 
 def test_to_dict_summary_separates_real_and_synthetic_counts(suite):

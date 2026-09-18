@@ -298,42 +298,93 @@ def fetch_openapi_schema(base_url: str, timeout: float):
 
 # Real, named, bounded locations only - never an unbounded repository scan
 # (the same "prune, don't wander" discipline every discovery strategy in
-# this project already follows). A `.yaml`/`.yml` spec is a real, common
-# form too (Phase 2's own scope list names it explicitly) but is
-# deliberately not attempted here: this project has no YAML-parsing
-# dependency today, and adding one is real, separate, out-of-scope
-# infrastructure work - named as a known limitation, not silently ignored.
+# this project already follows). Phase 4 (generalized discovery) added the
+# `.yaml`/`.yml` variant of each candidate (PyYAML, added to
+# requirements.txt for exactly this) - a real, common OpenAPI form Phase 2
+# had explicitly deferred for lacking a YAML-parsing dependency.
 _STATIC_OPENAPI_CANDIDATES = (
-    "openapi.json", "swagger.json",
+    "openapi.json", "swagger.json", "openapi.yaml", "swagger.yaml", "openapi.yml", "swagger.yml",
     "spec/openapi.json", "specs/openapi.json", "docs/openapi.json", "api/openapi.json",
     "spec/swagger.json", "specs/swagger.json", "docs/swagger.json", "api/swagger.json",
+    "spec/openapi.yaml", "specs/openapi.yaml", "docs/openapi.yaml", "api/openapi.yaml",
+    "spec/swagger.yaml", "specs/swagger.yaml", "docs/swagger.yaml", "api/swagger.yaml",
+    "spec/openapi.yml", "specs/openapi.yml", "docs/openapi.yml", "api/openapi.yml",
+    "spec/swagger.yml", "specs/swagger.yml", "docs/swagger.yml", "api/swagger.yml",
 )
 
 _MAX_STATIC_SCHEMA_BYTES = 5_000_000
 
+_YAML_SUFFIXES = (".yaml", ".yml")
+
+
+def _parse_static_schema_text(rel, text):
+    if rel.endswith(_YAML_SUFFIXES):
+        import yaml  # local import: only paid for when a .yaml/.yml candidate actually exists
+        return yaml.safe_load(text)
+    return json.loads(text)
+
+
+def find_static_openapi_schema_detailed(root):
+    """Returns `(doc_or_None, source_file, warnings)` - the same real,
+    already-checked-out OpenAPI/Swagger file `find_static_openapi_schema`
+    itself returns just the parsed document for, plus which real candidate
+    file it actually came from (Phase 4's own OpenAPI-as-independent-
+    discovery-source strategy in discovery.py needs this for provenance)
+    and a real, human-readable warning for every candidate that existed on
+    disk but could not actually be used (too large, malformed JSON/YAML, or
+    parsed but missing a top-level `paths` object) - never silently
+    ignored, unlike this function's own original, warning-less behavior.
+    """
+    root = Path(root)
+    warnings = []
+    for rel in _STATIC_OPENAPI_CANDIDATES:
+        candidate = root / rel
+        try:
+            if not candidate.is_file():
+                continue
+            if candidate.stat().st_size > _MAX_STATIC_SCHEMA_BYTES:
+                warnings.append(
+                    "skipped {} - larger than the {:.0f} MB size cap".format(
+                        rel, _MAX_STATIC_SCHEMA_BYTES / 1_000_000)
+                )
+                continue
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+            doc = _parse_static_schema_text(rel, text)
+        except OSError as exc:
+            warnings.append("could not read {}: {}".format(rel, exc))
+            continue
+        except ValueError as exc:
+            kind = "YAML" if rel.endswith(_YAML_SUFFIXES) else "JSON"
+            warnings.append("{} is not valid {}: {}".format(rel, kind, exc))
+            continue
+        except ImportError:
+            warnings.append(
+                "found {} but the PyYAML dependency is not installed - cannot parse it".format(rel)
+            )
+            continue
+        if isinstance(doc, dict) and "paths" in doc:
+            return doc, rel, tuple(warnings)
+        warnings.append(
+            "{} was parsed but has no top-level 'paths' object - not a usable OpenAPI document".format(rel)
+        )
+    return None, "", tuple(warnings)
+
 
 def find_static_openapi_schema(root):
-    """A real, already-checked-out `openapi.json`/`swagger.json` file the
-    target project ships with itself (Phase 2, docs/53) - tried only as a
-    fallback when the live server never served its own `/openapi.json` (see
+    """A real, already-checked-out `openapi.json`/`swagger.json`/
+    `openapi.yaml`/`swagger.yaml` file the target project ships with itself
+    (Phase 2, docs/53; YAML added in Phase 4) - tried only as a fallback
+    when the live server never served its own `/openapi.json` (see
     `resolve_and_execute`'s own `_schema()` closure): a running server's own
     live document reflects the code actually being tested right now, which
     outranks a possibly-stale file checked into the repository. Returns the
     real, parsed document, or `None` when nothing usable is found - never
-    fabricated, never treated as fatal.
+    fabricated, never treated as fatal. A thin wrapper around `find_static_
+    openapi_schema_detailed` for every existing caller that only ever
+    needed the document itself, unchanged.
     """
-    root = Path(root)
-    for rel in _STATIC_OPENAPI_CANDIDATES:
-        candidate = root / rel
-        try:
-            if not candidate.is_file() or candidate.stat().st_size > _MAX_STATIC_SCHEMA_BYTES:
-                continue
-            doc = json.loads(candidate.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(doc, dict) and "paths" in doc:
-            return doc
-    return None
+    doc, _source_file, _warnings = find_static_openapi_schema_detailed(root)
+    return doc
 
 
 # Sentinel distinguishing "this operation/schema could not be found at

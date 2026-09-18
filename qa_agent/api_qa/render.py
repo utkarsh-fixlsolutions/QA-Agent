@@ -42,6 +42,18 @@ def render(result):
     if result.base_url:
         lines.append("  Base URL:      {}".format(result.base_url))
     lines.append("  Endpoints:     {} discovered".format(len(result.endpoints)))
+    if result.discovery_strategy_counts:
+        lines.append("  Discovery:     {}".format(
+            ", ".join("{}={}".format(name, count) for name, count in result.discovery_strategy_counts)
+        ))
+    if result.unresolved_routes:
+        lines.append("  Unresolved:    {} route construct(s) found but not statically resolvable".format(
+            len(result.unresolved_routes)
+        ))
+    if result.unsupported_frameworks:
+        lines.append("  Unsupported:   {} (framework detected, no discovery strategy implemented)".format(
+            ", ".join(result.unsupported_frameworks)
+        ))
     lines.append("")
 
     if result.warnings:
@@ -283,6 +295,16 @@ def _planned_test_result_to_dict(outcome):
     }
 
 
+def _unresolved_route_to_dict(r):
+    return {
+        "method": r.method,
+        "raw_expression": r.raw_expression,
+        "source_file": r.source_file,
+        "line": r.line,
+        "reason": r.reason,
+    }
+
+
 def to_dict(result):
     return {
         "root_path": result.root_path,
@@ -302,6 +324,11 @@ def to_dict(result):
         # `render_test_plan`'s own docstring for why this is kept separate
         # from `calls` rather than merged into it.
         "functional_test_plan": [_planned_test_result_to_dict(r) for r in result.functional_results],
+        # Phase 4 (generalized discovery) - additive, structured views of
+        # facts already folded into `warnings` as human-readable lines too.
+        "unresolved_routes": [_unresolved_route_to_dict(r) for r in result.unresolved_routes],
+        "discovery_strategy_counts": dict(result.discovery_strategy_counts),
+        "unsupported_frameworks": list(result.unsupported_frameworks),
     }
 
 

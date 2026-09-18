@@ -172,6 +172,19 @@ class ApiEndpoint:
     # just a name to guess a type for), checked ahead of it in resolution.py's
     # fallback chain but behind explicit schema evidence (OpenAPI/Zod).
     test_evidence_fields: Tuple[Tuple[str, object], ...] = ()
+    # Phase 4 (generalized discovery): which real discovery strategy/
+    # strategies actually produced this endpoint - e.g. `("express-source",)`,
+    # or `("express-source", "openapi")` when a live source-code route and an
+    # independent OpenAPI document both describe the exact same (method,
+    # path) and were fused into one entry rather than reported twice (see
+    # `discovery.discover_api_endpoints_detailed`'s own merge step).
+    # `"express-composition"`/`"fastapi-composition"` is appended (never
+    # replacing the original source tag) when a router-mount prefix was
+    # resolved and prepended to this endpoint's own raw, per-file path.
+    # Empty only for endpoints built before this field existed (never
+    # produced by discovery.py itself since this phase) - purely additive,
+    # never required by any existing caller.
+    discovered_by: Tuple[str, ...] = ()
 
     def __post_init__(self):
         if self.method not in METHODS:
@@ -188,6 +201,36 @@ class ApiEndpoint:
                 "ApiEndpoint({!r} {!r}) has a non-positive line number {!r}"
                 .format(self.method, self.path, self.line)
             )
+
+
+@dataclass(frozen=True)
+class UnresolvedRoute:
+    r"""Phase 4 (generalized discovery): a real route-defining construct
+    whose HTTP method may be known but whose concrete path could not be
+    established by static analysis alone - `router.route(`/${entity}/create`)
+    .post(...)` (a template literal with runtime interpolation),
+    `router.get(pathVariable, handler)` (a bare variable/expression instead
+    of a string literal), and their Python/FastAPI equivalents.
+
+    Never fabricates a path, never invents a value for the unresolved
+    segment, and is never fed into HTTP execution as if it were a real,
+    callable `ApiEndpoint` - see discovery.py's own module docstring for
+    the full "why" behind this shape. Exists purely so the real, honest
+    fact "this project defines more routes than could be statically
+    resolved" is visible in reporting, instead of the route silently
+    vanishing the way an unmatched call shape always used to.
+
+    `method` is `None` only on the rare path where a route-defining call
+    was recognized at all but its own HTTP verb could not be determined
+    either (never expected in practice - every current producer of this
+    shape already knows the verb by construction).
+    """
+
+    raw_expression: str
+    source_file: str
+    reason: str
+    method: Optional[str] = None
+    line: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -485,6 +528,25 @@ class ApiTestResult:
     # `calls`' own "exactly one entry per endpoint" contract cannot express.
     test_plan: Tuple["PlannedTest", ...] = ()
     functional_results: Tuple["PlannedTestResult", ...] = ()
+    # Phase 4 (generalized discovery): every real route-defining construct
+    # discovery found but could not statically resolve to a concrete path -
+    # see `UnresolvedRoute`'s own docstring. Never fed into `endpoints`/
+    # `calls` - a distinct, honest "we saw this, but can't call it" bucket.
+    unresolved_routes: Tuple[UnresolvedRoute, ...] = ()
+    # Real (strategy_name, endpoint_count) pairs, one per discovery
+    # strategy that actually ran (a strategy whose own gating evidence was
+    # absent - e.g. Express strategies on a pure FastAPI project - is
+    # omitted entirely rather than reported as a misleading "0 found").
+    # Lets a report say plainly "Express source: 3, OpenAPI: 5, Tests: 0"
+    # instead of a single opaque total.
+    discovery_strategy_counts: Tuple[Tuple[str, int], ...] = ()
+    # Real, already-detected (`project.frameworks`) backend/API framework
+    # names for which discovery.py has no discovery strategy at all today
+    # (e.g. "Flask", "Django", "NestJS") - reported explicitly so a project
+    # using one of these reads as "framework detected, no discovery
+    # strategy implemented", never silently collapsed into the same "0
+    # endpoints" a framework-less or truly API-less project would also show.
+    unsupported_frameworks: Tuple[str, ...] = ()
 
     def __post_init__(self):
         if self.server_status not in SERVER_STATUSES:

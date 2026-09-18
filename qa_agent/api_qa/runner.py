@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import server as _server
-from .discovery import discover_api_endpoints
+from .discovery import discover_api_endpoints_detailed
 from .http_client import DEFAULT_TIMEOUT_SECONDS as _DEFAULT_REQUEST_TIMEOUT
 from .planning import build_test_plan, execute_test_plan
 from .resolution import (
@@ -161,29 +161,84 @@ def _resolve_base_url(handle, warnings):
     return _DEFAULT_FALLBACK_URL, True
 
 
-def run_api_qa(context, root, config=None, on_progress=None):
+def run_api_qa(context, root, config=None, on_progress=None, precondition_failure=None):
+    """`precondition_failure` (Phase 4, item 9): an already-known, real
+    reason the server must never even be attempted - today, only a failed
+    dependency install in the web upload flow (`web/server.py`'s own
+    `_run_analysis`). When set, static discovery still runs in full (so
+    whatever was really found is still honestly reported - Phase 4's own
+    "discovery must not depend on server startup" rule, applied in
+    reverse: a known-bad server precondition must not hide real discovery
+    results either), but server startup itself is skipped entirely -
+    never launched against a project with missing dependencies, and never
+    left to fail a second time with a more confusing, unrelated error.
+    """
     config = config or DEFAULT_CONFIG
     root = Path(root)
     started_at = _now()
     started_perf = time.perf_counter()
 
-    endpoints, warnings = discover_api_endpoints(context, root)
-    warnings = list(warnings)
+    discovery_outcome = discover_api_endpoints_detailed(context, root)
+    endpoints = discovery_outcome.endpoints
+    warnings = list(discovery_outcome.warnings)
+
+    # Phase 4 (item 7: framework-neutral zero-discovery reporting): every
+    # real, structured discovery fact is folded into `warnings` too, so the
+    # existing plain-text/HTML/JSON renderers (none of which needed to
+    # change) already surface it - never just a bare endpoint count with no
+    # explanation of what was actually attempted.
+    if discovery_outcome.strategy_counts:
+        warnings.append(
+            "API discovery by strategy: {}".format(
+                ", ".join("{}={}".format(name, count) for name, count in discovery_outcome.strategy_counts)
+            )
+        )
+    if discovery_outcome.unresolved_routes:
+        warnings.append(
+            "{} route-defining construct(s) were found but could not be resolved to a concrete "
+            "path (never called, never fabricated):".format(len(discovery_outcome.unresolved_routes))
+        )
+        for r in discovery_outcome.unresolved_routes:
+            warnings.append(
+                "  - {} {} (in {}{}): {}".format(
+                    r.method or "?", r.raw_expression, r.source_file,
+                    ":{}".format(r.line) if r.line else "", r.reason,
+                )
+            )
+    if discovery_outcome.unsupported_frameworks:
+        for name in discovery_outcome.unsupported_frameworks:
+            warnings.append(
+                "framework detected: {} - no discovery strategy is implemented for it yet "
+                "(this is not the same as 'no APIs exist')".format(name)
+            )
 
     def _finish(**fields):
         return ApiTestResult(
             root_path=str(root), warnings=tuple(warnings),
             started_at=started_at, finished_at=_now(),
             total_duration=time.perf_counter() - started_perf,
+            unresolved_routes=discovery_outcome.unresolved_routes,
+            discovery_strategy_counts=discovery_outcome.strategy_counts,
+            unsupported_frameworks=discovery_outcome.unsupported_frameworks,
             **fields,
         )
 
-    if not endpoints:
+    if precondition_failure is not None:
+        # item 9: a real, already-known reason (a failed dependency
+        # install) the server must never even be attempted - discovery
+        # above still ran and is still reported in full (Case A/B/C,
+        # item 8), only the server-startup attempt itself is skipped.
         return _finish(
-            endpoints=(), calls=(), server_status=SERVER_SKIPPED,
-            server_detail="no Next.js App Router API route handler was discovered under this project",
+            endpoints=endpoints,
+            calls=_skip_all(endpoints, precondition_failure),
+            server_status=SERVER_START_FAILED, server_detail=precondition_failure,
         )
 
+    # item 8: a zero static-discovery result must never, by itself, skip
+    # server startup - Case A (0 endpoints, server started) and Case B (0
+    # endpoints, server failed) are both real, distinct, honestly reported
+    # outcomes; only "no startable server command could be found at all"
+    # (handled next, exactly like before) is a real reason to stop here.
     command, evidence, server_cwd = _server.discover_server_start_command(root, context.project)
     if command is None:
         return _finish(

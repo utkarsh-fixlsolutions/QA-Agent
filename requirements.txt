@@ -2,6 +2,13 @@
 # Filesystem event monitoring for watch mode (isolated behind qa_agent/fsmonitor.py).
 watchdog==6.0.0
 
+# YAML parsing for a target project's own openapi.yaml/swagger.yaml
+# (qa_agent/api_qa/resolution.py's find_static_openapi_schema_detailed) -
+# Phase 4's OpenAPI-as-independent-discovery-source strategy reads these
+# the same way it already reads openapi.json, never a full YAML authoring
+# API, isolated behind that one function.
+PyYAML==6.0.2
+
 # The analyzers. Both invoked as CLI binaries, never imported.
 ruff==0.15.14
 
