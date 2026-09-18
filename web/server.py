@@ -37,7 +37,7 @@ from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from qa_agent.ai import GroqProvider  # noqa: E402
+from qa_agent.ai import OllamaProvider  # noqa: E402
 from qa_agent.api_qa import ApiQaConfig, diagnose_and_repair_api_failures, discover_api_endpoints, run_api_qa  # noqa: E402
 from qa_agent.api_qa import to_dict as api_qa_to_dict  # noqa: E402
 from qa_agent.api_qa import server as api_qa_server  # noqa: E402
@@ -557,14 +557,21 @@ def _run_analysis(
             api_data["install_error"] = install_result
         response["api_qa"] = api_data
 
-        # AI diagnosis (docs/42-groq-cloud-provider.md) - strictly
-        # opt-in, and only ever sent the real evidence for calls that
-        # really failed (`diagnose_and_repair_api_failures` itself
-        # filters to CALL_FAIL - a pass/skip is never sent to the AI).
-        # Repair is deliberately not offered here yet - diagnosis only.
+        # AI diagnosis - strictly opt-in, and only ever sent the real
+        # evidence for calls that really failed (`diagnose_and_repair_api_
+        # failures` itself filters to CALL_FAIL - a pass/skip is never sent
+        # to the AI). Repair is deliberately not offered here yet -
+        # diagnosis only. Ollama (local, docs/step-log.md Phase D Part 1) -
+        # swapped in place of the earlier Groq wiring (docs/42) to test the
+        # local-model path. Pinned to "qwen2.5:3b" rather than the
+        # provider's own "llama3" default - the model actually pulled on
+        # this machine (`ollama list`); "llama3" is not, and would return a
+        # handled-but-useless "model not found" failure instead of a real
+        # diagnosis. Needs a local Ollama server running, or this call
+        # returns a failed LLMResponse (caught, never crashes the run).
         if diagnose and any(c.status == "fail" for c in api_result.calls):
-            _stage(started, "running AI diagnosis (Groq)")
-            provider = GroqProvider()
+            _stage(started, "running AI diagnosis (Ollama qwen2.5:3b)")
+            provider = OllamaProvider(model="qwen2.5:3b")
             entries = diagnose_and_repair_api_failures(
                 api_result, context, provider, str(project_root),
                 do_diagnose=True, do_repair=False,
