@@ -37,8 +37,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Tuple
 
+from . import model_schema as _model_schema
 from . import test_evidence as _test_evidence
 from . import zod_schema as _zod_schema
+from .auth_context import AuthContext
 from .analysis import classify_negative_case_severity, classify_schema_validation_severity
 from .http_client import call_endpoint
 from .models import (
@@ -298,42 +300,93 @@ def fetch_openapi_schema(base_url: str, timeout: float):
 
 # Real, named, bounded locations only - never an unbounded repository scan
 # (the same "prune, don't wander" discipline every discovery strategy in
-# this project already follows). A `.yaml`/`.yml` spec is a real, common
-# form too (Phase 2's own scope list names it explicitly) but is
-# deliberately not attempted here: this project has no YAML-parsing
-# dependency today, and adding one is real, separate, out-of-scope
-# infrastructure work - named as a known limitation, not silently ignored.
+# this project already follows). Phase 4 (generalized discovery) added the
+# `.yaml`/`.yml` variant of each candidate (PyYAML, added to
+# requirements.txt for exactly this) - a real, common OpenAPI form Phase 2
+# had explicitly deferred for lacking a YAML-parsing dependency.
 _STATIC_OPENAPI_CANDIDATES = (
-    "openapi.json", "swagger.json",
+    "openapi.json", "swagger.json", "openapi.yaml", "swagger.yaml", "openapi.yml", "swagger.yml",
     "spec/openapi.json", "specs/openapi.json", "docs/openapi.json", "api/openapi.json",
     "spec/swagger.json", "specs/swagger.json", "docs/swagger.json", "api/swagger.json",
+    "spec/openapi.yaml", "specs/openapi.yaml", "docs/openapi.yaml", "api/openapi.yaml",
+    "spec/swagger.yaml", "specs/swagger.yaml", "docs/swagger.yaml", "api/swagger.yaml",
+    "spec/openapi.yml", "specs/openapi.yml", "docs/openapi.yml", "api/openapi.yml",
+    "spec/swagger.yml", "specs/swagger.yml", "docs/swagger.yml", "api/swagger.yml",
 )
 
 _MAX_STATIC_SCHEMA_BYTES = 5_000_000
 
+_YAML_SUFFIXES = (".yaml", ".yml")
+
+
+def _parse_static_schema_text(rel, text):
+    if rel.endswith(_YAML_SUFFIXES):
+        import yaml  # local import: only paid for when a .yaml/.yml candidate actually exists
+        return yaml.safe_load(text)
+    return json.loads(text)
+
+
+def find_static_openapi_schema_detailed(root):
+    """Returns `(doc_or_None, source_file, warnings)` - the same real,
+    already-checked-out OpenAPI/Swagger file `find_static_openapi_schema`
+    itself returns just the parsed document for, plus which real candidate
+    file it actually came from (Phase 4's own OpenAPI-as-independent-
+    discovery-source strategy in discovery.py needs this for provenance)
+    and a real, human-readable warning for every candidate that existed on
+    disk but could not actually be used (too large, malformed JSON/YAML, or
+    parsed but missing a top-level `paths` object) - never silently
+    ignored, unlike this function's own original, warning-less behavior.
+    """
+    root = Path(root)
+    warnings = []
+    for rel in _STATIC_OPENAPI_CANDIDATES:
+        candidate = root / rel
+        try:
+            if not candidate.is_file():
+                continue
+            if candidate.stat().st_size > _MAX_STATIC_SCHEMA_BYTES:
+                warnings.append(
+                    "skipped {} - larger than the {:.0f} MB size cap".format(
+                        rel, _MAX_STATIC_SCHEMA_BYTES / 1_000_000)
+                )
+                continue
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+            doc = _parse_static_schema_text(rel, text)
+        except OSError as exc:
+            warnings.append("could not read {}: {}".format(rel, exc))
+            continue
+        except ValueError as exc:
+            kind = "YAML" if rel.endswith(_YAML_SUFFIXES) else "JSON"
+            warnings.append("{} is not valid {}: {}".format(rel, kind, exc))
+            continue
+        except ImportError:
+            warnings.append(
+                "found {} but the PyYAML dependency is not installed - cannot parse it".format(rel)
+            )
+            continue
+        if isinstance(doc, dict) and "paths" in doc:
+            return doc, rel, tuple(warnings)
+        warnings.append(
+            "{} was parsed but has no top-level 'paths' object - not a usable OpenAPI document".format(rel)
+        )
+    return None, "", tuple(warnings)
+
 
 def find_static_openapi_schema(root):
-    """A real, already-checked-out `openapi.json`/`swagger.json` file the
-    target project ships with itself (Phase 2, docs/53) - tried only as a
-    fallback when the live server never served its own `/openapi.json` (see
+    """A real, already-checked-out `openapi.json`/`swagger.json`/
+    `openapi.yaml`/`swagger.yaml` file the target project ships with itself
+    (Phase 2, docs/53; YAML added in Phase 4) - tried only as a fallback
+    when the live server never served its own `/openapi.json` (see
     `resolve_and_execute`'s own `_schema()` closure): a running server's own
     live document reflects the code actually being tested right now, which
     outranks a possibly-stale file checked into the repository. Returns the
     real, parsed document, or `None` when nothing usable is found - never
-    fabricated, never treated as fatal.
+    fabricated, never treated as fatal. A thin wrapper around `find_static_
+    openapi_schema_detailed` for every existing caller that only ever
+    needed the document itself, unchanged.
     """
-    root = Path(root)
-    for rel in _STATIC_OPENAPI_CANDIDATES:
-        candidate = root / rel
-        try:
-            if not candidate.is_file() or candidate.stat().st_size > _MAX_STATIC_SCHEMA_BYTES:
-                continue
-            doc = json.loads(candidate.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(doc, dict) and "paths" in doc:
-            return doc
-    return None
+    doc, _source_file, _warnings = find_static_openapi_schema_detailed(root)
+    return doc
 
 
 # Sentinel distinguishing "this operation/schema could not be found at
@@ -498,6 +551,25 @@ def _fallback_from_source_hints(endpoint: Optional[ApiEndpoint], allow_synthetic
                 body, endpoint.method, endpoint.path)
         )
         return body, evidence, field_names, EVIDENCE_SCHEMA
+    if endpoint.model_fields:
+        # model_schema.py: real (name, type) evidence from a Mongoose model
+        # this endpoint's own real handler actually uses - the same
+        # real-type, same-tier strength `zod_fields` already gets above,
+        # sourced from the ORM/DB layer instead of an application-level
+        # validation schema. Checked only when no Zod schema already
+        # answered this - not a guess at which one "wins" when a project
+        # genuinely has both, just the existing, unmodified precedence.
+        body = {
+            name: synthesize_value(name, _model_schema.mongoose_field_to_prop(type_token))
+            for name, type_token in endpoint.model_fields
+        }
+        field_names = tuple(name for name, _type_token in endpoint.model_fields)
+        evidence = (
+            "body {} (synthesized from the endpoint's own referenced Mongoose model's real "
+            "required fields and types, no live OpenAPI schema available) for {} {}".format(
+                body, endpoint.method, endpoint.path)
+        )
+        return body, evidence, field_names, EVIDENCE_SCHEMA
     if endpoint.test_evidence_fields:
         # Phase 2 (docs/53): a real example body found in the project's own
         # existing test files/Postman collections - each real value is
@@ -605,7 +677,7 @@ def _extract_missing_fields_from_error_response(response_json):
     return tuple(names)
 
 
-def _probe_and_synthesize_body(base_url, endpoint, path_override, timeout):
+def _probe_and_synthesize_body(base_url, endpoint, path_override, timeout, auth_context=None):
     """One real, evidence-gated last resort (docs/49), tried only when
     `build_request_body` already found nothing to work with: send a real
     `{}` body, and act on the target's own real response.
@@ -625,10 +697,13 @@ def _probe_and_synthesize_body(base_url, endpoint, path_override, timeout):
       existing, honest skip reason; nothing here ever guesses a field name
       that wasn't actually named in a real response.
     """
+    auth_context = auth_context if auth_context is not None else AuthContext()
     probe = call_endpoint(
         base_url, endpoint, timeout=timeout, path_override=path_override,
         body={}, resolution_evidence="probe: sent an empty body to discover the target's own required fields",
+        extra_headers=auth_context.headers(),
     )
+    auth_context.observe(endpoint, probe)
     if probe.status == CALL_PASS:
         return probe
 
@@ -644,8 +719,9 @@ def _probe_and_synthesize_body(base_url, endpoint, path_override, timeout):
     )
     retry = call_endpoint(
         base_url, endpoint, timeout=timeout, path_override=path_override,
-        body=synthetic_body, resolution_evidence=evidence,
+        body=synthetic_body, resolution_evidence=evidence, extra_headers=auth_context.headers(),
     )
+    auth_context.observe(endpoint, retry)
     return replace(retry, synthetic=True, synthetic_fields=missing_fields)
 
 
@@ -662,7 +738,7 @@ def _skip(endpoint: ApiEndpoint, reason: str) -> ApiCallResult:
 def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeout: float,
                          schema_doc=None, on_progress=None,
                          allow_synthetic_mutations: bool = DEFAULT_ALLOW_SYNTHETIC_MUTATIONS,
-                         static_schema_doc=None,
+                         static_schema_doc=None, auth_context=None,
                          ) -> Tuple[ApiCallResult, ...]:
     """The one public entry point. Executes `endpoints` in a deterministic,
     dependency-aware order - every non-dynamic GET first (real evidence
@@ -703,12 +779,37 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
     the live `<base_url>/openapi.json` fetch itself returns nothing, never
     ahead of it (the running server's own live document is more current
     evidence than a possibly-stale checked-in file).
+
+    `auth_context` (`auth_context.AuthContext`, optional): a real, shared
+    credential state - if any endpoint's own real, passing response in this
+    run carries a real bearer token or session cookie, it is captured and
+    attached to every subsequent call automatically (never targeted at a
+    specific "/login"-shaped path - any endpoint's real response can be the
+    source). Pass the same instance used elsewhere in this run (`runner.py`)
+    so a credential captured here is also available to `generate_and_
+    execute_negative_cases`/`planning.execute_test_plan`; a fresh, empty one
+    is created when omitted, reproducing today's uncredentialed behavior.
     """
     results = {}
     evidence: list = []
     schema_state = {"doc": schema_doc, "fetched": schema_doc is not None}
     progress_state = {"done": 0}
     total = len(endpoints)
+    auth_context = auth_context if auth_context is not None else AuthContext()
+
+    def _call(endpoint, **kwargs):
+        # The headers state is read *before* this call is made, not after -
+        # a call that itself is the one producing a new credential (e.g.
+        # the real login call) must never be reported as having carried
+        # one; only a *later* call that genuinely received it should be.
+        request_headers = auth_context.headers()
+        result = call_endpoint(
+            base_url, endpoint, timeout=timeout, extra_headers=request_headers, **kwargs,
+        )
+        auth_context.observe(endpoint, result)
+        if request_headers:
+            result = replace(result, auth_evidence=auth_context.evidence_for_attached_call())
+        return result
 
     def _report(endpoint):
         if on_progress is None:
@@ -734,7 +835,7 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
         key=lambda e: e.path,
     )
     for endpoint in tier1:
-        result = call_endpoint(base_url, endpoint, timeout=timeout)
+        result = _call(endpoint)
         results[id(endpoint)] = result
         if result.status == CALL_PASS and result.response_json is not None:
             evidence.append(_Evidence(endpoint=endpoint, response_json=result.response_json))
@@ -754,9 +855,7 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
             results[id(endpoint)] = _skip(endpoint, note)
             _report(endpoint)
             continue
-        call = call_endpoint(
-            base_url, endpoint, timeout=timeout, path_override=concrete_path, resolution_evidence=note,
-        )
+        call = _call(endpoint, path_override=concrete_path, resolution_evidence=note)
         if synthetic_field is not None:
             call = replace(call, synthetic=True, synthetic_fields=(synthetic_field,))
         results[id(endpoint)] = call
@@ -801,6 +900,7 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
                 # response actually names real required fields.
                 probed_call = _probe_and_synthesize_body(
                     base_url, endpoint, concrete_path if endpoint.dynamic else None, timeout,
+                    auth_context=auth_context,
                 )
                 if probed_call is not None:
                     if path_synthetic_field is not None:
@@ -821,8 +921,8 @@ def resolve_and_execute(endpoints: Tuple[ApiEndpoint, ...], base_url: str, timeo
                 continue
 
         combined_evidence = " ; ".join(part for part in (path_note, body_note) if part)
-        call = call_endpoint(
-            base_url, endpoint, timeout=timeout,
+        call = _call(
+            endpoint,
             path_override=(concrete_path if endpoint.dynamic else None),
             body=body, resolution_evidence=combined_evidence,
         )
@@ -900,7 +1000,7 @@ def generate_and_execute_negative_cases(
     endpoints: Tuple[ApiEndpoint, ...], calls: Tuple[ApiCallResult, ...],
     base_url: str, timeout: float, schema_doc=None, on_progress=None,
     allow_synthetic_mutations: bool = DEFAULT_ALLOW_SYNTHETIC_MUTATIONS,
-    static_schema_doc=None,
+    static_schema_doc=None, auth_context=None,
 ) -> Tuple[NegativeCallResult, ...]:
     """One real, evidence-gated negative HTTP call per qualifying endpoint -
     `calls` must be `resolve_and_execute`'s own already-finished output for
@@ -932,6 +1032,7 @@ def generate_and_execute_negative_cases(
     """
     call_by_id = {id(e): c for e, c in zip(endpoints, calls)}
     schema_state = {"doc": schema_doc, "fetched": schema_doc is not None}
+    auth_context = auth_context if auth_context is not None else AuthContext()
 
     def _schema():
         # Phase 2 (docs/53): a live `/openapi.json` fetch is tried first
@@ -982,6 +1083,7 @@ def generate_and_execute_negative_cases(
             base_url, endpoint, timeout=timeout,
             path_override=positive_call.resolved_path or None,
             body=mutated_body, resolution_evidence="negative case: {}".format(case_name),
+            extra_headers=auth_context.headers(),
         )
         status, actual_summary = _judge_negative_call(raw)
         results.append(NegativeCallResult(
@@ -1004,6 +1106,7 @@ def generate_and_execute_negative_cases(
         raw = call_endpoint(
             base_url, endpoint, timeout=timeout, path_override=nonexistent_path,
             resolution_evidence="negative case: {}".format(case_name),
+            extra_headers=auth_context.headers(),
         )
         status, actual_summary = _judge_negative_call(raw)
         results.append(NegativeCallResult(

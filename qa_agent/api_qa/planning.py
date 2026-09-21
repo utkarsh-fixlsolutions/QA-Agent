@@ -29,6 +29,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
 
+from .auth_context import AuthContext
 from .http_client import call_endpoint
 from .models import (
     CALL_FAIL,
@@ -289,7 +290,7 @@ def execute_test_plan(
     plan: Tuple[PlannedTest, ...], base_url: str, timeout: float,
     schema_doc=None, static_schema_doc=None,
     allow_synthetic_mutations: bool = DEFAULT_ALLOW_SYNTHETIC_MUTATIONS,
-    on_progress=None,
+    on_progress=None, auth_context=None,
 ) -> Tuple[PlannedTestResult, ...]:
     """Executes `plan` in the exact order it was built - already dependency-
     correct (`build_test_plan` only ever appends a test after every test it
@@ -306,6 +307,7 @@ def execute_test_plan(
     schema_state = {"doc": schema_doc, "fetched": schema_doc is not None}
     total = len(plan)
     progress_state = {"done": 0}
+    auth_context = auth_context if auth_context is not None else AuthContext()
 
     def _schema():
         if not schema_state["fetched"]:
@@ -375,11 +377,15 @@ def execute_test_plan(
                 continue
 
         combined_evidence = " ; ".join(part for part in (path_note, body_note) if part)
+        request_headers = auth_context.headers()
         raw_call = call_endpoint(
             base_url, endpoint, timeout=timeout,
             path_override=(concrete_path if endpoint.dynamic else None),
-            body=body, resolution_evidence=combined_evidence,
+            body=body, resolution_evidence=combined_evidence, extra_headers=request_headers,
         )
+        auth_context.observe(endpoint, raw_call)
+        if request_headers:
+            raw_call = replace(raw_call, auth_evidence=auth_context.evidence_for_attached_call())
         synthetic_fields = tuple(
             ([path_synthetic_field] if path_synthetic_field is not None else []) + list(body_synthetic_fields)
         )

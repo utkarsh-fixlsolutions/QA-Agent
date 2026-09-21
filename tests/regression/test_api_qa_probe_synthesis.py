@@ -97,6 +97,12 @@ class _FakeHeaders:
     def get(self, key, default=None):
         return self._mapping.get(key, default)
 
+    def get_all(self, key, default=None):
+        value = self._mapping.get(key, default)
+        if value is None:
+            return default
+        return value if isinstance(value, list) else [value]
+
 
 class _FakeResponse:
     def __init__(self, status, body: bytes, headers=None):

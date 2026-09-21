@@ -407,6 +407,12 @@ class _FakeHeaders:
     def get(self, key, default=None):
         return self._mapping.get(key, default)
 
+    def get_all(self, key, default=None):
+        value = self._mapping.get(key, default)
+        if value is None:
+            return default
+        return value if isinstance(value, list) else [value]
+
 
 class _FakeResponse:
     def __init__(self, status, body: bytes, headers=None):
@@ -632,6 +638,83 @@ def test_discover_server_start_command_ambiguous_monorepo_is_never_guessed(suite
         suite.check("no cwd for a command that was never found", cwd is None)
     finally:
         proj.__exit__(None, None, None)
+
+
+# --- server lifecycle: ancestor-workspace package manager (docs/51) -----
+
+def test_discover_server_start_command_finds_ancestor_workspace_lockfile(suite):
+    """A monorepo package (e.g. `apps/web`) with no lockfile of its own,
+    inside a real pnpm workspace whose lockfile lives at the workspace
+    root - the exact shape that produced 'no JS package manager detected'
+    for a real pnpm-workspace project this session (docs/51)."""
+    proj = TempProject()
+    try:
+        proj.write("pnpm-lock.yaml", "lockfileVersion: '6.0'\n")
+        proj.write("apps/web/package.json", json.dumps({"name": "web", "scripts": {"dev": "next dev"}}))
+        package_root = proj.path / "apps" / "web"
+        result = discover_project(package_root)
+        context = build_repository_context(result.project)
+        command, evidence, cwd = server_module.discover_server_start_command(package_root, context.project)
+        suite.check("a command was found despite no local lockfile", command is not None,
+                     " (evidence/reason: {})".format(evidence))
+        suite.check("evidence names pnpm, found via the ancestor lockfile",
+                     command is not None and "pnpm" in evidence, " (evidence: {})".format(evidence))
+        suite.check("cwd is the package's own directory", cwd is not None and Path(cwd) == package_root)
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_discover_server_start_command_stops_ancestor_search_at_git_boundary(suite):
+    """The ancestor lockfile search must never cross a `.git` boundary - an
+    unrelated lockfile from some enclosing directory outside a package's own
+    repository must never be picked up as if it were real evidence for it."""
+    proj = TempProject()
+    try:
+        proj.write("pnpm-lock.yaml", "lockfileVersion: '6.0'\n")  # outside the "repo" below
+        proj.write("repo/.git/HEAD", "ref: refs/heads/main\n")
+        proj.write("repo/apps/web/package.json", json.dumps({"name": "web", "scripts": {"dev": "next dev"}}))
+        package_root = proj.path / "repo" / "apps" / "web"
+        result = discover_project(package_root)
+        context = build_repository_context(result.project)
+        command, reason, cwd = server_module.discover_server_start_command(package_root, context.project)
+        suite.check("no command found - the lockfile outside the repo boundary is never used",
+                     command is None, " (command: {})".format(command))
+    finally:
+        proj.__exit__(None, None, None)
+
+
+def test_prefer_installed_manager_binary_falls_back_to_npm(suite):
+    original_which = server_module.shutil.which
+    server_module.shutil.which = lambda name: ("C:/npm.cmd" if name == "npm" else None)
+    try:
+        result = server_module._prefer_installed_manager_binary(["pnpm", "run", "dev"])
+        suite.check("falls back to npm when the evidenced manager is not on PATH",
+                     result == ["npm", "run", "dev"], " (result: {})".format(result))
+    finally:
+        server_module.shutil.which = original_which
+
+
+def test_prefer_installed_manager_binary_keeps_manager_when_available(suite):
+    original_which = server_module.shutil.which
+    server_module.shutil.which = lambda name: "/usr/bin/" + name
+    try:
+        result = server_module._prefer_installed_manager_binary(["pnpm", "run", "dev"])
+        suite.check("keeps the evidenced manager when it is actually available",
+                     result == ["pnpm", "run", "dev"], " (result: {})".format(result))
+    finally:
+        server_module.shutil.which = original_which
+
+
+def test_prefer_installed_manager_binary_never_invents_when_nothing_is_available(suite):
+    original_which = server_module.shutil.which
+    server_module.shutil.which = lambda name: None
+    try:
+        result = server_module._prefer_installed_manager_binary(["pnpm", "run", "dev"])
+        suite.check("leaves the command untouched when no fallback is possible either - "
+                     "honest failure later, never an invented substitute",
+                     result == ["pnpm", "run", "dev"], " (result: {})".format(result))
+    finally:
+        server_module.shutil.which = original_which
 
 
 def test_start_and_wait_ready_reports_not_found_for_a_missing_binary(suite):
@@ -1599,6 +1682,11 @@ if __name__ == "__main__":
         test_discover_server_start_command_none_when_no_script,
         test_discover_server_start_command_falls_back_to_a_monorepo_package,
         test_discover_server_start_command_ambiguous_monorepo_is_never_guessed,
+        test_discover_server_start_command_finds_ancestor_workspace_lockfile,
+        test_discover_server_start_command_stops_ancestor_search_at_git_boundary,
+        test_prefer_installed_manager_binary_falls_back_to_npm,
+        test_prefer_installed_manager_binary_keeps_manager_when_available,
+        test_prefer_installed_manager_binary_never_invents_when_nothing_is_available,
         test_start_and_wait_ready_reports_not_found_for_a_missing_binary,
         test_start_and_wait_ready_detects_a_ready_signal,
         test_start_and_wait_ready_does_not_stop_on_a_keyword_only_line,

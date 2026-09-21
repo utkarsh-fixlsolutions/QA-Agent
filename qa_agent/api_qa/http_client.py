@@ -72,7 +72,7 @@ def _result(endpoint, status, **kwargs):
 
 
 def call_endpoint(base_url, endpoint, timeout=DEFAULT_TIMEOUT_SECONDS, path_override=None, body=None,
-                   resolution_evidence=""):
+                   resolution_evidence="", extra_headers=None):
     """One real HTTP call. Pass/fail rule (deliberately simple and
     deterministic, per docs/30): a 2xx status code, and - only when the
     response declares a JSON content-type - a body that actually parses as
@@ -89,11 +89,19 @@ def call_endpoint(base_url, endpoint, timeout=DEFAULT_TIMEOUT_SECONDS, path_over
     function ever inventing either itself - this remains the one place
     that actually makes an HTTP call; the *decision* of what path/body to
     use is made entirely by the caller (`resolution.py`).
+
+    `extra_headers` (auth/session propagation, optional, additive): real
+    headers a caller has already decided this call should carry (e.g. a
+    real `Authorization`/`Cookie` value captured from an earlier call's own
+    response, via `auth_context.AuthContext`) - this function never decides
+    on its own whether to send one, only sends what it is given. Never
+    overrides `Content-Type`, which this function always sets itself when
+    `body` is given.
     """
     concrete_path = path_override if path_override is not None else endpoint.path
     url = base_url.rstrip("/") + concrete_path
     data = None
-    headers = {}
+    headers = dict(extra_headers) if extra_headers else {}
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -106,6 +114,7 @@ def call_endpoint(base_url, endpoint, timeout=DEFAULT_TIMEOUT_SECONDS, path_over
             raw = response.read(MAX_RESPONSE_READ_BYTES)
             status_code = response.status
             content_type = response.headers.get("Content-Type", "")
+            response_cookies = tuple(response.headers.get_all("Set-Cookie") or ())
     except urllib.error.HTTPError as exc:
         # A real, received response with a non-2xx status - not a
         # connection failure. exc itself is a valid file-like object.
@@ -167,4 +176,5 @@ def call_endpoint(base_url, endpoint, timeout=DEFAULT_TIMEOUT_SECONDS, path_over
         content_type=content_type, valid_response=valid, response_json=parsed,
         response_sample=text[:MAX_RESPONSE_SAMPLE_CHARS], reason=reason,
         resolved_path=resolved_path, resolution_evidence=resolution_evidence,
+        response_cookies=response_cookies,
     )

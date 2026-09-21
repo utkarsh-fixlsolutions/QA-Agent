@@ -85,6 +85,26 @@ _PORT_ONLY_RE = re.compile(r"\bport[:\s]+(\d{2,5})\b", re.IGNORECASE)
 
 _JS_PACKAGE_MANAGER_PRIORITY = ("pnpm", "yarn", "bun", "npm")
 
+# Manager name -> the one lockfile basename that is real evidence of it,
+# restricted to the JS managers this module ever launches a server with.
+# Duplicated narrowly from `project.detectors`'s own (broader,
+# multi-language) `_PACKAGE_MANAGER_BASENAMES` rather than imported - same
+# "duplicate a small list rather than reach into another module's private
+# constant" precedent already used elsewhere in this file (see
+# `_FRONTEND_FRAMEWORK_NAMES`'s own docstring).
+_JS_LOCKFILE_BY_MANAGER = {
+    "pnpm": "pnpm-lock.yaml",
+    "yarn": "yarn.lock",
+    "bun": "bun.lockb",
+    "npm": "package-lock.json",
+}
+
+# How far up from a project root to look for a workspace's own lockfile -
+# generous enough for any real monorepo nesting (e.g. `apps/web` two levels
+# under the workspace root) without ever wandering into an unrelated parent
+# directory indefinitely.
+_MAX_ANCESTOR_LOCKFILE_LEVELS = 6
+
 
 def _read_json_safe(path):
     try:
@@ -93,11 +113,49 @@ def _read_json_safe(path):
         return None
 
 
-def _js_package_manager(project):
+def _ancestor_js_package_manager(root):
+    """A monorepo/workspace *package* (e.g. `apps/web` in a pnpm workspace)
+    commonly carries no lockfile of its own - the workspace root's lockfile,
+    one or more levels up, is what actually governs it, exactly like
+    `node_modules` resolution itself walks upward. `detect_package_managers`
+    (project/detectors.py) only ever scans *downward* from whatever root it
+    is given, so pointing this tool directly at such a package produces zero
+    package-manager evidence even though a completely real lockfile exists
+    just outside that root - this is real evidence too, just found by
+    walking the other direction.
+
+    Checks each ancestor's own immediate directory entries only (never a
+    recursive scan) for one of the same real lockfile basenames
+    `detect_package_managers` already trusts. Stops at the first match, at
+    the first ancestor that itself contains a `.git` directory (the real
+    repository boundary - never searched past it), or after
+    `_MAX_ANCESTOR_LOCKFILE_LEVELS`, whichever comes first.
+    """
+    current = Path(root).resolve()
+    for _ in range(_MAX_ANCESTOR_LOCKFILE_LEVELS):
+        parent = current.parent
+        if parent == current:  # reached the filesystem root
+            return None
+        current = parent
+        try:
+            entries = {entry.name for entry in current.iterdir()}
+        except OSError:
+            return None
+        for candidate in _JS_PACKAGE_MANAGER_PRIORITY:
+            if _JS_LOCKFILE_BY_MANAGER[candidate] in entries:
+                return candidate
+        if ".git" in entries:
+            return None
+    return None
+
+
+def _js_package_manager(project, root=None):
     names = {i.name for i in project.package_managers}
     for candidate in _JS_PACKAGE_MANAGER_PRIORITY:
         if candidate in names:
             return candidate
+    if root is not None:
+        return _ancestor_js_package_manager(root)
     return None
 
 
@@ -202,14 +260,16 @@ def discover_server_start_command(root, project):
     dev` from the wrong cwd would fail to find that package's own
     `package.json` at all). No fallback to a guessed command.
     """
-    manager = _js_package_manager(project)
+    manager = _js_package_manager(project, root)
     if manager is not None:
         for script in ("dev", "start"):
             command = _npm_script_command(root, manager, script)
             if command is not None:
+                command = _prefer_installed_manager_binary(command)
                 return command, "package.json scripts.{} (via {})".format(script, manager), Path(root)
         if project.monorepo_packages:
-            return _monorepo_start_command(root, project, manager)
+            command, evidence, cwd = _monorepo_start_command(root, project, manager)
+            return _prefer_installed_manager_binary(command), evidence, cwd
         return None, "no npm dev/start script found in package.json", None
 
     if _is_fastapi_project(project):
@@ -217,6 +277,31 @@ def discover_server_start_command(root, project):
         return command, evidence, (Path(root) if command is not None else None)
 
     return None, "no JS package manager detected for this project", None
+
+
+def _prefer_installed_manager_binary(command):
+    """The manager chosen for `command` (real evidence: its own lockfile,
+    found either in the project or in an ancestor workspace root - see
+    `_ancestor_js_package_manager`) is still the right *fact* about the
+    project, but a package manager's binary is only strictly required for
+    its own `install`; *running* an already-defined `package.json`
+    `scripts.<name>` entry against `node_modules` that already exists on
+    disk works identically through any of them. So if the evidenced
+    manager's own binary is not actually installed on this machine's PATH,
+    fall back to `npm` - which ships with any Node.js install and is
+    virtually always present - to run that same script, rather than
+    reporting a real, already-discovered, already-runnable server as
+    unstartable just because one specific binary happens to be missing.
+    Never invents a command; only ever substitutes its first element, and
+    only when the original genuinely is not runnable.
+    """
+    if not command:
+        return command
+    if shutil.which(command[0]) is not None:
+        return command
+    if command[0] != "npm" and shutil.which("npm") is not None:
+        return ["npm"] + list(command[1:])
+    return command
 
 
 # --- Python / FastAPI strategy (new) ----------------------------------------

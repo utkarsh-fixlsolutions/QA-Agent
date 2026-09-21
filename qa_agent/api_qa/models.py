@@ -73,7 +73,7 @@ CALL_STATUSES = (CALL_PASS, CALL_FAIL, CALL_SKIPPED)
 # existing human-readable `resolution_evidence` trace - never a replacement
 # for it.
 EVIDENCE_OPENAPI = "openapi"          # a live or static OpenAPI/Swagger schema
-EVIDENCE_SCHEMA = "schema"            # an explicit validation schema (Zod, ...)
+EVIDENCE_SCHEMA = "schema"            # an explicit validation/ORM schema (Zod, Mongoose, ...)
 EVIDENCE_TEST_EXAMPLE = "test_example"  # a real example found in the project's own tests/collections
 EVIDENCE_SOURCE_HINT = "source"       # route/controller source-code evidence
 EVIDENCE_SYNTHETIC = "synthetic"      # no real evidence at all - an invented placeholder
@@ -164,6 +164,15 @@ class ApiEndpoint:
     # `body_field_hints` (a real name *and* a real type, not just a name)
     # - checked first in resolution.py's fallback chain when present.
     zod_fields: Tuple[Tuple[str, str], ...] = ()
+    # Real (field_name, type_token) pairs found in a real Mongoose model
+    # (`model_schema.py`) this endpoint's own real handler actually uses -
+    # required fields only, resolved through the project's own real
+    # require/import graph (never a guess at which model "probably"
+    # applies). The same real-type, same-tier evidence `zod_fields` already
+    # provides, just sourced from the ORM/DB layer instead of an
+    # application-level validation schema - checked in resolution.py's
+    # fallback chain alongside it, never a separate, weaker tier.
+    model_fields: Tuple[Tuple[str, str], ...] = ()
     # Real (field_name, real_value) pairs (Phase 2, docs/53) found in the
     # project's own existing test files or Postman-style collections
     # (`test_evidence.py`) for a real HTTP call this endpoint's own
@@ -172,6 +181,19 @@ class ApiEndpoint:
     # just a name to guess a type for), checked ahead of it in resolution.py's
     # fallback chain but behind explicit schema evidence (OpenAPI/Zod).
     test_evidence_fields: Tuple[Tuple[str, object], ...] = ()
+    # Phase 4 (generalized discovery): which real discovery strategy/
+    # strategies actually produced this endpoint - e.g. `("express-source",)`,
+    # or `("express-source", "openapi")` when a live source-code route and an
+    # independent OpenAPI document both describe the exact same (method,
+    # path) and were fused into one entry rather than reported twice (see
+    # `discovery.discover_api_endpoints_detailed`'s own merge step).
+    # `"express-composition"`/`"fastapi-composition"` is appended (never
+    # replacing the original source tag) when a router-mount prefix was
+    # resolved and prepended to this endpoint's own raw, per-file path.
+    # Empty only for endpoints built before this field existed (never
+    # produced by discovery.py itself since this phase) - purely additive,
+    # never required by any existing caller.
+    discovered_by: Tuple[str, ...] = ()
 
     def __post_init__(self):
         if self.method not in METHODS:
@@ -188,6 +210,36 @@ class ApiEndpoint:
                 "ApiEndpoint({!r} {!r}) has a non-positive line number {!r}"
                 .format(self.method, self.path, self.line)
             )
+
+
+@dataclass(frozen=True)
+class UnresolvedRoute:
+    r"""Phase 4 (generalized discovery): a real route-defining construct
+    whose HTTP method may be known but whose concrete path could not be
+    established by static analysis alone - `router.route(`/${entity}/create`)
+    .post(...)` (a template literal with runtime interpolation),
+    `router.get(pathVariable, handler)` (a bare variable/expression instead
+    of a string literal), and their Python/FastAPI equivalents.
+
+    Never fabricates a path, never invents a value for the unresolved
+    segment, and is never fed into HTTP execution as if it were a real,
+    callable `ApiEndpoint` - see discovery.py's own module docstring for
+    the full "why" behind this shape. Exists purely so the real, honest
+    fact "this project defines more routes than could be statically
+    resolved" is visible in reporting, instead of the route silently
+    vanishing the way an unmatched call shape always used to.
+
+    `method` is `None` only on the rare path where a route-defining call
+    was recognized at all but its own HTTP verb could not be determined
+    either (never expected in practice - every current producer of this
+    shape already knows the verb by construction).
+    """
+
+    raw_expression: str
+    source_file: str
+    reason: str
+    method: Optional[str] = None
+    line: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -260,6 +312,19 @@ class ApiCallResult:
     # `body_evidence_source` records *why* the value was chosen, `synthetic`
     # records whether it is safe to treat as a verified default.
     body_evidence_source: str = ""
+    # Auth/session propagation (`auth_context.py`): every real, raw
+    # `Set-Cookie` header value this call's own real response actually sent
+    # - `()` for a call with none. Read by `AuthContext.observe` to forward
+    # a real session cookie into later calls; never parsed or acted on
+    # anywhere else.
+    response_cookies: Tuple[str, ...] = ()
+    # A short, human-readable trace of a real credential (`Authorization`/
+    # `Cookie`) this call carried, captured from an earlier call's own real
+    # response in this same run (`auth_context.AuthContext`) - `""` when
+    # this call carried no such credential, the same "empty when there is
+    # none" convention `resolution_evidence` already follows. Never
+    # invented; only ever describes a header that was actually attached.
+    auth_evidence: str = ""
 
     def __post_init__(self):
         if self.status not in CALL_STATUSES:
@@ -485,6 +550,25 @@ class ApiTestResult:
     # `calls`' own "exactly one entry per endpoint" contract cannot express.
     test_plan: Tuple["PlannedTest", ...] = ()
     functional_results: Tuple["PlannedTestResult", ...] = ()
+    # Phase 4 (generalized discovery): every real route-defining construct
+    # discovery found but could not statically resolve to a concrete path -
+    # see `UnresolvedRoute`'s own docstring. Never fed into `endpoints`/
+    # `calls` - a distinct, honest "we saw this, but can't call it" bucket.
+    unresolved_routes: Tuple[UnresolvedRoute, ...] = ()
+    # Real (strategy_name, endpoint_count) pairs, one per discovery
+    # strategy that actually ran (a strategy whose own gating evidence was
+    # absent - e.g. Express strategies on a pure FastAPI project - is
+    # omitted entirely rather than reported as a misleading "0 found").
+    # Lets a report say plainly "Express source: 3, OpenAPI: 5, Tests: 0"
+    # instead of a single opaque total.
+    discovery_strategy_counts: Tuple[Tuple[str, int], ...] = ()
+    # Real, already-detected (`project.frameworks`) backend/API framework
+    # names for which discovery.py has no discovery strategy at all today
+    # (e.g. "Flask", "Django", "NestJS") - reported explicitly so a project
+    # using one of these reads as "framework detected, no discovery
+    # strategy implemented", never silently collapsed into the same "0
+    # endpoints" a framework-less or truly API-less project would also show.
+    unsupported_frameworks: Tuple[str, ...] = ()
 
     def __post_init__(self):
         if self.server_status not in SERVER_STATUSES:

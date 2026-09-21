@@ -37,7 +37,7 @@ from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from qa_agent.ai import GroqProvider  # noqa: E402
+from qa_agent.ai import OllamaProvider  # noqa: E402
 from qa_agent.api_qa import ApiQaConfig, diagnose_and_repair_api_failures, discover_api_endpoints, run_api_qa  # noqa: E402
 from qa_agent.api_qa import to_dict as api_qa_to_dict  # noqa: E402
 from qa_agent.api_qa import server as api_qa_server  # noqa: E402
@@ -144,15 +144,23 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
         pass
 
 
-def _npm_install(pkg_dir: Path) -> dict:
+def _npm_install(pkg_dir: Path, manager: str = "npm") -> dict:
+    """Runs `<manager> install` in `pkg_dir` - `manager` should be whatever
+    `discover_server_start_command` actually found real evidence for (its
+    returned command's own first element), never hardcoded to `npm`: running
+    plain `npm install` against a pnpm/yarn-managed `node_modules` does not
+    understand that manager's own workspace linking and can silently
+    corrupt an already-working install (docs/51-monorepo-package-manager-
+    ancestor-detection.md).
+    """
     kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if _IS_WINDOWS else {"preexec_fn": os.setsid}
     try:
         proc = subprocess.Popen(
-            ["npm", "install"], cwd=str(pkg_dir), shell=_IS_WINDOWS,
+            [manager, "install"], cwd=str(pkg_dir), shell=_IS_WINDOWS,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kwargs,
         )
     except OSError as exc:
-        return {"dir": pkg_dir.name, "ok": False, "detail": "could not run npm install: {}".format(exc)}
+        return {"dir": pkg_dir.name, "ok": False, "detail": "could not run {} install: {}".format(manager, exc)}
 
     try:
         output, _ = proc.communicate(timeout=NPM_INSTALL_TIMEOUT)
@@ -160,8 +168,8 @@ def _npm_install(pkg_dir: Path) -> dict:
         _kill_process_tree(proc)
         return {
             "dir": pkg_dir.name, "ok": False,
-            "detail": "npm install did not finish within {:.0f}s - the whole process tree was terminated"
-                       .format(NPM_INSTALL_TIMEOUT),
+            "detail": "{} install did not finish within {:.0f}s - the whole process tree was terminated"
+                       .format(manager, NPM_INSTALL_TIMEOUT),
         }
 
     ok = proc.returncode == 0
@@ -504,15 +512,28 @@ def _run_analysis(
         # would crash in under a second, every time, for any real
         # Node project.
         install_result = None
+        install_failure_detail = None
         _cmd, _evidence, server_cwd = api_qa_server.discover_server_start_command(
             str(project_root), discovery.project,
         )
         if server_cwd is not None and (Path(server_cwd) / "package.json").is_file():
-            _stage(started, "running npm install in {}".format(Path(server_cwd).name))
-            install_result = _npm_install(Path(server_cwd))
-            _stage(started, "npm install {}".format("ok" if install_result["ok"] else "FAILED"))
+            manager = _cmd[0] if _cmd else "npm"
+            _stage(started, "running {} install in {}".format(manager, Path(server_cwd).name))
+            install_result = _npm_install(Path(server_cwd), manager=manager)
+            _stage(started, "{} install {}".format(manager, "ok" if install_result["ok"] else "FAILED"))
             if install_result["ok"]:
                 install_result = None  # nothing worth reporting when it just worked
+            else:
+                # Phase 4 (item 9): a real, already-known reason the server
+                # must never even be attempted - the previous behavior
+                # called `run_api_qa` unconditionally here anyway, which
+                # then tried (and failed) to launch a server with missing
+                # dependencies, producing a second, more confusing error
+                # ("'next' is not recognized") that masked this real one.
+                # The real install stdout/stderr is preserved in
+                # `install_result["detail"]` exactly as before.
+                install_failure_detail = "dependency installation failed ({} install in {}): {}".format(
+                    manager, Path(server_cwd).name, install_result["detail"])
 
         # A fresh upload just ran a real `npm install` moments ago -
         # give the server itself (and, on Windows, real-time antivirus
@@ -523,6 +544,7 @@ def _run_analysis(
             context, str(project_root),
             config=ApiQaConfig(server_startup_timeout=45.0, connect_probe_timeout=20.0),
             on_progress=on_progress,
+            precondition_failure=install_failure_detail,
         )
         _stage(started, "API testing done ({} call(s), {} negative case(s), {} schema check(s), server {})".format(
             len(api_result.calls), len(api_result.negative_calls), len(api_result.schema_validations),
@@ -535,14 +557,21 @@ def _run_analysis(
             api_data["install_error"] = install_result
         response["api_qa"] = api_data
 
-        # AI diagnosis (docs/42-groq-cloud-provider.md) - strictly
-        # opt-in, and only ever sent the real evidence for calls that
-        # really failed (`diagnose_and_repair_api_failures` itself
-        # filters to CALL_FAIL - a pass/skip is never sent to the AI).
-        # Repair is deliberately not offered here yet - diagnosis only.
+        # AI diagnosis - strictly opt-in, and only ever sent the real
+        # evidence for calls that really failed (`diagnose_and_repair_api_
+        # failures` itself filters to CALL_FAIL - a pass/skip is never sent
+        # to the AI). Repair is deliberately not offered here yet -
+        # diagnosis only. Ollama (local, docs/step-log.md Phase D Part 1) -
+        # swapped in place of the earlier Groq wiring (docs/42) to test the
+        # local-model path. Pinned to "qwen2.5:3b" rather than the
+        # provider's own "llama3" default - the model actually pulled on
+        # this machine (`ollama list`); "llama3" is not, and would return a
+        # handled-but-useless "model not found" failure instead of a real
+        # diagnosis. Needs a local Ollama server running, or this call
+        # returns a failed LLMResponse (caught, never crashes the run).
         if diagnose and any(c.status == "fail" for c in api_result.calls):
-            _stage(started, "running AI diagnosis (Groq)")
-            provider = GroqProvider()
+            _stage(started, "running AI diagnosis (Ollama qwen2.5:3b)")
+            provider = OllamaProvider(model="qwen2.5:3b")
             entries = diagnose_and_repair_api_failures(
                 api_result, context, provider, str(project_root),
                 do_diagnose=True, do_repair=False,

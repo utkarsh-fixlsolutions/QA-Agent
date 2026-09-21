@@ -305,6 +305,12 @@ class _FakeHeaders:
     def get(self, key, default=None):
         return self._mapping.get(key, default)
 
+    def get_all(self, key, default=None):
+        value = self._mapping.get(key, default)
+        if value is None:
+            return default
+        return value if isinstance(value, list) else [value]
+
 
 class _FakeResponse:
     def __init__(self, status, body: bytes, headers=None):
@@ -405,6 +411,9 @@ class _FakeResult:
         self.negative_calls = ()
         self.schema_validations = ()
         self.functional_results = ()
+        self.unresolved_routes = ()
+        self.discovery_strategy_counts = ()
+        self.unsupported_frameworks = ()
 
 
 def test_to_dict_summary_separates_real_and_synthetic_counts(suite):
