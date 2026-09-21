@@ -27,7 +27,7 @@ from qa_agent.__main__ import (  # noqa: E402
     _effective_ai_settings,
     _run_ai_pipeline,
 )
-from qa_agent.ai import LLMResponse, MockProvider, OllamaProvider  # noqa: E402
+from qa_agent.ai import LLMResponse, MockProvider, OllamaProvider, OpenRouterProvider  # noqa: E402
 from qa_agent.config import AIConfig  # noqa: E402
 
 PY_WITH_ISSUE = "import os\n\ndef add(a, b):\n    return a + b\n"
@@ -161,6 +161,42 @@ def test_build_ai_provider_ollama_defaults_when_unset(suite):
     suite.check("no field is the literal None - the provider's own defaults were used",
                 provider.model is not None and provider.endpoint is not None
                 and provider.timeout is not None)
+
+
+def test_build_ai_provider_cloud_constructs_openrouter(suite):
+    """docs/27-openrouter-cloud-provider.md: 'cloud' is the one new
+    provider name added alongside the existing 'mock'/'ollama' - proven the
+    same way those two already are, directly against `_build_ai_provider`,
+    no network call involved (api_key is never required just to construct
+    the object).
+    """
+    provider = _build_ai_provider(AIConfig(
+        enabled=True, provider="cloud", model="poolside/laguna-s-2.1:free",
+    ))
+    suite.check("a real OpenRouterProvider instance", isinstance(provider, OpenRouterProvider))
+    assert isinstance(provider, OpenRouterProvider)
+    suite.check("the configured model is used", provider.model == "poolside/laguna-s-2.1:free")
+
+
+def test_build_ai_provider_cloud_defaults_when_unset(suite):
+    provider = _build_ai_provider(AIConfig(enabled=True, provider="cloud"))
+    assert isinstance(provider, OpenRouterProvider)
+    suite.check("the default cloud model is poolside/laguna-s-2.1:free",
+                provider.model == "poolside/laguna-s-2.1:free")
+    suite.check("endpoint/timeout defaults are the provider's own, never a literal None",
+                provider.endpoint is not None and provider.timeout is not None)
+
+
+def test_build_ai_provider_mock_and_ollama_are_unaffected_by_adding_cloud(suite):
+    """A direct regression check on the refactor that introduced the shared
+    `_construct_ai_provider` dispatch (needed once a third provider existed) -
+    'mock'/'ollama' must still behave exactly as `test_build_ai_provider_mock`/
+    `test_build_ai_provider_ollama_with_overrides` above already prove.
+    """
+    mock_provider = _build_ai_provider(AIConfig(enabled=True, provider="mock", model="m"))
+    ollama_provider = _build_ai_provider(AIConfig(enabled=True, provider="ollama", model="m"))
+    suite.check("mock is still MockProvider", isinstance(mock_provider, MockProvider))
+    suite.check("ollama is still OllamaProvider", isinstance(ollama_provider, OllamaProvider))
 
 
 # --- _run_ai_pipeline: graceful degradation and correct wiring -------------
@@ -372,6 +408,9 @@ if __name__ == "__main__":
         test_build_ai_provider_mock,
         test_build_ai_provider_ollama_with_overrides,
         test_build_ai_provider_ollama_defaults_when_unset,
+        test_build_ai_provider_cloud_constructs_openrouter,
+        test_build_ai_provider_cloud_defaults_when_unset,
+        test_build_ai_provider_mock_and_ollama_are_unaffected_by_adding_cloud,
         test_run_ai_pipeline_disabled_returns_untouched_defaults,
         test_run_ai_pipeline_only_runs_enabled_features,
         test_run_ai_pipeline_all_three_enabled,
